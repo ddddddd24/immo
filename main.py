@@ -191,9 +191,12 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if action == "edit":
+        # Store pending-edit state so the next message from this user is used as the custom message
+        ctx.bot_data[f"pending_edit:{query.message.chat_id}"] = lbc_id
+        await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
-            "✏️ *Modification manuelle non encore implémentée.*\n"
-            "Utilisez /simulate à nouveau avec une URL différente.",
+            "✏️ *Mode édition activé.*\n"
+            "Envoie ton message personnalisé et je l'enverrai directement.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -541,7 +544,36 @@ async def cmd_boite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle any free-text message by classifying intent and routing to the right action."""
     user_text = update.effective_message.text
+    chat_id = update.effective_message.chat_id
     logger.info("Chat message received: %s", user_text[:80])
+
+    # ── Pending-edit interception ──────────────────────────────────────────────
+    pending_key = f"pending_edit:{chat_id}"
+    lbc_id = ctx.bot_data.pop(pending_key, None)
+    if lbc_id:
+        result = ctx.bot_data.get(f"sim:{lbc_id}")
+        if not result:
+            await _reply(update, "❌ Session expirée, relancez /simulate.")
+            return
+        listing = result.listing
+        custom_message = user_text.strip()
+        listing_id = database.upsert_listing(
+            lbc_id=listing.lbc_id,
+            title=listing.title,
+            price=listing.price,
+            location=listing.location,
+            seller_name=listing.seller_name,
+            seller_type=result.seller_type,
+            url=listing.url,
+        )
+        contact_id = database.create_contact(listing_id, custom_message)
+        await _reply(update, "📤 Envoi du message modifié…")
+        success = await send_message_safe(listing.url, custom_message, contact_id)
+        if success:
+            await _reply(update, f"✅ Message envoyé (édité) → {listing.url}")
+        else:
+            await _reply(update, "❌ Échec de l'envoi (voir logs). Vérifiez vos identifiants LBC.")
+        return
 
     intent = classify_intent(user_text)
     tool = intent.get("tool")
@@ -572,6 +604,8 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await cmd_settings(update, ctx)
 
     elif tool == "run_autostart":
+        hours = intent.get("hours")
+        ctx.args = [str(hours)] if hours else []
         await cmd_autostart(update, ctx)
 
     elif tool == "run_autostop":

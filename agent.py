@@ -351,6 +351,30 @@ _INTENT_TOOLS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "run_autostart",
+        "description": "Activer la campagne automatique répétée toutes les N heures.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "number",
+                    "description": "Intervalle en heures (défaut 3)",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "run_autostop",
+        "description": "Arrêter la campagne automatique.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "run_visites",
+        "description": "Afficher la liste des visites planifiées.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "reply",
         "description": "Répondre directement à l'utilisateur sans déclencher d'action. Utiliser pour les questions, les conversations, les explications.",
         "input_schema": {
