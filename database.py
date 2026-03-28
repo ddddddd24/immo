@@ -276,6 +276,66 @@ def mark_visit_done(visit_id: int) -> None:
         conn.execute("UPDATE visits SET done = 1 WHERE id = ?", (visit_id,))
 
 
+# ─── Price-drop re-contact ────────────────────────────────────────────────────
+
+def get_uncontacted_price_drops(max_price: int) -> list[dict]:
+    """Listings in DB (never contacted) whose price just dropped to <= max_price."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT l.lbc_id, l.title, l.url, l.price, l.price_prev,
+                      l.location, l.seller_name, l.source, l.seller_type
+               FROM listings l
+               WHERE l.price_prev IS NOT NULL
+               AND l.price_prev > l.price
+               AND l.price <= ?
+               AND l.id NOT IN (SELECT listing_id FROM contacts)
+               ORDER BY (l.price_prev - l.price) DESC
+               LIMIT 10""",
+            (max_price,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ─── Response rate stats ──────────────────────────────────────────────────────
+
+def tone_response_rates() -> dict:
+    """Response rates by seller_type → {type: {sent, responded, rate}}."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT l.seller_type,
+                      COUNT(DISTINCT c.id)           AS sent,
+                      COUNT(DISTINCT r.contact_id)   AS responded
+               FROM contacts c
+               JOIN listings l ON l.id = c.listing_id
+               LEFT JOIN responses r ON r.contact_id = c.id
+               WHERE c.status IN ('sent', 'responded', 'positive', 'negative')
+               GROUP BY l.seller_type"""
+        ).fetchall()
+    result = {}
+    for row in rows:
+        st = row["seller_type"] or "inconnu"
+        sent = row["sent"]
+        responded = row["responded"]
+        result[st] = {
+            "sent": sent,
+            "responded": responded,
+            "rate": round(responded / sent * 100) if sent else 0,
+        }
+    return result
+
+
+def stale_contacts_count(days: int = 5) -> int:
+    """Count sent contacts with no reply older than `days` days."""
+    with _conn() as conn:
+        return conn.execute(
+            """SELECT COUNT(*) AS n FROM contacts
+               WHERE status = 'sent'
+               AND sent_at <= datetime('now', ?)
+               AND id NOT IN (SELECT DISTINCT contact_id FROM responses)""",
+            (f"-{days} days",),
+        ).fetchone()["n"]
+
+
 # ─── Contacts for response reading ───────────────────────────────────────────
 
 def get_sent_contacts_without_response() -> list[dict]:

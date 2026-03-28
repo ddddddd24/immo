@@ -578,7 +578,271 @@ async def _run_actor(actor_id: str, input_payload: dict) -> list[dict]:
         return items.json()
 
 
-# ─── Listing quality filter ───────────────────────────────────────────────────
+# ─── Bien'ici listing normalisation ─────────────────────────────────────────
+
+def _bienici_ad_to_listing(ad: dict) -> Optional[Listing]:
+    """Convert a Bien'ici ad dict to a Listing."""
+    bi_id = str(ad.get("id") or "")
+    if not bi_id:
+        return None
+
+    listing_id = f"bi_{bi_id}"
+    slug = ad.get("slug") or bi_id
+    url = ad.get("url") or f"https://www.bienici.com/annonce/{slug}"
+
+    # Price — try several field names; add charges if separate
+    price_raw = (
+        ad.get("pricePerMonth")
+        or ad.get("price")
+        or (ad.get("prices") or {}).get("perMonth")
+    )
+    charges = ad.get("monthlyCharges") or ad.get("charges") or 0
+    price_total = _parse_price(price_raw)
+    if price_total and charges:
+        price_total += int(charges)
+
+    # Location
+    city = ad.get("city") or (ad.get("district") or {}).get("name") or ""
+    zipcode = ad.get("postalCode") or ad.get("zipCode") or ""
+    location = ", ".join(filter(None, [city, zipcode]))
+
+    # Seller
+    agency = ad.get("agency") or ad.get("contact") or {}
+    seller_name = (
+        agency.get("name") or agency.get("agencyName")
+        or ad.get("contactName") or ""
+    )
+    is_pro = bool(ad.get("agency")) or ad.get("adType") == "professional"
+    seller_type_hint = "pro" if is_pro else "particulier"
+
+    # Title
+    surface = ad.get("surfaceArea") or ad.get("surface") or ""
+    prop = "Appartement" if "flat" in (ad.get("propertyType") or "flat") else "Bien"
+    title = ad.get("title") or (
+        f"{prop} {surface}m² — {city}" if surface else f"{prop} — {city}"
+    )
+
+    # Photos
+    images = [
+        (p.get("url") or p.get("photo") or "")
+        for p in (ad.get("photos") or [])
+        if isinstance(p, dict)
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description=ad.get("description") or "",
+        price=price_total,
+        location=location,
+        seller_name=seller_name,
+        url=url,
+        seller_type_hint=seller_type_hint,
+        source="bienici",
+        images=[u for u in images if u],
+    )
+
+
+async def _search_bienici_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    logger.info("[BIENICI] Scraping search page: %s", search_url)
+
+    # Try __NEXT_DATA__ first (Bien'ici uses Next.js)
+    data = await _pw_get_next_data(search_url)
+    if data:
+        props = data.get("props", {}).get("pageProps", {})
+        ads = (
+            (props.get("searchResults") or {}).get("ads")
+            or props.get("ads")
+            or props.get("realEstateAds")
+            or props.get("listings")
+            or []
+        )
+        if ads:
+            listings = [l for l in (_bienici_ad_to_listing(a) for a in ads[:max_results]) if l]
+            logger.info("[BIENICI] Found %d listings via __NEXT_DATA__", len(listings))
+            return listings
+        logger.warning("[BIENICI] No ads in __NEXT_DATA__. pageProps keys: %s", list(props.keys())[:10])
+
+    # Fallback: intercept the JSON API response (realEstateAds.json endpoint)
+    captured: list[dict] = []
+
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=_USER_DATA_DIR,
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="fr-FR",
+        )
+        page = await ctx.new_page()
+        await Stealth().apply_stealth_async(page)
+
+        async def _on_bienici_response(r):
+            if ("realEstateAds" in r.url or "/search" in r.url) and r.status == 200:
+                ct = r.headers.get("content-type", "")
+                if "json" in ct:
+                    try:
+                        body = await r.json()
+                        ads = body.get("realEstateAds") or body.get("ads") or []
+                        captured.extend(ads)
+                    except Exception:
+                        pass
+
+        page.on("response", _on_bienici_response)
+        try:
+            await page.goto(search_url, wait_until="networkidle", timeout=35_000)
+            await _handle_cookie_banner(page)
+            await asyncio.sleep(random.uniform(2.0, 3.0))
+        finally:
+            await ctx.close()
+
+    if not captured:
+        logger.warning("[BIENICI] Could not capture any listings")
+        return []
+
+    listings = [l for l in (_bienici_ad_to_listing(a) for a in captured[:max_results]) if l]
+    logger.info("[BIENICI] Found %d listings via XHR intercept", len(listings))
+    return listings
+
+
+# ─── Logic-Immo listing normalisation ────────────────────────────────────────
+
+def _logicimmo_item_to_listing(item) -> Optional[Listing]:
+    """Parse a Logic-Immo BeautifulSoup card element into a Listing."""
+    import re as _re2
+    from bs4 import BeautifulSoup  # noqa: F401 — already imported at call site
+
+    # Try data attribute for ID first, then extract from href
+    li_id = item.get("data-listing-id") or item.get("data-id") or ""
+    href = ""
+    if not li_id:
+        link = item.find("a", href=_re2.compile(r"/(annonce|location)/"))
+        if link:
+            href = link.get("href", "")
+        m = _re2.search(r"-(\d+)\.htm", href)
+        if not m:
+            return None
+        li_id = m.group(1)
+
+    listing_id = f"li_{li_id}"
+    url = (
+        (f"https://www.logic-immo.com{href}" if href.startswith("/") else href)
+        or f"https://www.logic-immo.com/annonce-location-{li_id}.htm"
+    )
+
+    text = item.get_text(separator=" ", strip=True)
+    text = _re2.sub(r"\s+", " ", text)
+
+    # Price
+    price_raw = None
+    pm = _re2.search(r"([\d][\d\s\xa0\.]*)\s*€", text)
+    if pm:
+        try:
+            price_raw = int(pm.group(1).replace(".", "").replace("\xa0", "").replace(" ", ""))
+        except ValueError:
+            pass
+
+    # Location
+    location = ""
+    loc_el = item.find(class_=_re2.compile(r"city|localisation|location|ville", _re2.I))
+    if loc_el:
+        location = loc_el.get_text(strip=True)
+
+    # Surface for title
+    sm = _re2.search(r"(\d+)\s*m²", text, _re2.IGNORECASE)
+    surface = sm.group(1) if sm else ""
+
+    # Title
+    title_el = item.find(class_=_re2.compile(r"title|titre|heading", _re2.I))
+    title = (
+        title_el.get_text(strip=True) if title_el
+        else (f"Appartement {surface}m² — {location}" if surface else text[:80])
+    )
+
+    # Description
+    desc_el = item.find(class_=_re2.compile(r"desc|summary|resume|teaser", _re2.I))
+    description = desc_el.get_text(strip=True) if desc_el else ""
+
+    # Seller
+    seller_el = item.find(class_=_re2.compile(r"agency|agence|seller|advertiser", _re2.I))
+    seller_name = seller_el.get_text(strip=True) if seller_el else "Annonceur"
+
+    images = [
+        src for img in item.find_all("img")
+        if (src := img.get("src") or img.get("data-src") or "").startswith("http")
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description=description,
+        price=price_raw,
+        location=location,
+        seller_name=seller_name,
+        url=url,
+        seller_type_hint="pro",
+        source="logicimmo",
+        images=images,
+    )
+
+
+async def _search_logicimmo_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    logger.info("[LOGICIMMO] Scraping search page: %s", search_url)
+    try:
+        from bs4 import BeautifulSoup
+        import re as _re2
+
+        html: Optional[str] = None
+
+        async with async_playwright() as pw:
+            ctx = await pw.chromium.launch_persistent_context(
+                user_data_dir=_USER_DATA_DIR,
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="fr-FR",
+            )
+            page = await ctx.new_page()
+            await Stealth().apply_stealth_async(page)
+            try:
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+                await _handle_cookie_banner(page)
+                await asyncio.sleep(random.uniform(2.0, 3.5))
+                html = await page.content()
+            finally:
+                await ctx.close()
+
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, "html.parser")
+        items = (
+            soup.find_all("article", class_=_re2.compile(r"listing|ad-result|property", _re2.I))
+            or soup.find_all(attrs={"data-listing-id": True})
+            or soup.find_all(class_=_re2.compile(r"listing-item|search-result-item|offer-card", _re2.I))
+        )
+        logger.info("[LOGICIMMO] Found %d card elements", len(items))
+
+        listings = [l for l in (_logicimmo_item_to_listing(i) for i in items[:max_results]) if l]
+        logger.info("[LOGICIMMO] Parsed %d listings", len(listings))
+        return listings
+
+    except Exception as exc:
+        logger.warning("[LOGICIMMO] Scraping failed: %s", exc)
+        return []
+
+
+# ─── Listing quality + fraud filter ──────────────────────────────────────────
 
 _SKIP_TITLE = _re.compile(
     r"sous.?loc|contre service|recherch|cherch|coloc|parking|garage|cave|"
@@ -609,14 +873,51 @@ def is_real_offer(listing: Listing) -> bool:
     return True
 
 
+_FRAUD_KEYWORDS = _re.compile(
+    r"western union|moneygram|virement avant visite|"
+    r"clés? par courrier|remise des clés? à distance|"
+    r"je suis à l.étranger|partant? à l.étranger|travail (à|en) l.étranger|"
+    r"envoyer l.argent|wire transfer|arnaque|scam",
+    _re.IGNORECASE,
+)
+
+
+def is_suspicious(listing: Listing) -> tuple[bool, str]:
+    """Return (True, reason) if the listing shows fraud or spam signals."""
+    blob = f"{listing.title} {listing.description}"
+
+    m = _FRAUD_KEYWORDS.search(blob)
+    if m:
+        return True, f"Mot-clé suspect : '{m.group()}'"
+
+    if listing.price and listing.price < 350:
+        return True, f"Prix anormalement bas ({listing.price}€)"
+
+    if listing.description and len(listing.description.strip()) < 20:
+        return True, "Description quasi vide"
+
+    if listing.title and len(listing.title) > 250:
+        return True, "Titre anormalement long (spam)"
+
+    return False, ""
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def _is_pap(url: str) -> bool:
     return "pap.fr" in url
 
 
+def _is_bienici(url: str) -> bool:
+    return "bienici.com" in url
+
+
+def _is_logicimmo(url: str) -> bool:
+    return "logic-immo.com" in url
+
+
 async def search_listings(search_url: str, max_results: int = 50) -> list[Listing]:
-    """Scrape a search page. Source auto-detected from URL (LBC, SeLoger, or PAP)."""
+    """Scrape a search page. Source auto-detected from URL (LBC, SeLoger, PAP, Bien'ici, Logic-Immo)."""
     if config.MOCK_MODE:
         from mock_data import MOCK_LISTINGS
         logger.info("[MOCK] Returning %d fake listings", len(MOCK_LISTINGS))
@@ -627,6 +928,12 @@ async def search_listings(search_url: str, max_results: int = 50) -> list[Listin
 
     if _is_pap(search_url):
         return await _search_pap_with_playwright(search_url, max_results)
+
+    if _is_bienici(search_url):
+        return await _search_bienici_with_playwright(search_url, max_results)
+
+    if _is_logicimmo(search_url):
+        return await _search_logicimmo_with_playwright(search_url, max_results)
 
     if config.USE_APIFY:
         logger.info("[APIFY] Scraping search (max %d): %s", max_results, search_url)

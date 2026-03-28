@@ -22,8 +22,8 @@ from telegram.request import HTTPXRequest
 
 import config
 import database
-from agent import analyse_listing, format_simulation_text, classify_intent, Listing, score_listing
-from scraper import search_listings, fetch_single_listing, is_real_offer
+from agent import analyse_listing, format_simulation_text, classify_intent, Listing, score_listing, prescreen_listing
+from scraper import search_listings, fetch_single_listing, is_real_offer, is_suspicious
 from messenger import send_message_safe, check_inbox_lbc
 from profile import PROFILE
 
@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _campaign_running = False
 _auto_task: asyncio.Task | None = None
+_watch_task: asyncio.Task | None = None
 
 
 # ─── Helper ───────────────────────────────────────────────────────────────────
@@ -65,6 +66,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• /campagne — Lancer la campagne complète\n"
         "• /autostart [heures] — Campagne automatique (défaut : 3h)\n"
         "• /autostop — Arrêter la campagne automatique\n"
+        "• /watch [min] — Mode veille : nouvelles annonces toutes les N min (défaut : 15)\n"
+        "• /unwatch — Désactiver le mode veille\n"
         "• /rapport — Stats du jour\n"
         "• /settings — Critères de recherche\n"
         "• /visite <url> <date> — Enregistrer une visite\n"
@@ -277,7 +280,21 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as exc:
         logger.error("PAP scrape failed: %s", exc)
 
-    listings = listings_lbc + listings_sl + listings_pap
+    # Scrape Bien'ici
+    listings_bi: list = []
+    try:
+        listings_bi = await search_listings(config.DEFAULT_SEARCH_BIENICI_URL, max_results=25)
+    except Exception as exc:
+        logger.error("Bien'ici scrape failed: %s", exc)
+
+    # Scrape Logic-Immo
+    listings_li: list = []
+    try:
+        listings_li = await search_listings(config.DEFAULT_SEARCH_LOGICIMMO_URL, max_results=25)
+    except Exception as exc:
+        logger.error("Logic-Immo scrape failed: %s", exc)
+
+    listings = listings_lbc + listings_sl + listings_pap + listings_bi + listings_li
     # Deduplication: remove cross-platform duplicates by (price, location, seller_name)
     listings = _deduplicate(listings)
 
@@ -289,6 +306,7 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await _reply(
         update,
         f"📋 {len(listings_lbc)} LBC + {len(listings_sl)} SeLoger + {len(listings_pap)} PAP "
+        f"+ {len(listings_bi)} Bien'ici + {len(listings_li)} Logic-Immo "
         f"→ *{len(listings)} uniques* — analyse en cours…"
     )
 
@@ -314,6 +332,22 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         if database.already_contacted(listing.lbc_id):
             skipped_dup += 1
             continue
+
+        # Fraud detection
+        suspicious, suspicion_reason = is_suspicious(listing)
+        if suspicious:
+            logger.info("Suspicious listing %s skipped: %s", listing.lbc_id, suspicion_reason)
+            skipped_dup += 1
+            continue
+
+        # Optional dossier pre-screening
+        if config.ENABLE_PRESCREENING:
+            prescreen = await prescreen_listing(listing)
+            if not prescreen["eligible"]:
+                logger.info("Ineligible listing %s: %s", listing.lbc_id, prescreen["note"])
+                skipped_dup += 1
+                await _reply(update, f"⚠️ Dossier incompatible → _{listing.title}_ : _{prescreen['note']}_")
+                continue
 
         if database.messages_sent_last_hour() >= config.MAX_MESSAGES_PER_HOUR:
             skipped_rate += 1
@@ -387,6 +421,41 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             database.clear_price_prev(d.get("lbc_id", ""))
         await _reply(update, "\n".join(lines))
 
+    # Smart re-contact: listings never messaged that just dropped into budget
+    uncontacted_drops = database.get_uncontacted_price_drops(PROFILE["search"]["max_rent"])
+    if uncontacted_drops:
+        await _reply(
+            update,
+            f"💸 *{len(uncontacted_drops)} annonce(s)* jamais contactée(s) sont passées sous budget — contact en cours…"
+        )
+        for drop in uncontacted_drops:
+            if database.messages_sent_last_hour() >= config.MAX_MESSAGES_PER_HOUR:
+                break
+            try:
+                listing = await fetch_single_listing(drop["url"])
+                if not listing:
+                    continue
+                suspicious, _ = is_suspicious(listing)
+                if suspicious:
+                    continue
+                result = await analyse_listing(listing)
+                listing_id = database.upsert_listing(
+                    lbc_id=listing.lbc_id, title=listing.title, price=listing.price,
+                    location=listing.location, seller_name=listing.seller_name,
+                    seller_type=result.seller_type, url=listing.url, source=listing.source,
+                )
+                contact_id = database.create_contact(listing_id, result.message)
+                success = await send_message_safe(listing.url, result.message, contact_id)
+                if success:
+                    await _reply(
+                        update,
+                        f"💸✉️ Contacté (baisse) → _{listing.title}_ "
+                        f"({drop['price_prev']}€ → *{drop['price']}€*)"
+                    )
+            except Exception as exc:
+                logger.error("Smart re-contact failed for %s: %s", drop["url"], exc)
+            await asyncio.sleep(3)
+
     # Check LBC inbox for new replies
     try:
         new_replies = await check_inbox_lbc()
@@ -414,18 +483,32 @@ async def cmd_campagne(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_rapport(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     stats = database.today_stats()
+    rates = database.tone_response_rates()
+    stale = database.stale_contacts_count(config.STALE_DAYS)
     s = PROFILE["search"]
     zones_short = ", ".join(s["zones"][:2]) + "…"
+
+    rate_lines = []
+    for tone_type, data in rates.items():
+        emoji = "👤" if tone_type == "particulier" else "🏢"
+        rate_lines.append(
+            f"{emoji} {tone_type.capitalize()}: {data['rate']}% "
+            f"({data['responded']}/{data['sent']} réponses)"
+        )
+    rates_text = "\n".join(rate_lines) if rate_lines else "Pas encore de données"
+
     await _reply(
         update,
-        f"📊 *LEBONCOIN UPDATE*\n\n"
+        f"📊 *RAPPORT IMMOBILIER*\n\n"
         f"🎯 Critères : Appart meublé, {s['min_surface']}m²+, max {s['max_rent']}€, {zones_short}\n"
         f"📅 Période : aujourd'hui\n\n"
         f"📋 Annonces scrapées : {stats['scraped']}\n"
         f"✉️ Messages envoyés : {stats['sent']}\n"
         f"✅ Réponses positives : {stats['positive']}\n"
         f"❌ Réponses négatives : {stats['negative']}\n"
-        f"🔇 Sans réponse : {stats['no_response']}\n\n"
+        f"🔇 Sans réponse : {stats['no_response']} "
+        f"(dont *{stale}* fantômes depuis +{config.STALE_DAYS}j)\n\n"
+        f"📈 *Taux de réponse par type :*\n{rates_text}\n\n"
         f"🤖 Continuer la campagne demain ?",
     )
 
@@ -519,6 +602,101 @@ async def cmd_visites(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for v in visits:
         lines.append(f"• #{v['id']} — {v['date_str']}\n  {v['url']}")
     await _reply(update, "\n".join(lines))
+
+
+# ─── /watch + /unwatch ────────────────────────────────────────────────────────
+
+async def _fast_poll_loop(update: Update, ctx: ContextTypes.DEFAULT_TYPE, interval_min: int) -> None:
+    """
+    Lightweight background poller.
+    Scrapes all sources every `interval_min` minutes and immediately contacts
+    any listings that are new (not yet in DB and not already contacted).
+    """
+    while True:
+        logger.info("[WATCH] Fast poll starting…")
+        all_listings: list = []
+
+        sources = [
+            (config.DEFAULT_SEARCH_URL, "LBC"),
+            (config.DEFAULT_SEARCH_PAP_URL, "PAP"),
+            (config.DEFAULT_SEARCH_BIENICI_URL, "Bien'ici"),
+            (config.DEFAULT_SEARCH_LOGICIMMO_URL, "Logic-Immo"),
+        ]
+        if config.SELOGER_EMAIL:
+            sources.append((config.DEFAULT_SEARCH_SELOGER_URL, "SeLoger"))
+
+        for source_url, source_name in sources:
+            try:
+                results = await search_listings(source_url, max_results=20)
+                all_listings.extend(results)
+            except Exception as exc:
+                logger.warning("[WATCH] %s scrape failed: %s", source_name, exc)
+
+        all_listings = _deduplicate(all_listings)
+        new = [
+            lst for lst in all_listings
+            if is_real_offer(lst)
+            and not database.already_contacted(lst.lbc_id)
+            and (not lst.price or lst.price <= PROFILE["search"]["max_rent"])
+            and not is_suspicious(lst)[0]
+        ]
+
+        if new:
+            await _reply(update, f"🆕 *{len(new)} nouvelle(s) annonce(s)* détectée(s) — contact en cours…")
+            sent = 0
+            for listing in new:
+                if database.messages_sent_last_hour() >= config.MAX_MESSAGES_PER_HOUR:
+                    await _reply(update, f"⏸ Limite horaire atteinte ({config.MAX_MESSAGES_PER_HOUR}/h).")
+                    break
+                try:
+                    result = await analyse_listing(listing)
+                    listing_id = database.upsert_listing(
+                        lbc_id=listing.lbc_id, title=listing.title, price=listing.price,
+                        location=listing.location, seller_name=listing.seller_name,
+                        seller_type=result.seller_type, url=listing.url, source=listing.source,
+                    )
+                    contact_id = database.create_contact(listing_id, result.message)
+                    success = await send_message_safe(listing.url, result.message, contact_id)
+                    if success:
+                        sent += 1
+                        await _reply(update, f"✉️ → _{listing.title}_ ({listing.location})")
+                except Exception as exc:
+                    logger.error("[WATCH] Error on %s: %s", listing.lbc_id, exc)
+                await asyncio.sleep(2)
+
+            if sent:
+                await _reply(update, f"✅ {sent} message(s) envoyé(s).")
+
+        logger.info("[WATCH] Done — next poll in %d min", interval_min)
+        await asyncio.sleep(interval_min * 60)
+
+
+async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global _watch_task
+    if _watch_task and not _watch_task.done():
+        await _reply(update, "⚠️ Mode veille déjà actif. Utilise /unwatch pour l'arrêter.")
+        return
+    try:
+        interval = int(ctx.args[0]) if ctx.args else config.FAST_POLL_INTERVAL_MIN
+    except (ValueError, IndexError):
+        interval = config.FAST_POLL_INTERVAL_MIN
+    await _reply(
+        update,
+        f"👁 *Mode veille activé* — scraping toutes les {interval} min\n"
+        "Nouvelles annonces contactées automatiquement.\n"
+        "Utilise /unwatch pour désactiver."
+    )
+    _watch_task = asyncio.create_task(_fast_poll_loop(update, ctx, interval))
+
+
+async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global _watch_task
+    if _watch_task and not _watch_task.done():
+        _watch_task.cancel()
+        _watch_task = None
+        await _reply(update, "👁 Mode veille désactivé.")
+    else:
+        await _reply(update, "ℹ️ Aucun mode veille actif.")
 
 
 # ─── /boite ───────────────────────────────────────────────────────────────────
@@ -658,6 +836,8 @@ def main() -> None:
     app.add_handler(CommandHandler("visite", cmd_visite))
     app.add_handler(CommandHandler("visites", cmd_visites))
     app.add_handler(CommandHandler("boite", cmd_boite))
+    app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("unwatch", cmd_unwatch))
     app.add_handler(CallbackQueryHandler(callback_handler))
     # Natural language fallback — catches any non-command text message
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_chat))

@@ -83,3 +83,27 @@ DEFAULT_SEARCH_PAP_URL: str = os.getenv(
     "https://www.pap.fr/annonce/locations-appartement-paris-75g439-ile-de-france-g439"
     "?loyer-max=1000&surface-min=25&ameublement=meuble",
 )
+
+# Default Bien'ici search URL (Paris IDF, meublé, 25m²+, max 1000€)
+DEFAULT_SEARCH_BIENICI_URL: str = os.getenv(
+    "BIENICI_SEARCH_URL",
+    "https://www.bienici.com/recherche/location/paris-ile-de-france"
+    "?prix-max=1000&surface-min=25&meuble=true",
+)
+
+# Default Logic-Immo search URL (Paris IDF, meublé, 25m²+, max 1000€)
+# ⚠️ Copy the URL from your browser after filtering on logic-immo.com with your criteria
+DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
+    "LOGICIMMO_SEARCH_URL",
+    "https://www.logic-immo.com/location-appartement/paris,ile-de-france"
+    "?avec=meuble&surface-min=25&prix-max=1000",
+)
+
+# ── Fast poller (mode veille) ─────────────────────────────────────────────────
+FAST_POLL_INTERVAL_MIN: int = int(os.getenv("FAST_POLL_INTERVAL_MIN", "15"))
+
+# ── Dossier pre-screening (off by default — costs ~$0.003/listing extra) ──────
+ENABLE_PRESCREENING: bool = os.getenv("ENABLE_PRESCREENING", "false").lower() in ("true", "1", "yes")
+
+# ── Stale contact threshold (days without reply before flagged as ghost) ──────
+STALE_DAYS: int = int(os.getenv("STALE_DAYS", "5"))

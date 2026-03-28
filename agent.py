@@ -299,6 +299,51 @@ async def analyse_listing(listing: Listing) -> AnalysisResult:
     )
 
 
+# ─── Dossier pre-screening (optional, ENABLE_PRESCREENING=true) ──────────────
+
+async def prescreen_listing(listing: Listing) -> dict:
+    """Check profile compatibility with listing requirements.
+    Returns {"eligible": bool, "note": str}.
+    Always eligible in mock mode or when ENABLE_PRESCREENING=false.
+    """
+    if config.MOCK_MODE or not config.ENABLE_PRESCREENING:
+        return {"eligible": True, "note": ""}
+
+    s = PROFILE["search"]
+    prompt = (
+        f"Annonce de location :\n"
+        f"- Titre : {listing.title}\n"
+        f"- Prix : {listing.price}€/mois\n"
+        f"- Description : {listing.description[:500]}\n\n"
+        f"Profil du candidat :\n"
+        f"- Alternant SNCF Voyageurs, 1 850€/mois net\n"
+        f"- CDI SNCF confirmé septembre 2026, double revenu pacsé (~800€/mois supplémentaires)\n"
+        f"- Emménagement souhaité : septembre 2026\n"
+        f"- Budget max : {s['max_rent']}€ CC\n\n"
+        "Si l'annonce mentionne des conditions (ratio salaire/loyer, type de contrat, "
+        "date de disponibilité, garant requis, etc.), vérifie la compatibilité.\n"
+        "Si aucune condition n'est mentionnée, considère le profil compatible.\n"
+        "Réponds sur 2 lignes exactement :\n"
+        "ELIGIBLE: oui|non\n"
+        "NOTE: <raison si non éligible, sinon laisse vide>"
+    )
+    resp = _client.messages.create(
+        model=config.CLAUDE_MODEL,
+        max_tokens=80,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = resp.content[0].text.strip()
+    eligible = True
+    note = ""
+    for line in text.splitlines():
+        if line.upper().startswith("ELIGIBLE:"):
+            eligible = "non" not in line.lower()
+        elif line.upper().startswith("NOTE:"):
+            note = line.split(":", 1)[-1].strip()
+    logger.info("Prescreening %s → eligible=%s note=%s", listing.lbc_id, eligible, note)
+    return {"eligible": eligible, "note": note}
+
+
 # ─── Intent classification (natural language → action) ───────────────────────
 
 _INTENT_TOOLS = [
