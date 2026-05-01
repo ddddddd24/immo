@@ -650,7 +650,11 @@ def classify_intent(user_message: str, history: list[dict] | None = None) -> dic
     messages.append({"role": "user", "content": user_message})
     resp = _call_claude(
         model=config.CLAUDE_MODEL,
-        max_tokens=200,
+        # 1024 leaves plenty of room for the `reply` tool's `text` param to
+        # contain a full conversational answer in French. The 200-token cap
+        # we used before was bounded by the tool_use JSON envelope (~150
+        # tokens of structure overhead) and truncated replies mid-phrase.
+        max_tokens=1024,
         system=_INTENT_SYSTEM,
         tools=_INTENT_TOOLS,
         tool_choice={"type": "any"},
