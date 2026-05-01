@@ -26,8 +26,10 @@ _APIFY_BASE = "https://api.apify.com/v2"
 _POLL_INTERVAL = 5
 _MAX_WAIT = 300
 
-# Persistent browser profile — keeps cookies/session across runs
-_USER_DATA_DIR = str(Path("data/browser_profile"))
+# Persistent browser profiles — keeps cookies/session across runs.
+# Per-site dirs to avoid cookie pollution across portals (LBC, PAP, Bien'ici, Logic-Immo).
+def _user_data_dir(site: str) -> str:
+    return str(Path(f"data/browser_profile_{site}"))
 
 
 # ─── Shared Playwright browser helper ────────────────────────────────────────
@@ -44,16 +46,17 @@ async def _handle_cookie_banner(page) -> None:
         pass  # banner not present or already dismissed
 
 
-async def _pw_get_next_data(url: str) -> Optional[dict]:
+async def _pw_get_next_data(url: str, site: str = "leboncoin") -> Optional[dict]:
     """
     Open *url* using a persistent Chromium profile with stealth enabled.
     Returns parsed __NEXT_DATA__ JSON or None.
     """
-    Path(_USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
+    profile_dir = _user_data_dir(site)
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as pw:
         ctx = await pw.chromium.launch_persistent_context(
-            user_data_dir=_USER_DATA_DIR,
+            user_data_dir=profile_dir,
             headless=False,
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -98,12 +101,47 @@ def _is_seloger(url: str) -> bool:
 # ─── Listing normalisation ────────────────────────────────────────────────────
 
 def _parse_price(raw) -> Optional[int]:
+    """Extract a single rent value from raw input.
+
+    Walks the string left-to-right, accumulating digits and thousand-separators
+    (space, NBSP, dot, comma) for the FIRST contiguous number. Stops at the
+    first non-numeric break after at least one digit — this prevents
+    `"2100€ + charges 350€"` from yielding 2100350.
+
+    Returns None for values outside a plausible monthly-rent band [50, 50000].
+    """
     if raw is None:
         return None
     if isinstance(raw, (int, float)):
-        return int(raw)
-    digits = "".join(c for c in str(raw) if c.isdigit())
-    return int(digits) if digits else None
+        value = int(raw)
+        return value if 50 <= value <= 50000 else None
+
+    s = str(raw)
+    seen_digit = False
+    chars: list[str] = []
+    for c in s:
+        if c.isdigit():
+            chars.append(c)
+            seen_digit = True
+        elif c in (" ", "\xa0", ".", ","):
+            if seen_digit:
+                chars.append(c)
+            # else: leading separator, ignore
+        else:
+            if seen_digit:
+                break
+            # else: leading non-digit (e.g. currency), keep scanning
+
+    if not seen_digit:
+        return None
+    cleaned = "".join(c for c in chars if c.isdigit())
+    if not cleaned:
+        return None
+    try:
+        value = int(cleaned)
+    except ValueError:
+        return None
+    return value if 50 <= value <= 50000 else None
 
 
 def _ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
@@ -500,7 +538,7 @@ async def _search_pap_with_playwright(search_url: str, max_results: int) -> list
 
         async with async_playwright() as pw:
             ctx = await pw.chromium.launch_persistent_context(
-                user_data_dir=_USER_DATA_DIR,
+                user_data_dir=_user_data_dir("pap"),
                 headless=False,
                 args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
                 user_agent=(
@@ -544,23 +582,59 @@ async def _search_pap_with_playwright(search_url: str, max_results: int) -> list
 
 # ─── Apify scrapers (paid, opt-in via USE_APIFY=true) ────────────────────────
 
+_APIFY_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+async def _apify_request(coro_factory) -> "httpx.Response":
+    """Invoke an httpx coroutine with bounded retry on transient errors.
+
+    coro_factory is a zero-arg callable that returns a fresh coroutine
+    (so we can retry without reusing an awaited coroutine). Retries 3 times
+    on TransportError and on 429/5xx, with exponential backoff (2s, 4s).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = await coro_factory()
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in _APIFY_RETRYABLE_STATUS:
+                raise
+            last_exc = exc
+            logger.warning(
+                "Apify HTTP %d (attempt %d/3)",
+                exc.response.status_code, attempt + 1,
+            )
+        except httpx.TransportError as exc:
+            last_exc = exc
+            logger.warning("Apify transport error (attempt %d/3): %s", attempt + 1, exc)
+        if attempt < 2:
+            await asyncio.sleep(2 * (2 ** attempt))
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _run_actor(actor_id: str, input_payload: dict) -> list[dict]:
     headers = {"Content-Type": "application/json"}
     params = {"token": config.APIFY_API_KEY}
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{_APIFY_BASE}/acts/{actor_id}/runs",
-            json=input_payload, params=params, headers=headers,
+        resp = await _apify_request(
+            lambda: client.post(
+                f"{_APIFY_BASE}/acts/{actor_id}/runs",
+                json=input_payload, params=params, headers=headers,
+            )
         )
-        resp.raise_for_status()
         run_id = resp.json()["data"]["id"]
         logger.info("Apify run started: actor=%s run_id=%s", actor_id, run_id)
 
+        s = None
         deadline = time.time() + _MAX_WAIT
         while time.time() < deadline:
             await asyncio.sleep(_POLL_INTERVAL)
-            s = await client.get(f"{_APIFY_BASE}/actor-runs/{run_id}", params=params)
-            s.raise_for_status()
+            s = await _apify_request(
+                lambda: client.get(f"{_APIFY_BASE}/actor-runs/{run_id}", params=params)
+            )
             status = s.json()["data"]["status"]
             if status == "SUCCEEDED":
                 break
@@ -570,11 +644,12 @@ async def _run_actor(actor_id: str, input_payload: dict) -> list[dict]:
             raise TimeoutError(f"Apify run {run_id} timed out after {_MAX_WAIT}s")
 
         dataset_id = s.json()["data"]["defaultDatasetId"]
-        items = await client.get(
-            f"{_APIFY_BASE}/datasets/{dataset_id}/items",
-            params={**params, "format": "json", "clean": "true"},
+        items = await _apify_request(
+            lambda: client.get(
+                f"{_APIFY_BASE}/datasets/{dataset_id}/items",
+                params={**params, "format": "json", "clean": "true"},
+            )
         )
-        items.raise_for_status()
         return items.json()
 
 
@@ -647,7 +722,7 @@ async def _search_bienici_with_playwright(search_url: str, max_results: int) -> 
     logger.info("[BIENICI] Scraping search page: %s", search_url)
 
     # Try __NEXT_DATA__ first (Bien'ici uses Next.js)
-    data = await _pw_get_next_data(search_url)
+    data = await _pw_get_next_data(search_url, site="bienici")
     if data:
         props = data.get("props", {}).get("pageProps", {})
         ads = (
@@ -668,7 +743,7 @@ async def _search_bienici_with_playwright(search_url: str, max_results: int) -> 
 
     async with async_playwright() as pw:
         ctx = await pw.chromium.launch_persistent_context(
-            user_data_dir=_USER_DATA_DIR,
+            user_data_dir=_user_data_dir("bienici"),
             headless=False,
             args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
             user_agent=(
@@ -801,7 +876,7 @@ async def _search_logicimmo_with_playwright(search_url: str, max_results: int) -
 
         async with async_playwright() as pw:
             ctx = await pw.chromium.launch_persistent_context(
-                user_data_dir=_USER_DATA_DIR,
+                user_data_dir=_user_data_dir("logicimmo"),
                 headless=False,
                 args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
                 user_agent=(
@@ -840,6 +915,337 @@ async def _search_logicimmo_with_playwright(search_url: str, max_results: int) -
     except Exception as exc:
         logger.warning("[LOGICIMMO] Scraping failed: %s", exc)
         return []
+
+
+# ─── Shared HTML fetcher + generic card parser (used by new scrapers) ───────
+#
+# These were added during Phase 2 (student/young-pro platforms). Each new
+# scraper tries __NEXT_DATA__ via _pw_get_next_data first, and falls back to
+# _fetch_html_with_stealth + _parse_generic_card. Site-specific structure isn't
+# known ahead of time — selectors may need tuning against live HTML on first run.
+
+async def _fetch_html_with_stealth(
+    url: str, site: str, post_delay: tuple[float, float] = (2.0, 3.5)
+) -> Optional[str]:
+    """Fetch fully-rendered HTML using a per-site persistent Chromium profile."""
+    profile_dir = _user_data_dir(site)
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    async with async_playwright() as pw:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="fr-FR",
+        )
+        page = await ctx.new_page()
+        await Stealth().apply_stealth_async(page)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            await _handle_cookie_banner(page)
+            await asyncio.sleep(random.uniform(*post_delay))
+            return await page.content()
+        except Exception as exc:
+            logger.warning("[%s] page fetch failed: %s", site.upper(), exc)
+            return None
+        finally:
+            await ctx.close()
+
+
+def _parse_generic_card(item, base_url: str, source: str, prefix: str) -> Optional[Listing]:
+    """Best-effort parser for a French rental search-card.
+
+    Common patterns: anchor to detail page, price in €, surface in m², location
+    in a 'city/ville/location' class. Returns None if no link or no price.
+    """
+    import re as _re2
+
+    link = item.find("a", href=True)
+    href = link["href"] if link else ""
+    if not href:
+        return None
+    if href.startswith("/"):
+        href = base_url.rstrip("/") + href
+    elif not href.startswith("http"):
+        href = base_url.rstrip("/") + "/" + href
+
+    id_m = (
+        _re2.search(r"-(\d{5,})(?:\.htm|/?$)", href)
+        or _re2.search(r"/(\d{5,})(?:[/?]|$)", href)
+        or _re2.search(r"id[=/](\d{5,})", href, _re2.I)
+    )
+    raw_id = id_m.group(1) if id_m else href.rsplit("/", 1)[-1].split("?")[0][:32] or "0"
+    listing_id = f"{prefix}_{raw_id}"
+
+    text = item.get_text(separator=" ", strip=True)
+    text = _re2.sub(r"\s+", " ", text)
+
+    price = None
+    pm = _re2.search(r"([\d][\d\s\xa0\.]{1,})\s*€", text)
+    if pm:
+        try:
+            price = int(pm.group(1).replace(".", "").replace("\xa0", "").replace(" ", ""))
+        except ValueError:
+            pass
+
+    sm = _re2.search(r"(\d+)\s*m²", text, _re2.IGNORECASE)
+    surface = sm.group(1) if sm else ""
+
+    title_el = item.find(class_=_re2.compile(r"title|titre|heading|name", _re2.I))
+    title = (
+        title_el.get_text(strip=True) if title_el
+        else (f"Logement {surface}m²" if surface else text[:80])
+    )
+
+    loc_el = item.find(class_=_re2.compile(r"city|ville|locality|address|location", _re2.I))
+    location = loc_el.get_text(strip=True) if loc_el else ""
+
+    desc_el = item.find(class_=_re2.compile(r"desc|summary|teaser|excerpt|resume", _re2.I))
+    description = desc_el.get_text(strip=True) if desc_el else ""
+
+    seller_el = item.find(class_=_re2.compile(r"agency|agence|seller|advertiser|provider|owner", _re2.I))
+    seller_name = seller_el.get_text(strip=True) if seller_el else "Annonceur"
+
+    images = [
+        src for img in item.find_all("img")
+        if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description=description,
+        price=price,
+        location=location,
+        seller_name=seller_name,
+        url=href,
+        seller_type_hint="",
+        source=source,
+        images=images,
+    )
+
+
+def _ads_from_next_data(data: dict) -> list:
+    """Extract candidate ad list from a __NEXT_DATA__ blob using common keys."""
+    if not data:
+        return []
+    props = data.get("props", {}).get("pageProps", {}) or {}
+    return (
+        props.get("ads")
+        or props.get("listings")
+        or props.get("results")
+        or props.get("offers")
+        or props.get("items")
+        or props.get("annonces")
+        or props.get("rooms")
+        or (props.get("searchResults") or {}).get("ads")
+        or (props.get("searchResults") or {}).get("results")
+        or (props.get("searchData") or {}).get("ads")
+        or []
+    )
+
+
+def _generic_ad_to_listing(
+    ad: dict, base_url: str, source: str, prefix: str
+) -> Optional[Listing]:
+    """Map a JSON ad dict (from __NEXT_DATA__) to a Listing using common keys."""
+    raw_id = str(
+        ad.get("id") or ad.get("listingId") or ad.get("uuid")
+        or ad.get("slug") or ad.get("reference") or ""
+    )
+    if not raw_id:
+        return None
+    listing_id = f"{prefix}_{raw_id}"
+
+    href = ad.get("url") or ad.get("link") or ad.get("permalink") or ""
+    if href and href.startswith("/"):
+        href = base_url.rstrip("/") + href
+    elif not href:
+        slug = ad.get("slug") or raw_id
+        href = f"{base_url.rstrip('/')}/{slug}"
+
+    price_raw = (
+        ad.get("price") or ad.get("rent") or ad.get("monthlyRent")
+        or ad.get("pricePerMonth") or ad.get("loyer")
+        or (ad.get("prices") or {}).get("perMonth")
+    )
+
+    loc = ad.get("location") or ad.get("address") or {}
+    if isinstance(loc, str):
+        location = loc
+    else:
+        city = loc.get("city") or loc.get("locality") or ad.get("city") or ""
+        zipcode = loc.get("zipCode") or loc.get("postalCode") or ad.get("postalCode") or ""
+        location = ", ".join(filter(None, [city, zipcode]))
+
+    seller = ad.get("agency") or ad.get("owner") or ad.get("contact") or {}
+    if isinstance(seller, dict):
+        seller_name = seller.get("name") or seller.get("title") or "Annonceur"
+    else:
+        seller_name = str(seller) or "Annonceur"
+
+    title = ad.get("title") or ad.get("subject") or ad.get("name") or ""
+    description = ad.get("description") or ad.get("descriptif") or ad.get("body") or ""
+
+    images_raw = ad.get("images") or ad.get("photos") or ad.get("gallery") or []
+    images: list[str] = []
+    if isinstance(images_raw, list):
+        for img in images_raw:
+            if isinstance(img, str):
+                images.append(img)
+            elif isinstance(img, dict):
+                u = img.get("url") or img.get("src") or img.get("photo") or ""
+                if u:
+                    images.append(u)
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description=description,
+        price=_parse_price(price_raw),
+        location=location,
+        seller_name=seller_name,
+        url=href,
+        seller_type_hint="",
+        source=source,
+        images=images,
+    )
+
+
+async def _search_via_generic(
+    search_url: str,
+    max_results: int,
+    *,
+    site: str,
+    base_url: str,
+    source: str,
+    prefix: str,
+    card_selectors: list[str],
+) -> list[Listing]:
+    """Generic Next.js-then-cards search routine for the Phase 2 scrapers.
+
+    Tries __NEXT_DATA__ first; if no usable ad list comes back, falls back to
+    HTML card scraping using the supplied list of CSS class regex patterns.
+    """
+    logger.info("[%s] Scraping: %s", source.upper(), search_url)
+    try:
+        data = await _pw_get_next_data(search_url, site=site)
+        ads = _ads_from_next_data(data) if data else []
+        if ads:
+            listings = [
+                l for l in (
+                    _generic_ad_to_listing(a, base_url, source, prefix)
+                    for a in ads[:max_results] if isinstance(a, dict)
+                ) if l
+            ]
+            if listings:
+                logger.info("[%s] Found %d via __NEXT_DATA__", source.upper(), len(listings))
+                return listings
+
+        # Fallback: card scraping
+        html = await _fetch_html_with_stealth(search_url, site)
+        if not html:
+            return []
+        from bs4 import BeautifulSoup
+        import re as _re2
+        soup = BeautifulSoup(html, "html.parser")
+        items = []
+        for sel in card_selectors:
+            items = soup.find_all(class_=_re2.compile(sel, _re2.I))
+            if items:
+                break
+        if not items:
+            items = soup.find_all("article") or soup.find_all(attrs={"data-id": True})
+
+        logger.info("[%s] Found %d card elements", source.upper(), len(items))
+        listings = [
+            l for l in (
+                _parse_generic_card(i, base_url, source, prefix)
+                for i in items[:max_results]
+            ) if l
+        ]
+        logger.info("[%s] Parsed %d listings", source.upper(), len(listings))
+        return listings
+    except Exception as exc:
+        logger.warning("[%s] Scraping failed: %s", source.upper(), exc)
+        return []
+
+
+# ─── Phase 2 scrapers (student / young-pro platforms) ────────────────────────
+# NOTE: selectors below are educated guesses. They follow common French rental
+# site patterns and use _search_via_generic which tries __NEXT_DATA__ first.
+# Run /search <url> against each platform after first launch and tune the
+# `card_selectors` list (and source-specific JSON paths) against live HTML.
+
+async def _search_studapart_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    return await _search_via_generic(
+        search_url, max_results,
+        site="studapart",
+        base_url="https://www.studapart.com",
+        source="studapart",
+        prefix="sa",
+        card_selectors=[r"offer-card|listing-card|propertyCard", r"card|offer|listing"],
+    )
+
+
+async def _search_parisattitude_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    return await _search_via_generic(
+        search_url, max_results,
+        site="parisattitude",
+        base_url="https://www.parisattitude.com",
+        source="parisattitude",
+        prefix="pa",
+        card_selectors=[r"property-card|appartement|search-result", r"card|listing"],
+    )
+
+
+async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    return await _search_via_generic(
+        search_url, max_results,
+        site="lodgis",
+        base_url="https://www.lodgis.com",
+        source="lodgis",
+        prefix="lg",
+        card_selectors=[r"property-item|result-item|annonce-card|search-card", r"card|listing|item"],
+    )
+
+
+async def _search_immojeune_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    return await _search_via_generic(
+        search_url, max_results,
+        site="immojeune",
+        base_url="https://www.immojeune.com",
+        source="immojeune",
+        prefix="ij",
+        card_selectors=[r"annonce|listing-card|offer-card|property", r"card|listing"],
+    )
+
+
+async def _search_locservice_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    return await _search_via_generic(
+        search_url, max_results,
+        site="locservice",
+        base_url="https://www.locservice.fr",
+        source="locservice",
+        prefix="ls",
+        card_selectors=[r"annonce|offre|result|search-item", r"card|listing|item"],
+    )
+
+
+async def _search_roomlala_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    return await _search_via_generic(
+        search_url, max_results,
+        site="roomlala",
+        base_url="https://www.roomlala.com",
+        source="roomlala",
+        prefix="rl",
+        card_selectors=[r"property-card|room-card|listing-card", r"card|listing"],
+    )
 
 
 # ─── Listing quality + fraud filter ──────────────────────────────────────────
@@ -916,8 +1322,36 @@ def _is_logicimmo(url: str) -> bool:
     return "logic-immo.com" in url
 
 
+def _is_studapart(url: str) -> bool:
+    return "studapart.com" in url
+
+
+def _is_parisattitude(url: str) -> bool:
+    return "parisattitude.com" in url
+
+
+def _is_lodgis(url: str) -> bool:
+    return "lodgis.com" in url
+
+
+def _is_immojeune(url: str) -> bool:
+    return "immojeune.com" in url
+
+
+def _is_locservice(url: str) -> bool:
+    return "locservice.fr" in url
+
+
+def _is_roomlala(url: str) -> bool:
+    return "roomlala.com" in url
+
+
 async def search_listings(search_url: str, max_results: int = 50) -> list[Listing]:
-    """Scrape a search page. Source auto-detected from URL (LBC, SeLoger, PAP, Bien'ici, Logic-Immo)."""
+    """Scrape a search page. Source auto-detected from URL.
+
+    Supported: LBC, SeLoger, PAP, Bien'ici, Logic-Immo,
+    Studapart, Paris Attitude, Lodgis, ImmoJeune, LocService, Roomlala.
+    """
     if config.MOCK_MODE:
         from mock_data import MOCK_LISTINGS
         logger.info("[MOCK] Returning %d fake listings", len(MOCK_LISTINGS))
@@ -934,6 +1368,24 @@ async def search_listings(search_url: str, max_results: int = 50) -> list[Listin
 
     if _is_logicimmo(search_url):
         return await _search_logicimmo_with_playwright(search_url, max_results)
+
+    if _is_studapart(search_url):
+        return await _search_studapart_with_playwright(search_url, max_results)
+
+    if _is_parisattitude(search_url):
+        return await _search_parisattitude_with_playwright(search_url, max_results)
+
+    if _is_lodgis(search_url):
+        return await _search_lodgis_with_playwright(search_url, max_results)
+
+    if _is_immojeune(search_url):
+        return await _search_immojeune_with_playwright(search_url, max_results)
+
+    if _is_locservice(search_url):
+        return await _search_locservice_with_playwright(search_url, max_results)
+
+    if _is_roomlala(search_url):
+        return await _search_roomlala_with_playwright(search_url, max_results)
 
     if config.USE_APIFY:
         logger.info("[APIFY] Scraping search (max %d): %s", max_results, search_url)

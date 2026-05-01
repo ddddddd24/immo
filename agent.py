@@ -2,8 +2,9 @@
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import config
 from profile import PROFILE, PARTICULIER_CONTEXT, AGENCE_CONTEXT
@@ -14,9 +15,67 @@ SellerType = Literal["particulier", "agence"]
 
 if not config.MOCK_MODE:
     import anthropic
-    _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    if config.USE_DEEPSEEK:
+        # DeepSeek exposes an Anthropic-compatible endpoint at this base URL,
+        # so the same SDK + tool-use code paths work unchanged.
+        _client = anthropic.Anthropic(
+            api_key=config.DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com/anthropic",
+        )
+        logger.info("LLM provider: DeepSeek (model=%s)", config.CLAUDE_MODEL)
+    else:
+        _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        logger.info("LLM provider: Anthropic (model=%s)", config.CLAUDE_MODEL)
 else:
     _client = None  # type: ignore[assignment]
+
+
+def _first_text(resp) -> str:
+    """Return the first text-block content from a Claude/DeepSeek response.
+
+    DeepSeek V4 always prepends a 'thinking' block to responses on the
+    Anthropic-compatible endpoint; Anthropic's own API doesn't (unless extended
+    thinking is explicitly enabled). This helper handles both transparently.
+    """
+    for block in resp.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    return ""
+
+
+def _call_claude(**kwargs) -> Any:
+    """Invoke Claude (or DeepSeek via Anthropic-compatible endpoint) with retry.
+
+    3 attempts, exponential backoff (2s, 4s, 8s). Retries on connection errors,
+    rate limits, and 5xx upstream errors. Other errors propagate immediately.
+
+    When USE_DEEPSEEK is on, auto-injects thinking={'type':'disabled'} so the
+    response doesn't waste tokens on a chain-of-thought block we don't display.
+    """
+    if _client is None:
+        raise RuntimeError("Claude client unavailable (MOCK_MODE or missing API key)")
+    if config.USE_DEEPSEEK:
+        kwargs.setdefault("thinking", {"type": "disabled"})
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            return _client.messages.create(**kwargs)
+        except anthropic.APIConnectionError as exc:
+            last_exc = exc
+            logger.warning("Claude connection error (attempt %d/3): %s", attempt + 1, exc)
+        except anthropic.RateLimitError as exc:
+            last_exc = exc
+            logger.warning("Claude rate-limited (attempt %d/3): %s", attempt + 1, exc)
+        except anthropic.APIStatusError as exc:
+            if getattr(exc, "status_code", 0) >= 500:
+                last_exc = exc
+                logger.warning("Claude 5xx (attempt %d/3): %s", attempt + 1, exc)
+            else:
+                raise
+        if attempt < 2:
+            time.sleep(2 * (2 ** attempt))
+    assert last_exc is not None
+    raise last_exc
 
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
@@ -82,12 +141,12 @@ def _detect_seller_type(listing: Listing) -> SellerType:
         "Est-ce que le vendeur est un particulier ou une agence immobilière ?\n"
         "Réponds UNIQUEMENT par 'particulier' ou 'agence'."
     )
-    resp = _client.messages.create(
+    resp = _call_claude(
         model=config.CLAUDE_MODEL,
         max_tokens=10,
         messages=[{"role": "user", "content": prompt}],
     )
-    answer = resp.content[0].text.strip().lower()
+    answer = _first_text(resp).strip().lower()
     return "agence" if "agence" in answer else "particulier"
 
 
@@ -164,13 +223,13 @@ def _generate_message(listing: Listing, seller_type: SellerType) -> str:
         system = _AGENCE_SYSTEM
         user_prompt = _build_agence_prompt(listing)
 
-    resp = _client.messages.create(
+    resp = _call_claude(
         model=config.CLAUDE_MODEL,
         max_tokens=400,
         system=system,
         messages=[{"role": "user", "content": user_prompt}],
     )
-    return resp.content[0].text.strip()
+    return _first_text(resp).strip()
 
 
 # ─── Scoring (optional, ENABLE_SCORING=true) ─────────────────────────────────
@@ -194,12 +253,12 @@ async def score_listing(listing: Listing) -> dict:
         "SCORE: <chiffre 1-10>\n"
         "RAISON: <une phrase courte>"
     )
-    resp = _client.messages.create(
+    resp = _call_claude(
         model=config.CLAUDE_MODEL,
         max_tokens=60,
         messages=[{"role": "user", "content": prompt}],
     )
-    text = resp.content[0].text.strip()
+    text = _first_text(resp).strip()
     score = 5
     reason = ""
     for line in text.splitlines():
@@ -242,12 +301,12 @@ async def analyse_photos(image_urls: list) -> dict:
         ),
     })
 
-    resp = _client.messages.create(
+    resp = _call_claude(
         model=config.CLAUDE_MODEL,
         max_tokens=80,
         messages=[{"role": "user", "content": content}],
     )
-    text = resp.content[0].text.strip()
+    text = _first_text(resp).strip()
     photo_score = 5
     observations = ""
     for line in text.splitlines():
@@ -327,12 +386,12 @@ async def prescreen_listing(listing: Listing) -> dict:
         "ELIGIBLE: oui|non\n"
         "NOTE: <raison si non éligible, sinon laisse vide>"
     )
-    resp = _client.messages.create(
+    resp = _call_claude(
         model=config.CLAUDE_MODEL,
         max_tokens=80,
         messages=[{"role": "user", "content": prompt}],
     )
-    text = resp.content[0].text.strip()
+    text = _first_text(resp).strip()
     eligible = True
     note = ""
     for line in text.splitlines():
@@ -468,7 +527,7 @@ def classify_intent(user_message: str) -> dict:
             return {"tool": "run_settings"}
         return {"tool": "reply", "text": "Je suis en mode simulation (sans clé API). Envoie-moi une URL LeBonCoin ou tape une commande comme /search, /campagne, /rapport."}
 
-    resp = _client.messages.create(
+    resp = _call_claude(
         model=config.CLAUDE_MODEL,
         max_tokens=200,
         system=_INTENT_SYSTEM,

@@ -2,7 +2,9 @@
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 from telegram import (
     Update,
@@ -41,9 +43,41 @@ logger = logging.getLogger(__name__)
 
 # ─── Campaign state ───────────────────────────────────────────────────────────
 
-_campaign_running = False
+_campaign_lock = asyncio.Lock()
+_stop_requested = asyncio.Event()
 _auto_task: asyncio.Task | None = None
 _watch_task: asyncio.Task | None = None
+
+# ─── TTL helpers for ctx.bot_data callback state ──────────────────────────────
+
+_TTL_SECONDS = 1800  # 30 min — matches /simulate user wait window
+
+
+def _set_ttl(data: dict, key: str, value: Any) -> None:
+    data[key] = (value, time.time() + _TTL_SECONDS)
+
+
+def _get_ttl(data: dict, key: str) -> Any:
+    """Return the value if not expired, else None (and remove if expired)."""
+    entry = data.get(key)
+    if entry is None:
+        return None
+    value, expires_at = entry
+    if time.time() >= expires_at:
+        data.pop(key, None)
+        return None
+    return value
+
+
+def _pop_ttl(data: dict, key: str) -> Any:
+    """Pop and return the value if not expired, else None."""
+    entry = data.pop(key, None)
+    if entry is None:
+        return None
+    value, expires_at = entry
+    if time.time() >= expires_at:
+        return None
+    return value
 
 
 # ─── Helper ───────────────────────────────────────────────────────────────────
@@ -60,6 +94,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(
         update,
         "👋 *Bienvenue sur le bot immo d'Illan !*\n\n"
+        "📡 11 sources : LBC, SeLoger, PAP, Bien'ici, Logic-Immo,\n"
+        "Studapart, Paris Attitude, Lodgis, ImmoJeune, LocService, Roomlala\n\n"
         "Commandes disponibles :\n"
         "• /search — Lancer un scraping\n"
         "• /simulate <url> — Simuler un message sans l'envoyer\n"
@@ -168,8 +204,8 @@ async def cmd_simulate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ]
     ])
 
-    # Store result in bot_data so callback can access it
-    ctx.bot_data[f"sim:{listing.lbc_id}"] = result
+    # Store result in bot_data so callback can access it (TTL guard against stale entries)
+    _set_ttl(ctx.bot_data, f"sim:{listing.lbc_id}", result)
 
     await update.effective_message.reply_text(
         text,
@@ -186,16 +222,17 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await query.answer()
 
     action, lbc_id = query.data.split(":", 1)
-    result = ctx.bot_data.get(f"sim:{lbc_id}")
+    result = _get_ttl(ctx.bot_data, f"sim:{lbc_id}")
 
     if action == "ignore":
+        ctx.bot_data.pop(f"sim:{lbc_id}", None)
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("❌ Annonce ignorée.")
         return
 
     if action == "edit":
         # Store pending-edit state so the next message from this user is used as the custom message
-        ctx.bot_data[f"pending_edit:{query.message.chat_id}"] = lbc_id
+        _set_ttl(ctx.bot_data, f"pending_edit:{query.message.chat_id}", lbc_id)
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
             "✏️ *Mode édition activé.*\n"
@@ -249,65 +286,76 @@ def _deduplicate(listings: list) -> list:
     return unique
 
 
+def _should_contact(listing) -> tuple[bool, str]:
+    """Centralised eligibility check shared by /campagne and /watch.
+
+    Returns (True, "") if the listing should be contacted, else (False, fr_reason).
+    Order matters: cheapest checks first, DB hit last.
+    """
+    if not is_real_offer(listing):
+        return False, "annonce filtrée (qualité)"
+    if listing.price and listing.price > PROFILE["search"]["max_rent"]:
+        return False, f"hors budget ({listing.price}€)"
+    suspicious, reason = is_suspicious(listing)
+    if suspicious:
+        return False, f"suspect : {reason}"
+    if database.already_contacted(listing.lbc_id):
+        return False, "déjà contactée"
+    return True, ""
+
+
 # ─── Campaign core (shared by /campagne and auto-loop) ────────────────────────
 
 async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run one full campaign cycle. Caller is responsible for _campaign_running flag."""
-    global _campaign_running
+    """Run one full campaign cycle. Acquires _campaign_lock; honours _stop_requested."""
+    async with _campaign_lock:
+        _stop_requested.clear()
+        await _run_campaign_body(update, ctx)
+
+
+def _campaign_sources() -> list[tuple[str, str]]:
+    """Return [(url, label)] for each enabled source. Empty URL disables a source."""
+    sources: list[tuple[str, str]] = [
+        (config.DEFAULT_SEARCH_URL, "LBC"),
+        (config.DEFAULT_SEARCH_PAP_URL, "PAP"),
+        (config.DEFAULT_SEARCH_BIENICI_URL, "Bien'ici"),
+        (config.DEFAULT_SEARCH_LOGICIMMO_URL, "Logic-Immo"),
+        (config.DEFAULT_SEARCH_STUDAPART_URL, "Studapart"),
+        (config.DEFAULT_SEARCH_PARISATTITUDE_URL, "Paris Attitude"),
+        (config.DEFAULT_SEARCH_LODGIS_URL, "Lodgis"),
+        (config.DEFAULT_SEARCH_IMMOJEUNE_URL, "ImmoJeune"),
+        (config.DEFAULT_SEARCH_LOCSERVICE_URL, "LocService"),
+        (config.DEFAULT_SEARCH_ROOMLALA_URL, "Roomlala"),
+    ]
+    if config.SELOGER_EMAIL:
+        sources.insert(1, (config.DEFAULT_SEARCH_SELOGER_URL, "SeLoger"))
+    return [(url, label) for url, label in sources if url]
+
+
+async def _run_campaign_body(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(update, "🚀 Campagne lancée ! Scraping en cours…")
 
-    # Scrape LeBonCoin
-    try:
-        listings_lbc = await search_listings(config.DEFAULT_SEARCH_URL, max_results=25)
-    except Exception as exc:
-        logger.error("LBC scrape failed: %s", exc)
-        listings_lbc = []
-
-    # Scrape SeLoger (skip if no credentials)
-    listings_sl: list = []
-    if config.SELOGER_EMAIL:
+    per_source: list[tuple[str, int, list]] = []
+    listings: list = []
+    for url, label in _campaign_sources():
         try:
-            listings_sl = await search_listings(config.DEFAULT_SEARCH_SELOGER_URL, max_results=25)
+            results = await search_listings(url, max_results=25)
         except Exception as exc:
-            logger.error("SeLoger scrape failed: %s", exc)
-    else:
-        logger.info("SeLoger credentials not set — skipping SeLoger scrape")
+            logger.error("%s scrape failed: %s", label, exc)
+            results = []
+        per_source.append((label, len(results), results))
+        listings.extend(results)
 
-    # Scrape PAP.fr
-    listings_pap: list = []
-    try:
-        listings_pap = await search_listings(config.DEFAULT_SEARCH_PAP_URL, max_results=25)
-    except Exception as exc:
-        logger.error("PAP scrape failed: %s", exc)
-
-    # Scrape Bien'ici
-    listings_bi: list = []
-    try:
-        listings_bi = await search_listings(config.DEFAULT_SEARCH_BIENICI_URL, max_results=25)
-    except Exception as exc:
-        logger.error("Bien'ici scrape failed: %s", exc)
-
-    # Scrape Logic-Immo
-    listings_li: list = []
-    try:
-        listings_li = await search_listings(config.DEFAULT_SEARCH_LOGICIMMO_URL, max_results=25)
-    except Exception as exc:
-        logger.error("Logic-Immo scrape failed: %s", exc)
-
-    listings = listings_lbc + listings_sl + listings_pap + listings_bi + listings_li
-    # Deduplication: remove cross-platform duplicates by (price, location, seller_name)
     listings = _deduplicate(listings)
 
     if not listings:
         await _reply(update, "😕 Aucune annonce trouvée.")
-        _campaign_running = False
         return
 
+    breakdown = " + ".join(f"{n} {label}" for label, n, _ in per_source if n)
     await _reply(
         update,
-        f"📋 {len(listings_lbc)} LBC + {len(listings_sl)} SeLoger + {len(listings_pap)} PAP "
-        f"+ {len(listings_bi)} Bien'ici + {len(listings_li)} Logic-Immo "
-        f"→ *{len(listings)} uniques* — analyse en cours…"
+        f"📋 {breakdown}\n→ *{len(listings)} uniques* — analyse en cours…"
     )
 
     sent = 0
@@ -316,27 +364,13 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     errors = 0
 
     for listing in listings:
-        if not _campaign_running:
+        if _stop_requested.is_set():
             await _reply(update, "🛑 Campagne arrêtée manuellement.")
             break
 
-        if not is_real_offer(listing):
-            skipped_dup += 1
-            continue
-
-        # Hard budget ceiling (catches promoted listings from PAP that bypass URL filter)
-        if listing.price and listing.price > PROFILE["search"]["max_rent"]:
-            skipped_dup += 1
-            continue
-
-        if database.already_contacted(listing.lbc_id):
-            skipped_dup += 1
-            continue
-
-        # Fraud detection
-        suspicious, suspicion_reason = is_suspicious(listing)
-        if suspicious:
-            logger.info("Suspicious listing %s skipped: %s", listing.lbc_id, suspicion_reason)
+        eligible, reason = _should_contact(listing)
+        if not eligible:
+            logger.info("Listing %s skipped: %s", listing.lbc_id, reason)
             skipped_dup += 1
             continue
 
@@ -357,6 +391,7 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         try:
             # Optional scoring gate
+            score_result = None
             if config.ENABLE_SCORING:
                 score_result = await score_listing(listing)
                 if score_result["score"] < config.MIN_SCORE:
@@ -379,12 +414,27 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 url=listing.url,
                 source=listing.source,
             )
+            # Persist score and fire high-interest alert before contact
+            if score_result is not None:
+                database.set_listing_score(
+                    listing.lbc_id, score_result["score"], score_result["reason"]
+                )
+                if score_result["score"] >= config.INTEREST_THRESHOLD:
+                    await _reply(
+                        update,
+                        f"🔥 *ANNONCE INTÉRESSANTE* ⭐{score_result['score']}/10\n"
+                        f"📍 _{listing.title}_ ({listing.location})\n"
+                        f"💰 {listing.price}€/mois\n"
+                        f"🔗 {listing.url}\n"
+                        f"💡 _{score_result['reason']}_"
+                    )
+
             contact_id = database.create_contact(listing_id, result.message)
             success = await send_message_safe(listing.url, result.message, contact_id)
             if success:
                 sent += 1
                 score_str = ""
-                if config.ENABLE_SCORING:
+                if score_result is not None:
                     score_str = f" ⭐{score_result['score']}/10"
                 await _reply(
                     update,
@@ -399,7 +449,6 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         # Small delay between messages
         await asyncio.sleep(3)
 
-    _campaign_running = False
     await _reply(
         update,
         f"🏁 *Campagne terminée*\n\n"
@@ -471,11 +520,9 @@ async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 # ─── /campagne ────────────────────────────────────────────────────────────────
 
 async def cmd_campagne(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global _campaign_running
-    if _campaign_running:
+    if _campaign_lock.locked():
         await _reply(update, "⚠️ Une campagne est déjà en cours. Utilisez /stop pour l'arrêter.")
         return
-    _campaign_running = True
     await _run_campaign_core(update, ctx)
 
 
@@ -516,9 +563,8 @@ async def cmd_rapport(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ─── /stop ────────────────────────────────────────────────────────────────────
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global _campaign_running
-    if _campaign_running:
-        _campaign_running = False
+    if _campaign_lock.locked():
+        _stop_requested.set()
         await _reply(update, "🛑 Campagne arrêtée.")
     else:
         await _reply(update, "ℹ️ Aucune campagne en cours.")
@@ -616,14 +662,7 @@ async def _fast_poll_loop(update: Update, ctx: ContextTypes.DEFAULT_TYPE, interv
         logger.info("[WATCH] Fast poll starting…")
         all_listings: list = []
 
-        sources = [
-            (config.DEFAULT_SEARCH_URL, "LBC"),
-            (config.DEFAULT_SEARCH_PAP_URL, "PAP"),
-            (config.DEFAULT_SEARCH_BIENICI_URL, "Bien'ici"),
-            (config.DEFAULT_SEARCH_LOGICIMMO_URL, "Logic-Immo"),
-        ]
-        if config.SELOGER_EMAIL:
-            sources.append((config.DEFAULT_SEARCH_SELOGER_URL, "SeLoger"))
+        sources = _campaign_sources()
 
         for source_url, source_name in sources:
             try:
@@ -633,13 +672,11 @@ async def _fast_poll_loop(update: Update, ctx: ContextTypes.DEFAULT_TYPE, interv
                 logger.warning("[WATCH] %s scrape failed: %s", source_name, exc)
 
         all_listings = _deduplicate(all_listings)
-        new = [
-            lst for lst in all_listings
-            if is_real_offer(lst)
-            and not database.already_contacted(lst.lbc_id)
-            and (not lst.price or lst.price <= PROFILE["search"]["max_rent"])
-            and not is_suspicious(lst)[0]
-        ]
+        new = []
+        for lst in all_listings:
+            eligible, _ = _should_contact(lst)
+            if eligible:
+                new.append(lst)
 
         if new:
             await _reply(update, f"🆕 *{len(new)} nouvelle(s) annonce(s)* détectée(s) — contact en cours…")
@@ -727,9 +764,9 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── Pending-edit interception ──────────────────────────────────────────────
     pending_key = f"pending_edit:{chat_id}"
-    lbc_id = ctx.bot_data.pop(pending_key, None)
+    lbc_id = _pop_ttl(ctx.bot_data, pending_key)
     if lbc_id:
-        result = ctx.bot_data.get(f"sim:{lbc_id}")
+        result = _pop_ttl(ctx.bot_data, f"sim:{lbc_id}")
         if not result:
             await _reply(update, "❌ Session expirée, relancez /simulate.")
             return

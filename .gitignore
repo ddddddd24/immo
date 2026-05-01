@@ -1,0 +1,25 @@
+# Secrets — never commit
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime artifacts
+*.log
+leboncoin_bot.log
+
+# Local data — DB, browser profiles, auth state, debug captures
+data/
+*.db
+*.db-journal
+*_debug.html
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

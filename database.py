@@ -54,6 +54,13 @@ def init_db() -> None:
                 created_at  TEXT NOT NULL,
                 done        INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE INDEX IF NOT EXISTS idx_contacts_listing
+                ON contacts(listing_id);
+            CREATE INDEX IF NOT EXISTS idx_contacts_status_sent
+                ON contacts(status, sent_at);
+            CREATE INDEX IF NOT EXISTS idx_responses_contact
+                ON responses(contact_id);
         """)
     # Migrate existing DBs: add missing columns
     with _conn() as conn:
@@ -64,6 +71,12 @@ def init_db() -> None:
         if "price_prev" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN price_prev INTEGER")
             logger.info("Migrated listings table: added price_prev column")
+        if "score" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN score INTEGER")
+            logger.info("Migrated listings table: added score column")
+        if "score_reason" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN score_reason TEXT")
+            logger.info("Migrated listings table: added score_reason column")
 
     logger.info("Database initialised at %s", config.DB_PATH)
 
@@ -95,28 +108,41 @@ def upsert_listing(
     url: str,
     source: str = "leboncoin",
 ) -> int:
-    """Insert listing or return existing id. Tracks price changes. Returns row id."""
+    """Insert listing or update in place. Tracks downward price changes. Returns row id.
+
+    Atomic via ON CONFLICT...DO UPDATE so concurrent /watch + /campagne calls
+    can't race on the SELECT-then-INSERT pattern.
+    """
     with _conn() as conn:
-        cur = conn.execute(
-            "SELECT id, price FROM listings WHERE lbc_id = ?", (lbc_id,)
-        )
-        row = cur.fetchone()
-        if row:
-            # Track price drop: save old price if current price changed downward
-            if price and row["price"] and price < row["price"]:
-                conn.execute(
-                    "UPDATE listings SET price_prev = ?, price = ? WHERE id = ?",
-                    (row["price"], price, row["id"]),
-                )
-            return row["id"]
         cur = conn.execute(
             """INSERT INTO listings
                (lbc_id, source, title, price, location, seller_name, seller_type, url, scraped_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(lbc_id) DO UPDATE SET
+                 title       = excluded.title,
+                 location    = excluded.location,
+                 seller_name = excluded.seller_name,
+                 seller_type = excluded.seller_type,
+                 url         = excluded.url,
+                 price_prev  = CASE
+                     WHEN excluded.price IS NOT NULL
+                          AND listings.price IS NOT NULL
+                          AND excluded.price < listings.price
+                     THEN listings.price
+                     ELSE listings.price_prev
+                 END,
+                 price       = CASE
+                     WHEN excluded.price IS NOT NULL
+                          AND listings.price IS NOT NULL
+                          AND excluded.price < listings.price
+                     THEN excluded.price
+                     ELSE listings.price
+                 END
+               RETURNING id""",
             (lbc_id, source, title, price, location, seller_name, seller_type, url,
              datetime.utcnow().isoformat()),
         )
-        return cur.lastrowid
+        return cur.fetchone()[0]
 
 
 def already_contacted(lbc_id: str) -> bool:
@@ -139,6 +165,15 @@ def get_listing_by_lbc_id(lbc_id: str) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
+def set_listing_score(lbc_id: str, score: int, reason: str) -> None:
+    """Record Claude's score (1–10) and short reason for a listing."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE listings SET score = ?, score_reason = ? WHERE lbc_id = ?",
+            (score, reason, lbc_id),
+        )
+
+
 # ─── Contacts ─────────────────────────────────────────────────────────────────
 
 def create_contact(listing_id: int, message: str) -> int:
@@ -158,7 +193,14 @@ def mark_contact_sent(contact_id: int) -> None:
         )
 
 
+_VALID_STATUS = {"pending", "sent", "responded", "positive", "negative"}
+
+
 def mark_contact_status(contact_id: int, status: str) -> None:
+    if status not in _VALID_STATUS:
+        raise ValueError(
+            f"Statut invalide: {status!r} (valeurs autorisées : {sorted(_VALID_STATUS)})"
+        )
     with _conn() as conn:
         conn.execute(
             "UPDATE contacts SET status=? WHERE id=?", (status, contact_id)
@@ -234,7 +276,8 @@ def get_price_drops() -> list[dict]:
     """Return listings we've contacted where price dropped since last scrape."""
     with _conn() as conn:
         rows = conn.execute(
-            """SELECT l.title, l.url, l.price as new_price, l.price_prev as old_price
+            """SELECT l.lbc_id, l.title, l.url,
+                      l.price as new_price, l.price_prev as old_price
                FROM listings l
                JOIN contacts c ON c.listing_id = l.id
                WHERE l.price_prev IS NOT NULL AND l.price_prev > l.price

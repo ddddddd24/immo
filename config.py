@@ -35,11 +35,19 @@ APIFY_API_KEY: str = _require("APIFY_API_KEY")
 LBC_EMAIL: str = _require("LBC_EMAIL")
 LBC_PASSWORD: str = _require("LBC_PASSWORD")
 
+# DeepSeek (Anthropic-compatible endpoint — cheap LLM alternative)
+USE_DEEPSEEK: bool = os.getenv("USE_DEEPSEEK", "false").lower() in ("true", "1", "yes")
+DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+
 # Optional / defaults
 DB_PATH: str = os.getenv("DB_PATH", "data/bot.db")
 LOG_FILE: str = os.getenv("LOG_FILE", "leboncoin_bot.log")
 MAX_MESSAGES_PER_HOUR: int = int(os.getenv("MAX_MESSAGES_PER_HOUR", "20"))
-CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+# CLAUDE_MODEL is reused by both Claude and DeepSeek (Anthropic-compatible API).
+# Default depends on USE_DEEPSEEK so swapping providers is one env-var flip.
+_DEFAULT_LLM_MODEL = DEEPSEEK_MODEL if USE_DEEPSEEK else "claude-sonnet-4-6"
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", _DEFAULT_LLM_MODEL)
 
 # SeLoger credentials (optional — SeLoger scraping disabled if missing)
 SELOGER_EMAIL: str = os.getenv("SELOGER_EMAIL", "")
@@ -99,6 +107,39 @@ DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
     "?avec=meuble&surface-min=25&prix-max=1000",
 )
 
+# ── Phase 2: student / young-pro platforms ────────────────────────────────────
+# Empty string disables the source. Set the env var with a search URL copied
+# from your browser after filtering on the target site for best results.
+DEFAULT_SEARCH_STUDAPART_URL: str = os.getenv(
+    "STUDAPART_SEARCH_URL",
+    "https://www.studapart.com/fr/search?city=paris&priceMax=1000&surfaceMin=25",
+)
+
+DEFAULT_SEARCH_PARISATTITUDE_URL: str = os.getenv(
+    "PARISATTITUDE_SEARCH_URL",
+    "https://www.parisattitude.com/recherche?priceMax=1000",
+)
+
+DEFAULT_SEARCH_LODGIS_URL: str = os.getenv(
+    "LODGIS_SEARCH_URL",
+    "https://www.lodgis.com/locations-paris?prixMax=1000&surfaceMin=25",
+)
+
+DEFAULT_SEARCH_IMMOJEUNE_URL: str = os.getenv(
+    "IMMOJEUNE_SEARCH_URL",
+    "https://www.immojeune.com/locations?ville=paris&loyer-max=1000&surface-min=25",
+)
+
+DEFAULT_SEARCH_LOCSERVICE_URL: str = os.getenv(
+    "LOCSERVICE_SEARCH_URL",
+    "https://www.locservice.fr/recherche.html?ville=paris&loyer-max=1000",
+)
+
+DEFAULT_SEARCH_ROOMLALA_URL: str = os.getenv(
+    "ROOMLALA_SEARCH_URL",
+    "https://www.roomlala.com/fr/recherche?city=paris&priceMax=1000",
+)
+
 # ── Fast poller (mode veille) ─────────────────────────────────────────────────
 FAST_POLL_INTERVAL_MIN: int = int(os.getenv("FAST_POLL_INTERVAL_MIN", "15"))
 
@@ -107,3 +148,8 @@ ENABLE_PRESCREENING: bool = os.getenv("ENABLE_PRESCREENING", "false").lower() in
 
 # ── Stale contact threshold (days without reply before flagged as ghost) ──────
 STALE_DAYS: int = int(os.getenv("STALE_DAYS", "5"))
+
+# ── High-interest score threshold (only used when ENABLE_SCORING=true) ───────
+# Listings scored ≥ INTEREST_THRESHOLD trigger a 🔥 priority alert in addition
+# to the regular contact flow. Default 8/10 = strong match only.
+INTEREST_THRESHOLD: int = int(os.getenv("INTEREST_THRESHOLD", "8"))

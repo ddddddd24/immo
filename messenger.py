@@ -10,6 +10,7 @@ Update _SELECTORS / _SELOGER_SELECTORS if either site redesigns their UI.
 """
 import asyncio
 import logging
+import random
 from pathlib import Path
 
 from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PWTimeout
@@ -145,13 +146,27 @@ async def send_message(listing_url: str, message: str, contact_id: int) -> bool:
         )
         page = await context.new_page()
         try:
-            await send_fn(page, listing_url, message)
-        except Exception as exc:
-            logger.warning("First attempt failed (%s), re-authenticating…", exc)
-            auth_path.unlink(missing_ok=True)
-            await login_fn(page)
-            await context.storage_state(path=str(auth_path))
-            await send_fn(page, listing_url, message)
+            last_exc: Exception | None = None
+            for attempt in range(2):
+                try:
+                    await send_fn(page, listing_url, message)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == 0:
+                        logger.warning(
+                            "Attempt %d failed (%s), re-authenticating…",
+                            attempt + 1, exc,
+                        )
+                        auth_path.unlink(missing_ok=True)
+                        await login_fn(page)
+                        await context.storage_state(path=str(auth_path))
+                        await asyncio.sleep(2 + random.random() * 3)
+                    else:
+                        logger.warning("Attempt %d failed (%s), giving up", attempt + 1, exc)
+            if last_exc is not None:
+                raise last_exc
         finally:
             await page.close()
             await browser.close()
