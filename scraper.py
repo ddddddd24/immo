@@ -546,7 +546,7 @@ def _parse_pap_listing(item, base_url: str = "https://www.pap.fr") -> Optional[L
         lbc_id=pap_id,
         title=title,
         description=description,
-        price=price_raw,
+        price=_parse_price(price_raw),  # range-check [50, 50000] like other parsers
         location=location,
         seller_name="Particulier",  # PAP is always owner-to-renter
         url=url,
@@ -884,7 +884,7 @@ def _logicimmo_item_to_listing(item) -> Optional[Listing]:
         lbc_id=listing_id,
         title=title,
         description=description,
-        price=price_raw,
+        price=_parse_price(price_raw),  # range-check [50, 50000] like other parsers
         location=location,
         seller_name=seller_name,
         url=url,

@@ -111,13 +111,34 @@ def _pop_ttl(data: dict, key: str) -> Any:
 
 # ─── Helper ───────────────────────────────────────────────────────────────────
 
+_MD_SPECIAL = re.compile(r"([_*\[\]`])")
+
+
+def _escape_md(text: str | None) -> str:
+    """Escape Telegram MARKDOWN special chars so dynamic content (titles,
+    locations, seller names) doesn't break formatting. Returns "" for None."""
+    if not text:
+        return ""
+    return _MD_SPECIAL.sub(r"\\\1", str(text))
+
+
 async def _reply(update: Update, text: str, **kwargs) -> None:
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is not None:
         _TURN_REPLIES.setdefault(chat_id, []).append(text)
-    await update.effective_message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN, **kwargs
-    )
+    try:
+        await update.effective_message.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN, **kwargs
+        )
+    except Exception as exc:
+        # If MARKDOWN parsing fails (unbalanced *, _, [ in dynamic content
+        # despite escaping), retry as plain text so the user sees something
+        # rather than nothing.
+        logger.warning("Markdown reply failed (%s) — retrying as plain text", exc)
+        try:
+            await update.effective_message.reply_text(text, **kwargs)
+        except Exception as exc2:
+            logger.error("Plain-text reply also failed: %s", exc2)
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -464,7 +485,14 @@ async def _run_campaign_body(
     )
 
     sent = 0  # count of messages PREPARED in this run
-    skipped = {"budget": 0, "qualité": 0, "suspect": 0, "déjà_préparée": 0}
+    skipped = {
+        "budget": 0,
+        "qualité": 0,
+        "suspect": 0,
+        "déjà_préparée": 0,
+        "dossier": 0,         # prescreen rejected (only if ENABLE_PRESCREENING)
+        "score_bas": 0,       # score < MIN_SCORE (only if ENABLE_SCORING)
+    }
     errors = 0
 
     for listing in listings:
@@ -483,8 +511,11 @@ async def _run_campaign_body(
             prescreen = await prescreen_listing(listing)
             if not prescreen["eligible"]:
                 logger.info("Ineligible listing %s: %s", listing.lbc_id, prescreen["note"])
-                skipped_dup += 1
-                await _reply(update, f"⚠️ Dossier incompatible → _{listing.title}_ : _{prescreen['note']}_")
+                skipped["dossier"] += 1
+                await _reply(
+                    update,
+                    f"⚠️ Dossier incompatible → _{_escape_md(listing.title)}_ : _{_escape_md(prescreen['note'])}_",
+                )
                 continue
 
         try:
@@ -493,7 +524,7 @@ async def _run_campaign_body(
             if config.ENABLE_SCORING:
                 score_result = await score_listing(listing)
                 if score_result["score"] < config.MIN_SCORE:
-                    skipped_dup += 1
+                    skipped["score_bas"] += 1
                     logger.info(
                         "Listing %s skipped: score %d < %d (%s)",
                         listing.lbc_id, score_result["score"], config.MIN_SCORE,
@@ -521,7 +552,7 @@ async def _run_campaign_body(
                     await _reply(
                         update,
                         f"🔥 *ANNONCE INTÉRESSANTE* ⭐{score_result['score']}/10\n"
-                        f"📍 _{listing.title}_ ({listing.location})\n"
+                        f"📍 _{_escape_md(listing.title)}_ ({_escape_md(listing.location)})\n"
                         f"💰 {listing.price}€/mois\n"
                         f"🔗 {listing.url}\n"
                         f"💡 _{score_result['reason']}_"
@@ -533,7 +564,7 @@ async def _run_campaign_body(
             score_str = f" ⭐{score_result['score']}/10" if score_result else ""
             await _reply(
                 update,
-                f"📝 Préparé{score_str} → _{listing.title}_ ({listing.location})"
+                f"📝 Préparé{score_str} → _{_escape_md(listing.title)}_ ({_escape_md(listing.location)})"
             )
         except Exception as exc:
             logger.error("Campaign error on %s: %s", listing.lbc_id, exc)
@@ -545,6 +576,8 @@ async def _run_campaign_body(
         "qualité": "filtrées (qualité)",
         "suspect": "suspectes",
         "déjà_préparée": "déjà préparées",
+        "dossier": "dossier incompatible",
+        "score_bas": f"score < {config.MIN_SCORE}",
     }
     skip_lines = [
         f"  • {n} {skip_label[k]}"
@@ -597,7 +630,7 @@ async def _run_campaign_body(
                 database.create_contact(listing_id, result.message)
                 await _reply(
                     update,
-                    f"💸📝 Préparé (baisse) → _{listing.title}_ "
+                    f"💸📝 Préparé (baisse) → _{_escape_md(listing.title)}_ "
                     f"({drop['price_prev']}€ → *{drop['price']}€*)"
                 )
             except Exception as exc:
@@ -646,7 +679,7 @@ async def cmd_envoyer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     preview_lines = []
     for c in pending[:3]:
-        preview_lines.append(f"  • _{c['title']}_ ({c['location']})")
+        preview_lines.append(f"  • _{_escape_md(c['title'])}_ ({_escape_md(c['location'])})")
     preview = "\n".join(preview_lines)
     if len(pending) > 3:
         preview += f"\n  … et {len(pending) - 3} autres"
@@ -706,7 +739,7 @@ async def _drain_pending_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
             success = await send_message_safe(c["url"], c["message"], c["contact_id"])
             if success:
                 sent += 1
-                await _reply(update, f"✉️ Envoyé → _{c['title']}_ ({c['location']})")
+                await _reply(update, f"✉️ Envoyé → _{_escape_md(c['title'])}_ ({_escape_md(c['location'])})")
             else:
                 errors += 1
         except Exception as exc:
@@ -896,7 +929,7 @@ async def _fast_poll_loop(update: Update, ctx: ContextTypes.DEFAULT_TYPE, interv
                     success = await send_message_safe(listing.url, result.message, contact_id)
                     if success:
                         sent += 1
-                        await _reply(update, f"✉️ → _{listing.title}_ ({listing.location})")
+                        await _reply(update, f"✉️ → _{_escape_md(listing.title)}_ ({_escape_md(listing.location)})")
                 except Exception as exc:
                     logger.error("[WATCH] Error on %s: %s", listing.lbc_id, exc)
                 await asyncio.sleep(2)
