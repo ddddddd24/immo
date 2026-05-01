@@ -126,12 +126,27 @@ DEFAULT_SEARCH_PARISATTITUDE_URL: str = os.getenv(
     "https://www.parisattitude.com/rent-apartment/furnished-rental/index,rentals.aspx",
 )
 
-# Disabled by default — generic-card parser returned nav/UI junk on first run.
-# Set the env var to a search URL copied from your browser to re-enable
-# (parser will likely still need site-specific tuning).
-DEFAULT_SEARCH_LODGIS_URL: str = os.getenv("LODGIS_SEARCH_URL", "")
-DEFAULT_SEARCH_IMMOJEUNE_URL: str = os.getenv("IMMOJEUNE_SEARCH_URL", "")
-DEFAULT_SEARCH_LOCSERVICE_URL: str = os.getenv("LOCSERVICE_SEARCH_URL", "")
+# Lodgis — Paris medium/long-term furnished. Mostly 1000€+, expat segment.
+DEFAULT_SEARCH_LODGIS_URL: str = os.getenv(
+    "LODGIS_SEARCH_URL",
+    "https://www.lodgis.com/en/paris,long-term-rentals/rentals-furnished-paris_1.cat.html",
+)
+
+# ImmoJeune — student housing aggregator.
+DEFAULT_SEARCH_IMMOJEUNE_URL: str = os.getenv(
+    "IMMOJEUNE_SEARCH_URL",
+    "https://www.immojeune.com/logement-etudiant/paris-75.html",
+)
+
+# LocService — owner-direct rentals, French-market.
+DEFAULT_SEARCH_LOCSERVICE_URL: str = os.getenv(
+    "LOCSERVICE_SEARCH_URL",
+    "https://www.locservice.fr/paris-75/location-appartement.html",
+)
+
+# Roomlala disabled — site redirects geo-aware and 404s on every URL pattern
+# tried with Camoufox; site may be restructured or geo-blocked. Set the env
+# var manually if you find a working URL.
 DEFAULT_SEARCH_ROOMLALA_URL: str = os.getenv("ROOMLALA_SEARCH_URL", "")
 
 # ── Fast poller (mode veille) ─────────────────────────────────────────────────

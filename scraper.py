@@ -1392,37 +1392,297 @@ async def _search_parisattitude_with_playwright(search_url: str, max_results: in
         return []
 
 
-async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    return await _search_via_generic(
-        search_url, max_results,
-        site="lodgis",
-        base_url="https://www.lodgis.com",
+def _lodgis_card_to_listing(card) -> Optional[Listing]:
+    """Parse a Lodgis `div.card__appart`.
+
+    Card text format (verified 2026-05-01, /en/ version):
+      "Furnished studio | No.1011056 | 18 m² | Louvre | €1,045 | /month |
+       Available from | 01-01-2027 | Paris 1°"
+    URL pattern: /en/paris,long-term-rentals/apartment/LPA{slug}-paris-{arr}.mod.html
+    """
+    import re as _re2
+
+    link = card.find("a", href=True)
+    if not link:
+        return None
+    href = link["href"]
+    if href.startswith("/"):
+        href = "https://www.lodgis.com" + href
+
+    # ID from "No.NNNNN" element
+    num_el = card.find(class_="card__appart__num")
+    raw_id = ""
+    if num_el:
+        m = _re2.search(r"\d+", num_el.get_text(strip=True))
+        raw_id = m.group(0) if m else ""
+    if not raw_id:
+        # Fallback: extract LPA{N} from URL
+        m = _re2.search(r"LPA(\d+)", href)
+        raw_id = m.group(1) if m else ""
+    if not raw_id:
+        return None
+    listing_id = f"lg_{raw_id}"
+
+    text = _re2.sub(r"\s+", " ", card.get_text(" ", strip=True))
+
+    # Price: "€1,045" — € before number with optional thousands comma
+    price = None
+    pm = _re2.search(r"€\s*([\d,]+)", text)
+    if pm:
+        try:
+            price = int(pm.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    # Surface: "X m²"
+    sm = _re2.search(r"(\d+)\s*m²", text)
+    surface = sm.group(1) if sm else ""
+
+    # Location: "Paris X°" + neighborhood preceding €
+    arr_m = _re2.search(r"Paris\s+(\d{1,2})\s*°?", text)
+    location = ""
+    if arr_m:
+        # Try to find neighborhood — usually the segment right before "€"
+        neighborhood_m = _re2.search(r"\|\s*([^|€]+?)\s*\|\s*€", text)
+        if neighborhood_m:
+            location = f"{neighborhood_m.group(1).strip()}, Paris {arr_m.group(1)}"
+        else:
+            location = f"Paris {arr_m.group(1)}"
+
+    # Title — first non-empty segment
+    title_parts = [p.strip() for p in text.split("|") if p.strip()]
+    title = title_parts[0] if title_parts else "Furnished apartment"
+    if surface and location:
+        title = f"{title} {surface}m² — {location}"
+
+    images = [
+        src for img in card.find_all("img")
+        if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description="",
+        price=price,
+        location=location,
+        seller_name="Lodgis",
+        url=href,
+        seller_type_hint="pro",
         source="lodgis",
-        prefix="lg",
-        card_selectors=[r"property-item|result-item|annonce-card|search-card", r"card|listing|item"],
+        images=images,
+    )
+
+
+async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """Lodgis scraper — Paris medium/long-term furnished. Uses Camoufox.
+    Heads-up: typical inventory is 1000€+ so most results filter out."""
+    logger.info("[LODGIS] Scraping: %s", search_url)
+    try:
+        html = await _fetch_html_with_camoufox(search_url, post_delay=(4.0, 6.0))
+        if not html:
+            return []
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.find_all("div", class_="card__appart")
+        logger.info("[LODGIS] Found %d card elements", len(cards))
+        listings = [
+            l for l in (_lodgis_card_to_listing(c) for c in cards[:max_results]) if l
+        ]
+        logger.info("[LODGIS] Parsed %d listings", len(listings))
+        return listings
+    except Exception as exc:
+        logger.warning("[LODGIS] Scraping failed: %s", exc)
+        return []
+
+
+def _immojeune_card_to_listing(card) -> Optional[Listing]:
+    """Parse an ImmoJeune `div.card` element.
+
+    Card text format (verified 2026-05-01):
+      "...{TYPE}|{TITLE}|{DESC}|{SURFACE}m² - {PRICE} €|CC|{ZIP} {CITY}"
+    Title anchor lives inside `<p class="title">`.
+    URL pattern: /{type-segment}/{slug}_{numeric_id}.html
+    """
+    import re as _re2
+
+    title_p = card.find("p", class_="title")
+    if not title_p:
+        return None
+    link = title_p.find("a", href=True)
+    if not link:
+        return None
+    href = link["href"]
+    if href.startswith("/"):
+        href = "https://www.immojeune.com" + href
+
+    id_m = _re2.search(r"_(\d+)\.html", href)
+    if not id_m:
+        return None
+    listing_id = f"ij_{id_m.group(1)}"
+
+    title = link.get_text(strip=True)
+
+    text = _re2.sub(r"\s+", " ", card.get_text(" ", strip=True))
+
+    # "X m² - Y €" — Y is the actual rent
+    price = None
+    surface = ""
+    sm = _re2.search(r"(\d+)\s*m²\s*-\s*(\d+)\s*€", text)
+    if sm:
+        surface = sm.group(1)
+        try:
+            price = int(sm.group(2))
+            if price == 0:
+                price = None
+        except ValueError:
+            pass
+
+    # "{5-digit-zip} {City}" — the city is what we want for dedup matching
+    location = ""
+    loc_m = _re2.search(r"(\d{5})\s+([A-ZÀ-Ÿ][\wÀ-ÿ\-' ]+?)(?:\s|$|\|)", text)
+    if loc_m:
+        location = f"{loc_m.group(2).strip()}, {loc_m.group(1)}"
+
+    desc_el = card.find(class_="description")
+    description = desc_el.get_text(strip=True) if desc_el else ""
+
+    images = [
+        src for img in card.find_all("img")
+        if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description=description,
+        price=price,
+        location=location,
+        seller_name="ImmoJeune",
+        url=href,
+        seller_type_hint="",
+        source="immojeune",
+        images=images,
     )
 
 
 async def _search_immojeune_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    return await _search_via_generic(
-        search_url, max_results,
-        site="immojeune",
-        base_url="https://www.immojeune.com",
-        source="immojeune",
-        prefix="ij",
-        card_selectors=[r"annonce|listing-card|offer-card|property", r"card|listing"],
+    """ImmoJeune scraper — uses Camoufox like Studapart since stealth Playwright
+    gets fingerprinted and served the SEO landing version of the page.
+    """
+    logger.info("[IMMOJEUNE] Scraping: %s", search_url)
+    try:
+        html = await _fetch_html_with_camoufox(search_url, post_delay=(4.0, 6.0))
+        if not html:
+            return []
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.find_all("div", class_="card")
+        logger.info("[IMMOJEUNE] Found %d card elements", len(cards))
+        listings = [
+            l for l in (_immojeune_card_to_listing(c) for c in cards[:max_results]) if l
+        ]
+        logger.info("[IMMOJEUNE] Parsed %d listings", len(listings))
+        return listings
+    except Exception as exc:
+        logger.warning("[IMMOJEUNE] Scraping failed: %s", exc)
+        return []
+
+
+def _locservice_card_to_listing(card) -> Optional[Listing]:
+    """Parse a LocService `li.accommodation-ad` card.
+
+    Card text format (verified 2026-05-01):
+      "Appartement T2 meublé à louer | Paris 17 (75017) | 30 m² | 1 254 € / mois | {desc}"
+    URL pattern: /paris-75/location-{type}-paris-{arr}/{numeric_id}
+    Price element: <li class="accommodation-ad-characteristic"> containing "€ / mois".
+    """
+    import re as _re2
+
+    link = card.find("a", href=True)
+    if not link:
+        return None
+    href = link["href"]
+    if href.startswith("/"):
+        href = "https://www.locservice.fr" + href
+
+    id_m = _re2.search(r"/(\d+)/?$", href)
+    if not id_m:
+        return None
+    listing_id = f"ls_{id_m.group(1)}"
+
+    # Find the price <li> — its text contains "€ / mois" (narrow no-break spaces)
+    price = None
+    for li in card.find_all("li"):
+        txt = li.get_text(" ", strip=True)
+        if "mois" in txt and "€" in txt:
+            digits = _re2.sub(r"[^\d]", "", txt.split("€")[0])
+            if digits:
+                try:
+                    price = int(digits)
+                except ValueError:
+                    pass
+            break
+
+    text = _re2.sub(r"\s+", " ", card.get_text(" ", strip=True))
+
+    # Title — first text up to the location marker "Paris XX (75XXX)"
+    title_m = _re2.search(r"^(.+?)\s+Paris\s+\d{1,2}\s*\(", text)
+    title = title_m.group(1).strip() if title_m else (text[:80] if text else "Appartement")
+
+    location = ""
+    loc_m = _re2.search(r"(Paris\s+\d{1,2})\s*\((\d{5})\)", text)
+    if loc_m:
+        location = f"{loc_m.group(1)}, {loc_m.group(2)}"
+    else:
+        zip_m = _re2.search(r"\b(\d{5})\b", text)
+        if zip_m:
+            location = zip_m.group(1)
+
+    # Description — text after the price up to ~500 chars
+    desc_m = _re2.search(r"€\s*/\s*mois\s*(.+?)$", text)
+    description = desc_m.group(1).strip()[:500] if desc_m else ""
+
+    images = [
+        src for img in card.find_all("img")
+        if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description=description,
+        price=price,
+        location=location,
+        seller_name="Particulier",
+        url=href,
+        seller_type_hint="particulier",
+        source="locservice",
+        images=images,
     )
 
 
 async def _search_locservice_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    return await _search_via_generic(
-        search_url, max_results,
-        site="locservice",
-        base_url="https://www.locservice.fr",
-        source="locservice",
-        prefix="ls",
-        card_selectors=[r"annonce|offre|result|search-item", r"card|listing|item"],
-    )
+    """LocService scraper — owner-direct rentals, French market.
+    Uses Camoufox for consistency with the rest of the Phase 2 fix; stealth
+    Playwright also works on this site but Camoufox is more reliable."""
+    logger.info("[LOCSERVICE] Scraping: %s", search_url)
+    try:
+        html = await _fetch_html_with_camoufox(search_url, post_delay=(4.0, 6.0))
+        if not html:
+            return []
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.find_all("li", class_="accommodation-ad")
+        logger.info("[LOCSERVICE] Found %d card elements", len(cards))
+        listings = [
+            l for l in (_locservice_card_to_listing(c) for c in cards[:max_results]) if l
+        ]
+        logger.info("[LOCSERVICE] Parsed %d listings", len(listings))
+        return listings
+    except Exception as exc:
+        logger.warning("[LOCSERVICE] Scraping failed: %s", exc)
+        return []
 
 
 async def _search_roomlala_with_playwright(search_url: str, max_results: int) -> list[Listing]:

@@ -94,7 +94,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(
         update,
         "👋 *Bienvenue sur le bot immo d'Illan !*\n\n"
-        "📡 Sources : LBC, SeLoger, PAP, Bien'ici, Logic-Immo, Studapart, Paris Attitude\n\n"
+        "📡 Sources : LBC, SeLoger, PAP, Bien'ici, Logic-Immo,\n"
+        "Studapart, Paris Attitude, Lodgis, ImmoJeune, LocService\n\n"
         "Commandes disponibles :\n"
         "• /search — Lancer un scraping\n"
         "• /simulate <url> — Simuler un message sans l'envoyer\n"
