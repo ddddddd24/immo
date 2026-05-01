@@ -1,6 +1,7 @@
 """Telegram bot entry point — all commands handled here."""
 import asyncio
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -48,6 +49,34 @@ _stop_requested = asyncio.Event()
 _auto_task: asyncio.Task | None = None
 _watch_task: asyncio.Task | None = None
 
+# ─── Conversation memory (per chat_id) ────────────────────────────────────────
+#
+# DeepSeek classify_intent sees only one user message at a time. Without
+# memory the bot would deny prior actions ("rien lancé encore" right after
+# running a campaign). We keep the last few user/assistant turns per chat_id
+# so the LLM can answer questions like "qu'as-tu trouvé ?" coherently.
+
+_HISTORY: dict[int, list[dict]] = {}
+_TURN_REPLIES: dict[int, list[str]] = {}
+_HISTORY_MAX_PAIRS = 4  # last N (user, assistant) pairs
+
+
+def _commit_turn(chat_id: int, user_text: str) -> None:
+    h = _HISTORY.setdefault(chat_id, [])
+    h.append({"role": "user", "content": user_text[:1500]})
+    bot_replies = _TURN_REPLIES.pop(chat_id, [])
+    bot_text = "\n\n".join(bot_replies)[:2000]
+    if bot_text:
+        h.append({"role": "assistant", "content": bot_text})
+    max_msgs = _HISTORY_MAX_PAIRS * 2
+    if len(h) > max_msgs:
+        del h[: len(h) - max_msgs]
+
+
+def _history_for(chat_id: int) -> list[dict]:
+    return list(_HISTORY.get(chat_id, []))
+
+
 # ─── TTL helpers for ctx.bot_data callback state ──────────────────────────────
 
 _TTL_SECONDS = 1800  # 30 min — matches /simulate user wait window
@@ -83,6 +112,9 @@ def _pop_ttl(data: dict, key: str) -> Any:
 # ─── Helper ───────────────────────────────────────────────────────────────────
 
 async def _reply(update: Update, text: str, **kwargs) -> None:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is not None:
+        _TURN_REPLIES.setdefault(chat_id, []).append(text)
     await update.effective_message.reply_text(
         text, parse_mode=ParseMode.MARKDOWN, **kwargs
     )
@@ -99,8 +131,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Commandes disponibles :\n"
         "• /search — Lancer un scraping\n"
         "• /simulate <url> — Simuler un message sans l'envoyer\n"
-        "• /campagne — Préparer la campagne (scrape + analyse, *sans envoi*)\n"
-        "• /envoyer — Envoyer les messages préparés en attente\n"
+        "• /campagne [source] — Préparer la campagne (scrape + analyse, *sans envoi*)\n"
+        "• /envoyer — Demander confirmation avant l'envoi des messages préparés\n"
+        "• /confirmer — Confirmer et lancer l'envoi (ou tape « oui »)\n"
         "• /autostart [heures] — Campagne automatique (défaut : 3h)\n"
         "• /autostop — Arrêter la campagne automatique\n"
         "• /watch [min] — Mode veille : nouvelles annonces toutes les N min (défaut : 15)\n"
@@ -289,22 +322,24 @@ def _deduplicate(listings: list) -> list:
     return unique
 
 
-def _should_contact(listing) -> tuple[bool, str]:
+def _should_contact(listing) -> tuple[bool, str, str]:
     """Centralised eligibility check shared by /campagne and /watch.
 
-    Returns (True, "") if the listing should be contacted, else (False, fr_reason).
+    Returns (eligible, category, fr_reason). Categories are stable identifiers
+    used by the campaign report to break down skipped listings:
+    'qualité' / 'budget' / 'suspect' / 'déjà_préparée'.
     Order matters: cheapest checks first, DB hit last.
     """
     if not is_real_offer(listing):
-        return False, "annonce filtrée (qualité)"
+        return False, "qualité", "annonce filtrée"
     if listing.price and listing.price > PROFILE["search"]["max_rent"]:
-        return False, f"hors budget ({listing.price}€)"
+        return False, "budget", f"{listing.price}€ > {PROFILE['search']['max_rent']}€"
     suspicious, reason = is_suspicious(listing)
     if suspicious:
-        return False, f"suspect : {reason}"
+        return False, "suspect", reason
     if database.already_contacted(listing.lbc_id):
-        return False, "déjà contactée"
-    return True, ""
+        return False, "déjà_préparée", "contact déjà créé"
+    return True, "", ""
 
 
 # ─── Campaign core (shared by /campagne and auto-loop) ────────────────────────
@@ -428,8 +463,8 @@ async def _run_campaign_body(
         f"📋 {breakdown}\n→ *{len(listings)} uniques* — analyse en cours…"
     )
 
-    sent = 0  # repurposed: count of messages PREPARED in this run
-    skipped_dup = 0
+    sent = 0  # count of messages PREPARED in this run
+    skipped = {"budget": 0, "qualité": 0, "suspect": 0, "déjà_préparée": 0}
     errors = 0
 
     for listing in listings:
@@ -437,10 +472,10 @@ async def _run_campaign_body(
             await _reply(update, "🛑 Campagne arrêtée manuellement.")
             break
 
-        eligible, reason = _should_contact(listing)
+        eligible, category, reason = _should_contact(listing)
         if not eligible:
-            logger.info("Listing %s skipped: %s", listing.lbc_id, reason)
-            skipped_dup += 1
+            logger.info("Listing %s skipped (%s): %s", listing.lbc_id, category, reason)
+            skipped[category] = skipped.get(category, 0) + 1
             continue
 
         # Optional dossier pre-screening
@@ -505,11 +540,22 @@ async def _run_campaign_body(
             errors += 1
 
     pending_total = database.count_pending_contacts()
+    skip_label = {
+        "budget": "hors budget",
+        "qualité": "filtrées (qualité)",
+        "suspect": "suspectes",
+        "déjà_préparée": "déjà préparées",
+    }
+    skip_lines = [
+        f"  • {n} {skip_label[k]}"
+        for k, n in skipped.items() if n > 0
+    ]
+    skip_block = "\n".join(skip_lines) if skip_lines else "  • aucune"
     await _reply(
         update,
         f"🏁 *Campagne terminée — phase préparation*\n\n"
-        f"📝 Messages préparés : {sent}\n"
-        f"⏭ Déjà contactés / filtrés : {skipped_dup}\n"
+        f"📝 Messages préparés : *{sent}*\n"
+        f"⏭ Annonces écartées :\n{skip_block}\n"
         f"❌ Erreurs : {errors}\n\n"
         f"📤 *{pending_total} message(s) en attente d'envoi*\n"
         f"Tape /envoyer (ou « envoie ») quand tu veux les envoyer.",
@@ -580,19 +626,62 @@ async def cmd_campagne(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_campaign_core(update, ctx, source=source)
 
 
-# ─── /envoyer ─────────────────────────────────────────────────────────────────
+# ─── /envoyer (asks for confirmation) + /confirmer (actually sends) ──────────
+
+_SEND_CONFIRM_KEY = "send_confirm"  # bot_data flag set by /envoyer, drained by /confirmer
+
 
 async def cmd_envoyer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drain the pending-contact queue: actually send messages prepared by /campagne."""
+    """Step 1 of send: confirm the user really wants to send.
+
+    Sets a TTL flag in bot_data; user must run /confirmer (or reply 'oui')
+    within 30 min to actually trigger the send.
+    """
     pending = database.get_pending_contacts()
     if not pending:
         await _reply(update, "📭 Aucun message en attente d'envoi. Lance /campagne d'abord.")
         return
 
+    _set_ttl(ctx.bot_data, _SEND_CONFIRM_KEY, len(pending))
+
+    preview_lines = []
+    for c in pending[:3]:
+        preview_lines.append(f"  • _{c['title']}_ ({c['location']})")
+    preview = "\n".join(preview_lines)
+    if len(pending) > 3:
+        preview += f"\n  … et {len(pending) - 3} autres"
+
     await _reply(
         update,
-        f"📤 *{len(pending)} message(s) à envoyer.*\nDémarrage…"
+        f"📤 *Confirmation requise*\n\n"
+        f"*{len(pending)} message(s)* prêts à être envoyés sur LeBonCoin / SeLoger :\n"
+        f"{preview}\n\n"
+        f"➡️ Tape /confirmer (ou « *oui* » / « *go* » / « *vas-y* ») pour lancer l'envoi.\n"
+        f"➡️ Tape autre chose pour annuler.",
     )
+
+
+async def cmd_confirmer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step 2 of send: drain the pending queue if user has confirmed."""
+    confirmed = _pop_ttl(ctx.bot_data, _SEND_CONFIRM_KEY)
+    if not confirmed:
+        await _reply(
+            update,
+            "ℹ️ Aucun envoi en attente de confirmation. "
+            "Lance /envoyer d'abord pour préparer l'envoi.",
+        )
+        return
+    await _drain_pending_queue(update, ctx)
+
+
+async def _drain_pending_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Actually iterate pending contacts and send via Playwright."""
+    pending = database.get_pending_contacts()
+    if not pending:
+        await _reply(update, "📭 La file est vide (peut-être déjà envoyée ?).")
+        return
+
+    await _reply(update, f"📤 Envoi de *{len(pending)}* message(s)…")
 
     sent = 0
     skipped_rate = 0
@@ -608,7 +697,7 @@ async def cmd_envoyer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await _reply(
                 update,
                 f"⏸ Limite horaire atteinte ({config.MAX_MESSAGES_PER_HOUR}/h). "
-                "Pause 1 minute…"
+                "Pause 1 minute…",
             )
             await asyncio.sleep(60)
             continue
@@ -617,26 +706,23 @@ async def cmd_envoyer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             success = await send_message_safe(c["url"], c["message"], c["contact_id"])
             if success:
                 sent += 1
-                await _reply(
-                    update,
-                    f"✉️ Envoyé → _{c['title']}_ ({c['location']})"
-                )
+                await _reply(update, f"✉️ Envoyé → _{c['title']}_ ({c['location']})")
             else:
                 errors += 1
         except Exception as exc:
             logger.error("Send failed for contact %s: %s", c["contact_id"], exc)
             errors += 1
 
-        await asyncio.sleep(3)  # gentle pacing between sends
+        await asyncio.sleep(3)
 
     remaining = database.count_pending_contacts()
     await _reply(
         update,
         f"🏁 *Envoi terminé*\n\n"
-        f"✉️ Envoyés : {sent}\n"
+        f"✉️ Envoyés : *{sent}*\n"
         f"⏸ Limite horaire (reportés) : {skipped_rate}\n"
         f"❌ Erreurs : {errors}\n"
-        f"📤 Restants en attente : {remaining}"
+        f"📤 Restants en attente : {remaining}",
     )
 
 
@@ -788,7 +874,7 @@ async def _fast_poll_loop(update: Update, ctx: ContextTypes.DEFAULT_TYPE, interv
         all_listings = _deduplicate(all_listings)
         new = []
         for lst in all_listings:
-            eligible, _ = _should_contact(lst)
+            eligible, _cat, _reason = _should_contact(lst)
             if eligible:
                 new.append(lst)
 
@@ -875,6 +961,32 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_text = update.effective_message.text
     chat_id = update.effective_message.chat_id
     logger.info("Chat message received: %s", user_text[:80])
+    _TURN_REPLIES[chat_id] = []  # reset reply accumulator for this turn
+
+    try:
+        await _cmd_chat_inner(update, ctx, user_text, chat_id)
+    finally:
+        _commit_turn(chat_id, user_text)
+
+
+async def _cmd_chat_inner(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_text: str, chat_id: int
+) -> None:
+    # ── Send-confirmation interception ─────────────────────────────────────────
+    # If /envoyer was just invoked, the user's next message can be an affirmative
+    # ("oui", "go", "vas-y", "confirme") to drain the queue, or anything else to
+    # cancel the confirmation silently.
+    if _get_ttl(ctx.bot_data, _SEND_CONFIRM_KEY) is not None:
+        affirmative = re.search(
+            r"\b(oui|ok|okay|go|vas[\s-]?y|confirme[rz]?|allez|envoie|c'est\s+bon)\b",
+            user_text.strip().lower(),
+        )
+        if affirmative:
+            _pop_ttl(ctx.bot_data, _SEND_CONFIRM_KEY)
+            await _drain_pending_queue(update, ctx)
+            return
+        # User said something else → silently clear the flag and proceed normally
+        _pop_ttl(ctx.bot_data, _SEND_CONFIRM_KEY)
 
     # ── Pending-edit interception ──────────────────────────────────────────────
     pending_key = f"pending_edit:{chat_id}"
@@ -904,7 +1016,7 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await _reply(update, "❌ Échec de l'envoi (voir logs). Vérifiez vos identifiants LBC.")
         return
 
-    intent = classify_intent(user_text)
+    intent = classify_intent(user_text, history=_history_for(chat_id))
     tool = intent.get("tool")
 
     if tool == "run_search":
@@ -1018,6 +1130,7 @@ def main() -> None:
     app.add_handler(CommandHandler("simulate", cmd_simulate))
     app.add_handler(CommandHandler("campagne", cmd_campagne))
     app.add_handler(CommandHandler("envoyer", cmd_envoyer))
+    app.add_handler(CommandHandler("confirmer", cmd_confirmer))
     app.add_handler(CommandHandler("rapport", cmd_rapport))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("autostart", cmd_autostart))

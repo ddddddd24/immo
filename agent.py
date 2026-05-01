@@ -462,7 +462,7 @@ _INTENT_TOOLS = [
     },
     {
         "name": "run_envoyer",
-        "description": "Envoyer effectivement les messages préparés par run_campagne (vide la file d'attente). C'est l'étape finale et délibérée d'envoi. Utiliser pour 'envoyer les messages', 'envoie tout', 'fais l'envoi', 'go envoyer', 'contacte-les maintenant', etc.",
+        "description": "Demander la CONFIRMATION d'envoi des messages préparés. Cet outil n'envoie PAS directement — il affiche un récap et attend que l'utilisateur dise 'oui' / 'go' / 'confirme' ou tape /confirmer pour lancer l'envoi pour de vrai. Utiliser pour 'envoie les messages', 'fais l'envoi', 'contacte-les maintenant', etc.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -617,9 +617,14 @@ Réponds TOUJOURS en français.
 """.strip()
 
 
-def classify_intent(user_message: str) -> dict:
+def classify_intent(user_message: str, history: list[dict] | None = None) -> dict:
     """
     Classify a free-text user message into a bot action.
+
+    `history` is an optional list of prior {role, content} pairs so the LLM
+    can answer follow-up questions ("qu'as-tu trouvé ?") coherently. Pairs
+    must alternate user/assistant per Anthropic's API requirement.
+
     Returns e.g. {"tool": "run_simulate", "url": "https://..."}
     or {"tool": "reply", "text": "..."}
     """
@@ -641,13 +646,15 @@ def classify_intent(user_message: str) -> dict:
             return {"tool": "run_settings"}
         return {"tool": "reply", "text": "Je suis en mode simulation (sans clé API). Envoie-moi une URL LeBonCoin ou tape une commande comme /search, /campagne, /rapport."}
 
+    messages = list(history or [])
+    messages.append({"role": "user", "content": user_message})
     resp = _call_claude(
         model=config.CLAUDE_MODEL,
         max_tokens=200,
         system=_INTENT_SYSTEM,
         tools=_INTENT_TOOLS,
         tool_choice={"type": "any"},
-        messages=[{"role": "user", "content": user_message}],
+        messages=messages,
     )
 
     # Extract the tool use block
