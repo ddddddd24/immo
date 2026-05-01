@@ -444,7 +444,12 @@ _INTENT_TOOLS = [
     },
     {
         "name": "run_campagne",
-        "description": "Lancer une campagne complète : scraping multi-sources + analyse + envoi de messages. À utiliser quand l'utilisateur veut 'lancer la recherche', 'envoyer les messages', 'contacter les annonces', etc.",
+        "description": "Lancer la phase de PRÉPARATION d'une campagne : scraping multi-sources + analyse + génération des messages personnalisés. AUCUN message n'est envoyé — les messages sont stockés en attente d'envoi. À utiliser quand l'utilisateur veut 'lancer la recherche', 'préparer la campagne', 'scraper les annonces', 'analyser les annonces', etc. NE PAS utiliser pour 'envoyer les messages' — pour cela utiliser run_envoyer.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "run_envoyer",
+        "description": "Envoyer effectivement les messages préparés par run_campagne (vide la file d'attente). C'est l'étape finale et délibérée d'envoi. Utiliser pour 'envoyer les messages', 'envoie tout', 'fais l'envoi', 'go envoyer', 'contacte-les maintenant', etc.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -548,6 +553,12 @@ Profil d'Illan :
 
 Sources scrapées : LeBonCoin, SeLoger, PAP, Bien'ici, Logic-Immo, Studapart,
 Paris Attitude, Lodgis, ImmoJeune, LocService.
+
+Workflow en deux étapes (Illan préfère contrôler l'envoi explicitement) :
+- run_campagne PRÉPARE les messages (scrape + analyse) sans rien envoyer
+- run_envoyer ENVOIE effectivement les messages préparés (étape finale)
+Distingue bien ces deux : « lance la recherche / prépare » → run_campagne ;
+« envoie les messages / vas-y envoie » → run_envoyer.
 
 Ton rôle : comprendre ce qu'Illan veut faire en langage naturel et choisir
 l'outil approprié. Tu DOIS appeler exactement un outil par message.

@@ -99,7 +99,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Commandes disponibles :\n"
         "• /search — Lancer un scraping\n"
         "• /simulate <url> — Simuler un message sans l'envoyer\n"
-        "• /campagne — Lancer la campagne complète\n"
+        "• /campagne — Préparer la campagne (scrape + analyse, *sans envoi*)\n"
+        "• /envoyer — Envoyer les messages préparés en attente\n"
         "• /autostart [heures] — Campagne automatique (défaut : 3h)\n"
         "• /autostop — Arrêter la campagne automatique\n"
         "• /watch [min] — Mode veille : nouvelles annonces toutes les N min (défaut : 15)\n"
@@ -358,9 +359,8 @@ async def _run_campaign_body(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         f"📋 {breakdown}\n→ *{len(listings)} uniques* — analyse en cours…"
     )
 
-    sent = 0
+    sent = 0  # repurposed: count of messages PREPARED in this run
     skipped_dup = 0
-    skipped_rate = 0
     errors = 0
 
     for listing in listings:
@@ -382,12 +382,6 @@ async def _run_campaign_body(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 skipped_dup += 1
                 await _reply(update, f"⚠️ Dossier incompatible → _{listing.title}_ : _{prescreen['note']}_")
                 continue
-
-        if database.messages_sent_last_hour() >= config.MAX_MESSAGES_PER_HOUR:
-            skipped_rate += 1
-            await _reply(update, f"⏸ Limite horaire atteinte ({config.MAX_MESSAGES_PER_HOUR}/h). Pause…")
-            await asyncio.sleep(60)
-            continue
 
         try:
             # Optional scoring gate
@@ -414,7 +408,7 @@ async def _run_campaign_body(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 url=listing.url,
                 source=listing.source,
             )
-            # Persist score and fire high-interest alert before contact
+            # Persist score and fire high-interest alert
             if score_result is not None:
                 database.set_listing_score(
                     listing.lbc_id, score_result["score"], score_result["reason"]
@@ -429,33 +423,27 @@ async def _run_campaign_body(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                         f"💡 _{score_result['reason']}_"
                     )
 
-            contact_id = database.create_contact(listing_id, result.message)
-            success = await send_message_safe(listing.url, result.message, contact_id)
-            if success:
-                sent += 1
-                score_str = ""
-                if score_result is not None:
-                    score_str = f" ⭐{score_result['score']}/10"
-                await _reply(
-                    update,
-                    f"✉️ Message envoyé{score_str} → _{listing.title}_ ({listing.location})"
-                )
-            else:
-                errors += 1
+            # Prepare-only: persist as pending, no actual send
+            database.create_contact(listing_id, result.message)
+            sent += 1
+            score_str = f" ⭐{score_result['score']}/10" if score_result else ""
+            await _reply(
+                update,
+                f"📝 Préparé{score_str} → _{listing.title}_ ({listing.location})"
+            )
         except Exception as exc:
             logger.error("Campaign error on %s: %s", listing.lbc_id, exc)
             errors += 1
 
-        # Small delay between messages
-        await asyncio.sleep(3)
-
+    pending_total = database.count_pending_contacts()
     await _reply(
         update,
-        f"🏁 *Campagne terminée*\n\n"
-        f"✉️ Messages envoyés : {sent}\n"
+        f"🏁 *Campagne terminée — phase préparation*\n\n"
+        f"📝 Messages préparés : {sent}\n"
         f"⏭ Déjà contactés / filtrés : {skipped_dup}\n"
-        f"⏸ Limite horaire (ignorés) : {skipped_rate}\n"
-        f"❌ Erreurs : {errors}",
+        f"❌ Erreurs : {errors}\n\n"
+        f"📤 *{pending_total} message(s) en attente d'envoi*\n"
+        f"Tape /envoyer (ou « envoie ») quand tu veux les envoyer.",
     )
 
     # Check for price drops on previously contacted listings
@@ -475,11 +463,9 @@ async def _run_campaign_body(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     if uncontacted_drops:
         await _reply(
             update,
-            f"💸 *{len(uncontacted_drops)} annonce(s)* jamais contactée(s) sont passées sous budget — contact en cours…"
+            f"💸 *{len(uncontacted_drops)} annonce(s)* jamais contactée(s) sont passées sous budget — préparation en cours…"
         )
         for drop in uncontacted_drops:
-            if database.messages_sent_last_hour() >= config.MAX_MESSAGES_PER_HOUR:
-                break
             try:
                 listing = await fetch_single_listing(drop["url"])
                 if not listing:
@@ -493,17 +479,14 @@ async def _run_campaign_body(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                     location=listing.location, seller_name=listing.seller_name,
                     seller_type=result.seller_type, url=listing.url, source=listing.source,
                 )
-                contact_id = database.create_contact(listing_id, result.message)
-                success = await send_message_safe(listing.url, result.message, contact_id)
-                if success:
-                    await _reply(
-                        update,
-                        f"💸✉️ Contacté (baisse) → _{listing.title}_ "
-                        f"({drop['price_prev']}€ → *{drop['price']}€*)"
-                    )
+                database.create_contact(listing_id, result.message)
+                await _reply(
+                    update,
+                    f"💸📝 Préparé (baisse) → _{listing.title}_ "
+                    f"({drop['price_prev']}€ → *{drop['price']}€*)"
+                )
             except Exception as exc:
-                logger.error("Smart re-contact failed for %s: %s", drop["url"], exc)
-            await asyncio.sleep(3)
+                logger.error("Smart re-contact prep failed for %s: %s", drop["url"], exc)
 
     # Check LBC inbox for new replies
     try:
@@ -524,6 +507,66 @@ async def cmd_campagne(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, "⚠️ Une campagne est déjà en cours. Utilisez /stop pour l'arrêter.")
         return
     await _run_campaign_core(update, ctx)
+
+
+# ─── /envoyer ─────────────────────────────────────────────────────────────────
+
+async def cmd_envoyer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drain the pending-contact queue: actually send messages prepared by /campagne."""
+    pending = database.get_pending_contacts()
+    if not pending:
+        await _reply(update, "📭 Aucun message en attente d'envoi. Lance /campagne d'abord.")
+        return
+
+    await _reply(
+        update,
+        f"📤 *{len(pending)} message(s) à envoyer.*\nDémarrage…"
+    )
+
+    sent = 0
+    skipped_rate = 0
+    errors = 0
+
+    for c in pending:
+        if _stop_requested.is_set():
+            await _reply(update, "🛑 Envoi arrêté manuellement.")
+            break
+
+        if database.messages_sent_last_hour() >= config.MAX_MESSAGES_PER_HOUR:
+            skipped_rate += 1
+            await _reply(
+                update,
+                f"⏸ Limite horaire atteinte ({config.MAX_MESSAGES_PER_HOUR}/h). "
+                "Pause 1 minute…"
+            )
+            await asyncio.sleep(60)
+            continue
+
+        try:
+            success = await send_message_safe(c["url"], c["message"], c["contact_id"])
+            if success:
+                sent += 1
+                await _reply(
+                    update,
+                    f"✉️ Envoyé → _{c['title']}_ ({c['location']})"
+                )
+            else:
+                errors += 1
+        except Exception as exc:
+            logger.error("Send failed for contact %s: %s", c["contact_id"], exc)
+            errors += 1
+
+        await asyncio.sleep(3)  # gentle pacing between sends
+
+    remaining = database.count_pending_contacts()
+    await _reply(
+        update,
+        f"🏁 *Envoi terminé*\n\n"
+        f"✉️ Envoyés : {sent}\n"
+        f"⏸ Limite horaire (reportés) : {skipped_rate}\n"
+        f"❌ Erreurs : {errors}\n"
+        f"📤 Restants en attente : {remaining}"
+    )
 
 
 # ─── /rapport ─────────────────────────────────────────────────────────────────
@@ -833,6 +876,9 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif tool == "run_campagne":
         await cmd_campagne(update, ctx)
 
+    elif tool == "run_envoyer":
+        await cmd_envoyer(update, ctx)
+
     elif tool == "run_rapport":
         await cmd_rapport(update, ctx)
 
@@ -910,6 +956,7 @@ def main() -> None:
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("simulate", cmd_simulate))
     app.add_handler(CommandHandler("campagne", cmd_campagne))
+    app.add_handler(CommandHandler("envoyer", cmd_envoyer))
     app.add_handler(CommandHandler("rapport", cmd_rapport))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("autostart", cmd_autostart))

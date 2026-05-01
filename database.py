@@ -146,16 +146,49 @@ def upsert_listing(
 
 
 def already_contacted(lbc_id: str) -> bool:
-    """Return True if we've already sent a message for this listing."""
+    """Return True if we have any contact row for this listing.
+
+    With the prepare/send split, a pending contact (message ready but not yet
+    sent) also blocks re-preparation — re-running /campagne won't recreate
+    duplicate pending rows.
+    """
     with _conn() as conn:
         cur = conn.execute(
             """SELECT c.id FROM contacts c
                JOIN listings l ON l.id = c.listing_id
-               WHERE l.lbc_id = ? AND c.status != 'pending'
+               WHERE l.lbc_id = ?
                LIMIT 1""",
             (lbc_id,),
         )
         return cur.fetchone() is not None
+
+
+def get_pending_contacts() -> list[dict]:
+    """Return contacts prepared but not yet sent (status='pending').
+
+    Each row: {contact_id, url, message, title, location}. Ordered by
+    creation order (oldest first) so /envoyer drains FIFO.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT c.id           AS contact_id,
+                      l.url          AS url,
+                      c.message_sent AS message,
+                      l.title        AS title,
+                      l.location     AS location
+               FROM contacts c
+               JOIN listings l ON l.id = c.listing_id
+               WHERE c.status = 'pending'
+               ORDER BY c.id ASC"""
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_pending_contacts() -> int:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM contacts WHERE status = 'pending'"
+        ).fetchone()["n"]
 
 
 def get_listing_by_lbc_id(lbc_id: str) -> Optional[sqlite3.Row]:
