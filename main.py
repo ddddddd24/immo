@@ -165,7 +165,9 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(
         update,
         f"✅ {len(listings)} annonces scrapées, *{new_count}* nouvelles (non encore contactées).\n"
-        f"Lance /campagne pour envoyer les messages.",
+        f"_Brut : aucun message n'a été préparé._\n"
+        f"Pour analyser et préparer des messages : lance /campagne (toutes sources) "
+        f"ou « lance la campagne pour <site> » pour cibler une seule source.",
     )
 
 
@@ -307,15 +309,62 @@ def _should_contact(listing) -> tuple[bool, str]:
 
 # ─── Campaign core (shared by /campagne and auto-loop) ────────────────────────
 
-async def _run_campaign_core(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run one full campaign cycle. Acquires _campaign_lock; honours _stop_requested."""
+async def _run_campaign_core(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, source: str | None = None
+) -> None:
+    """Run one full campaign cycle. Acquires _campaign_lock; honours _stop_requested.
+
+    If `source` is provided (e.g. 'parisattitude'), restrict scraping to that one site.
+    """
     async with _campaign_lock:
         _stop_requested.clear()
-        await _run_campaign_body(update, ctx)
+        await _run_campaign_body(update, ctx, source=source)
 
 
-def _campaign_sources() -> list[tuple[str, str]]:
-    """Return [(url, label)] for each enabled source. Empty URL disables a source."""
+_SOURCE_LABELS = {
+    "leboncoin":     "LBC",
+    "seloger":       "SeLoger",
+    "pap":           "PAP",
+    "bienici":       "Bien'ici",
+    "logicimmo":     "Logic-Immo",
+    "studapart":     "Studapart",
+    "parisattitude": "Paris Attitude",
+    "lodgis":        "Lodgis",
+    "immojeune":     "ImmoJeune",
+    "locservice":    "LocService",
+    "roomlala":      "Roomlala",
+}
+
+
+def _source_url(source: str) -> str:
+    """Map a normalised source name to its configured search URL ('' if disabled)."""
+    return {
+        "leboncoin":     config.DEFAULT_SEARCH_URL,
+        "seloger":       config.DEFAULT_SEARCH_SELOGER_URL,
+        "pap":           config.DEFAULT_SEARCH_PAP_URL,
+        "bienici":       config.DEFAULT_SEARCH_BIENICI_URL,
+        "logicimmo":     config.DEFAULT_SEARCH_LOGICIMMO_URL,
+        "studapart":     config.DEFAULT_SEARCH_STUDAPART_URL,
+        "parisattitude": config.DEFAULT_SEARCH_PARISATTITUDE_URL,
+        "lodgis":        config.DEFAULT_SEARCH_LODGIS_URL,
+        "immojeune":     config.DEFAULT_SEARCH_IMMOJEUNE_URL,
+        "locservice":    config.DEFAULT_SEARCH_LOCSERVICE_URL,
+        "roomlala":      config.DEFAULT_SEARCH_ROOMLALA_URL,
+    }.get(source, "")
+
+
+def _campaign_sources(only: str | None = None) -> list[tuple[str, str]]:
+    """Return [(url, label)] for each enabled source.
+
+    If `only` is set, restrict to that single source (still subject to URL/creds).
+    Empty URL skips a source.
+    """
+    if only:
+        url = _source_url(only)
+        if not url:
+            return []
+        return [(url, _SOURCE_LABELS.get(only, only))]
+
     sources: list[tuple[str, str]] = [
         (config.DEFAULT_SEARCH_URL, "LBC"),
         (config.DEFAULT_SEARCH_PAP_URL, "PAP"),
@@ -333,12 +382,32 @@ def _campaign_sources() -> list[tuple[str, str]]:
     return [(url, label) for url, label in sources if url]
 
 
-async def _run_campaign_body(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _reply(update, "🚀 Campagne lancée ! Scraping en cours…")
+async def _run_campaign_body(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, source: str | None = None
+) -> None:
+    sources = _campaign_sources(only=source)
+    if not sources:
+        if source:
+            await _reply(
+                update,
+                f"⚠️ Source `{source}` inconnue ou désactivée. "
+                f"Sources disponibles : {', '.join(_SOURCE_LABELS.values())}.",
+            )
+        else:
+            await _reply(update, "⚠️ Aucune source configurée.")
+        return
+
+    if source:
+        await _reply(
+            update,
+            f"🚀 Campagne *{sources[0][1]}* lancée ! Scraping en cours…",
+        )
+    else:
+        await _reply(update, "🚀 Campagne lancée ! Scraping en cours…")
 
     per_source: list[tuple[str, int, list]] = []
     listings: list = []
-    for url, label in _campaign_sources():
+    for url, label in sources:
         try:
             results = await search_listings(url, max_results=25)
         except Exception as exc:
@@ -506,7 +575,9 @@ async def cmd_campagne(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if _campaign_lock.locked():
         await _reply(update, "⚠️ Une campagne est déjà en cours. Utilisez /stop pour l'arrêter.")
         return
-    await _run_campaign_core(update, ctx)
+    # Optional source filter via CLI: /campagne studapart
+    source = (ctx.args[0].lower().strip() if ctx.args else None) or None
+    await _run_campaign_core(update, ctx, source=source)
 
 
 # ─── /envoyer ─────────────────────────────────────────────────────────────────
@@ -840,19 +911,7 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         source = (intent.get("source") or "").strip().lower()
         url = (intent.get("url") or "").strip()
         if source:
-            source_url_map = {
-                "leboncoin":     config.DEFAULT_SEARCH_URL,
-                "seloger":       config.DEFAULT_SEARCH_SELOGER_URL,
-                "pap":           config.DEFAULT_SEARCH_PAP_URL,
-                "bienici":       config.DEFAULT_SEARCH_BIENICI_URL,
-                "logicimmo":     config.DEFAULT_SEARCH_LOGICIMMO_URL,
-                "studapart":     config.DEFAULT_SEARCH_STUDAPART_URL,
-                "parisattitude": config.DEFAULT_SEARCH_PARISATTITUDE_URL,
-                "lodgis":        config.DEFAULT_SEARCH_LODGIS_URL,
-                "immojeune":     config.DEFAULT_SEARCH_IMMOJEUNE_URL,
-                "locservice":    config.DEFAULT_SEARCH_LOCSERVICE_URL,
-            }
-            url = source_url_map.get(source, "")
+            url = _source_url(source)
             if not url:
                 await _reply(
                     update,
@@ -874,6 +933,8 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await cmd_simulate(update, ctx)
 
     elif tool == "run_campagne":
+        source = (intent.get("source") or "").strip().lower()
+        ctx.args = [source] if source else []
         await cmd_campagne(update, ctx)
 
     elif tool == "run_envoyer":

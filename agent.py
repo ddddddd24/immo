@@ -444,8 +444,21 @@ _INTENT_TOOLS = [
     },
     {
         "name": "run_campagne",
-        "description": "Lancer la phase de PRÉPARATION d'une campagne : scraping multi-sources + analyse + génération des messages personnalisés. AUCUN message n'est envoyé — les messages sont stockés en attente d'envoi. À utiliser quand l'utilisateur veut 'lancer la recherche', 'préparer la campagne', 'scraper les annonces', 'analyser les annonces', etc. NE PAS utiliser pour 'envoyer les messages' — pour cela utiliser run_envoyer.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "description": "Lancer la phase de PRÉPARATION d'une campagne : scraping + analyse + génération des messages personnalisés. AUCUN message n'est envoyé — les messages sont stockés en attente d'envoi (run_envoyer pour envoyer ensuite). Par défaut scrape toutes les sources. Si l'utilisateur précise un site (« lance la campagne pour paris attitude », « campagne studapart »), utiliser le paramètre `source` pour limiter à ce site.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": [
+                        "leboncoin", "seloger", "pap", "bienici", "logicimmo",
+                        "studapart", "parisattitude", "lodgis", "immojeune", "locservice",
+                    ],
+                    "description": "Limiter la campagne à une seule source. Optionnel — si absent, toutes les sources sont scrapées.",
+                },
+            },
+            "required": [],
+        },
     },
     {
         "name": "run_envoyer",
