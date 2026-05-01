@@ -173,7 +173,7 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         listings = await search_listings(url, max_results=30)
     except Exception as exc:
-        await _reply(update, f"❌ Erreur Apify : `{exc}`")
+        await _reply(update, f"❌ Erreur de scraping : `{exc}`")
         return
 
     if not listings:

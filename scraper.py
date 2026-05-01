@@ -46,50 +46,78 @@ async def _handle_cookie_banner(page) -> None:
         pass  # banner not present or already dismissed
 
 
-async def _pw_get_next_data(url: str, site: str = "leboncoin") -> Optional[dict]:
-    """
-    Open *url* using a persistent Chromium profile with stealth enabled.
-    Returns parsed __NEXT_DATA__ JSON or None.
-    """
-    profile_dir = _user_data_dir(site)
-    Path(profile_dir).mkdir(parents=True, exist_ok=True)
-
-    async with async_playwright() as pw:
-        ctx = await pw.chromium.launch_persistent_context(
-            user_data_dir=profile_dir,
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1280,800",
-            ],
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            locale="fr-FR",
-        )
-        page = await ctx.new_page()
-        await Stealth().apply_stealth_async(page)
-        try:
-            await page.goto(url, wait_until="load", timeout=30_000)
-            await _handle_cookie_banner(page)
-            # Brief human-like pause before extracting
-            await asyncio.sleep(random.uniform(1.5, 3.0))
-            content = await page.content()
-        finally:
-            await ctx.close()
-
-    match = _re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', content, _re.DOTALL)
+def _extract_next_data(html: str) -> Optional[dict]:
+    """Parse the __NEXT_DATA__ JSON blob from a rendered HTML page."""
+    match = _re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, _re.DOTALL)
     if not match:
-        logger.warning("__NEXT_DATA__ not found — DataDome may have blocked the request (%s)", url)
         return None
     try:
         return json.loads(match.group(1))
     except json.JSONDecodeError:
-        logger.warning("Failed to parse __NEXT_DATA__ JSON for %s", url)
         return None
+
+
+async def _pw_get_next_data(url: str, site: str = "leboncoin") -> Optional[dict]:
+    """Fetch a Next.js page and return parsed __NEXT_DATA__.
+
+    Two-stage: Playwright + stealth first (fast, persistent cookies). If the
+    page returns no __NEXT_DATA__ (DataDome fallback page), retry via
+    Camoufox which fingerprint-masks more aggressively. Returns the parsed
+    JSON dict or None if both engines fail.
+    """
+    profile_dir = _user_data_dir(site)
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+
+    # ─── Attempt 1: Playwright + stealth ──────────────────────────────────────
+    html: Optional[str] = None
+    try:
+        async with async_playwright() as pw:
+            ctx = await pw.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1280,800",
+                ],
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="fr-FR",
+            )
+            page = await ctx.new_page()
+            await Stealth().apply_stealth_async(page)
+            try:
+                await page.goto(url, wait_until="load", timeout=30_000)
+                await _handle_cookie_banner(page)
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+                html = await page.content()
+            finally:
+                await ctx.close()
+    except Exception as exc:
+        logger.warning("[%s] Playwright fetch raised: %s — will try Camoufox", site, exc)
+
+    if html:
+        data = _extract_next_data(html)
+        if data is not None:
+            return data
+        logger.warning(
+            "[%s] __NEXT_DATA__ missing in Playwright HTML — DataDome likely "
+            "served a fallback page. Trying Camoufox.",
+            site,
+        )
+
+    # ─── Attempt 2: Camoufox fallback (anti-detect Firefox) ──────────────────
+    cam_html = await _fetch_html_with_camoufox(url, post_delay=(3.0, 5.0))
+    if not cam_html:
+        logger.warning("[%s] Camoufox also failed to retrieve HTML for %s", site, url)
+        return None
+    data = _extract_next_data(cam_html)
+    if data is None:
+        logger.warning("[%s] __NEXT_DATA__ still missing even via Camoufox", site)
+    return data
 
 
 # ─── Source detection ─────────────────────────────────────────────────────────
