@@ -1182,26 +1182,214 @@ async def _search_via_generic(
 # Run /search <url> against each platform after first launch and tune the
 # `card_selectors` list (and source-specific JSON paths) against live HTML.
 
-async def _search_studapart_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    return await _search_via_generic(
-        search_url, max_results,
-        site="studapart",
-        base_url="https://www.studapart.com",
+async def _fetch_html_with_camoufox(url: str, post_delay: tuple[float, float] = (5.0, 8.0)) -> Optional[str]:
+    """Fetch a page with Camoufox (anti-detect Firefox) — bypasses stealth-Playwright fingerprinting.
+
+    Studapart serves an SEO landing page (no listings) to detected automation
+    on the same URL where real browsers see ~48 listings. Camoufox masks the
+    fingerprint enough to get the real content. Same approach we use for
+    SeLoger (DataDome).
+    """
+    from camoufox.async_api import AsyncCamoufox
+    async with AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows") as browser:
+        page = await browser.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            await _handle_cookie_banner(page)
+            await asyncio.sleep(random.uniform(*post_delay))
+            return await page.content()
+        except Exception as exc:
+            logger.warning("Camoufox fetch failed for %s: %s", url, exc)
+            return None
+        finally:
+            await page.close()
+
+
+def _studapart_card_to_listing(card) -> Optional[Listing]:
+    """Parse a Studapart `a.AccomodationBlock` card.
+
+    Card layout (verified 2026-05-01 via Camoufox):
+      <a class="AccomodationBlock AccomodationBlock--withDescription"
+         href="https://www.studapart.com/fr/logement-{City}/{Slug}/residence/{id}">
+      Visible text format examples:
+        "Logement en résidence NOMAD Campus The Place à partir de 860€ cc / mois Suresnes"
+        "Promotion en cours Logement en résidence Kley Créteil à partir de 660€ cc 7..."
+        "Colocation Coliving à Paris (Robida) avec chambre..."
+    """
+    import re as _re2
+
+    href = card.get("href", "")
+    if not href or "/fr/logement-" not in href:
+        return None
+
+    # ID from URL: try residence/{id}, else slug fallback
+    id_m = _re2.search(r"/residence/(\d+)", href)
+    raw_id = id_m.group(1) if id_m else href.rstrip("/").rsplit("/", 1)[-1][:40]
+    listing_id = f"sa_{raw_id}"
+
+    text = card.get_text(" ", strip=True)
+    text = _re2.sub(r"\s+", " ", text)
+
+    # Price: "à partir de XXX€" pattern (otherwise first standalone N€ run)
+    price = None
+    pm = _re2.search(r"(?:à\s+partir\s+de\s+)?(\d{3,4})\s*€", text, _re2.IGNORECASE)
+    if pm:
+        try:
+            price = int(pm.group(1))
+        except ValueError:
+            pass
+
+    # Location: last whitespace-separated token after the price expression
+    # Pattern: "...à partir de 860€ cc / mois Suresnes"
+    loc_m = _re2.search(r"\d+€[^A-ZÀ-Ÿ]*([A-ZÀ-Ÿ][\wÀ-ÿ\-' ]+?)$", text)
+    location = loc_m.group(1).strip() if loc_m else ""
+    # Fallback: extract city from URL pattern /fr/logement-{City}/...
+    if not location:
+        url_loc_m = _re2.search(r"/fr/logement-([A-Za-zÀ-ÿ\-]+)/", href)
+        if url_loc_m:
+            location = url_loc_m.group(1).replace("-", " ")
+
+    # Title: residence name. Strip status badges then take "résidence NAME"
+    # or "Colocation NAME" portion before "à partir de".
+    title_m = _re2.search(
+        r"(?:résidence|Colocation|Coliving)\s+(.+?)(?:\s+à\s+partir|\s+avec|\s*$)",
+        text, _re2.IGNORECASE,
+    )
+    title = title_m.group(1).strip() if title_m else text[:80]
+
+    images = [
+        src for img in card.find_all("img")
+        if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description="",
+        price=price,
+        location=location,
+        seller_name="Studapart",
+        url=href,
+        seller_type_hint="pro",
         source="studapart",
-        prefix="sa",
-        card_selectors=[r"offer-card|listing-card|propertyCard", r"card|offer|listing"],
+        images=images,
+    )
+
+
+async def _search_studapart_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """Studapart scraper — uses Camoufox (anti-detect Firefox) because stealth
+    Playwright gets fingerprinted and served an SEO landing page instead of
+    real listings. ~48 cards per page; 200+ across paginated index.
+    """
+    logger.info("[STUDAPART] Scraping: %s", search_url)
+    try:
+        html = await _fetch_html_with_camoufox(search_url, post_delay=(5.0, 8.0))
+        if not html:
+            return []
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.find_all("a", class_="AccomodationBlock")
+        logger.info("[STUDAPART] Found %d card elements", len(cards))
+        listings = [
+            l for l in (_studapart_card_to_listing(c) for c in cards[:max_results]) if l
+        ]
+        logger.info("[STUDAPART] Parsed %d listings", len(listings))
+        return listings
+    except Exception as exc:
+        logger.warning("[STUDAPART] Scraping failed: %s", exc)
+        return []
+
+
+def _parisattitude_card_to_listing(card) -> Optional[Listing]:
+    """Parse a single Paris Attitude `div.accommodation-search-card`.
+
+    Card layout (verified 2026-05-01):
+      div.accommodation-search-card
+        a[href*="/rent-apartment/{slug},apartment,{type},{id}.aspx"]
+        .accommodation-card-content__price → "1 550 €"
+      Visible text in order:
+        "Paris Attitude Selection | 1 bedroom 28m² | Poissonnière, Paris 10 |
+         1 550 € | /Month | Available from | 09 May 2026"
+    """
+    import re as _re2
+
+    link = card.find("a", href=_re2.compile(r"/rent-apartment/[^,]+,apartment,[^,]+,\d+\.aspx"))
+    if not link:
+        return None
+    href = link["href"]
+    if href.startswith("/"):
+        href = "https://www.parisattitude.com" + href
+
+    id_m = _re2.search(r",(\d+)\.aspx", href)
+    if not id_m:
+        return None
+    listing_id = f"pa_{id_m.group(1)}"
+
+    price = None
+    price_el = card.find(class_="accommodation-card-content__price")
+    if price_el:
+        raw = price_el.get_text(strip=True)
+        digits = "".join(c for c in raw if c.isdigit())
+        if digits:
+            try:
+                price = int(digits)
+            except ValueError:
+                price = None
+
+    parts = [p.strip() for p in card.get_text(separator="|", strip=True).split("|") if p.strip()]
+    type_part = next((p for p in parts if "m²" in p or "bedroom" in p.lower() or "studio" in p.lower()), "")
+    # Real PA locations look like "Poissonnière, Paris 10" or "Montmartre / Place des
+    # Abbesses, Paris 18". The "Paris Attitude Selection" label is a featured-listing
+    # tag, not a real address — require a Paris arrondissement number to qualify.
+    location = ""
+    arr_re = _re.compile(r"\bParis\s+\d{1,2}\b")
+    for p in parts:
+        if arr_re.search(p) and "€" not in p:
+            location = p
+            break
+
+    title = type_part if type_part else (parts[1] if len(parts) > 1 else "Appartement")
+    if location and type_part:
+        title = f"{type_part} — {location}"
+
+    images = [
+        src for img in card.find_all("img")
+        if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description="",
+        price=price,
+        location=location,
+        seller_name="Paris Attitude",
+        url=href,
+        seller_type_hint="pro",
+        source="parisattitude",
+        images=images,
     )
 
 
 async def _search_parisattitude_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    return await _search_via_generic(
-        search_url, max_results,
-        site="parisattitude",
-        base_url="https://www.parisattitude.com",
-        source="parisattitude",
-        prefix="pa",
-        card_selectors=[r"property-card|appartement|search-result", r"card|listing"],
-    )
+    """Site-specific parser — bypasses the generic Next.js path (PA is .NET/Quasar)."""
+    logger.info("[PARISATTITUDE] Scraping: %s", search_url)
+    try:
+        html = await _fetch_html_with_stealth(search_url, "parisattitude", post_delay=(3.0, 5.0))
+        if not html:
+            return []
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.find_all("div", class_="accommodation-search-card")
+        logger.info("[PARISATTITUDE] Found %d card elements", len(cards))
+        listings = [
+            l for l in (_parisattitude_card_to_listing(c) for c in cards[:max_results]) if l
+        ]
+        logger.info("[PARISATTITUDE] Parsed %d listings", len(listings))
+        return listings
+    except Exception as exc:
+        logger.warning("[PARISATTITUDE] Scraping failed: %s", exc)
+        return []
 
 
 async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> list[Listing]:

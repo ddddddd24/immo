@@ -108,37 +108,31 @@ DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
 )
 
 # ── Phase 2: student / young-pro platforms ────────────────────────────────────
-# Empty string disables the source. Set the env var with a search URL copied
-# from your browser after filtering on the target site for best results.
+# Empty string disables the source — dispatcher skips empty URLs in
+# _campaign_sources(). Studapart and Paris Attitude have site-specific parsers;
+# the others are disabled by default until proper parsers are written.
+# Studapart — public listings via Camoufox (stealth Playwright gets
+# fingerprinted and served an SEO fallback page).
 DEFAULT_SEARCH_STUDAPART_URL: str = os.getenv(
     "STUDAPART_SEARCH_URL",
-    "https://www.studapart.com/fr/search?city=paris&priceMax=1000&surfaceMin=25",
+    "https://www.studapart.com/fr/logement-etudiant-paris",
 )
 
+# Paris Attitude — public listings, ~40 per page on the index URL.
+# Typical inventory is 1500€+/month (expat medium-term furnished), so the
+# 1000€ budget ceiling will filter out most results.
 DEFAULT_SEARCH_PARISATTITUDE_URL: str = os.getenv(
     "PARISATTITUDE_SEARCH_URL",
-    "https://www.parisattitude.com/recherche?priceMax=1000",
+    "https://www.parisattitude.com/rent-apartment/furnished-rental/index,rentals.aspx",
 )
 
-DEFAULT_SEARCH_LODGIS_URL: str = os.getenv(
-    "LODGIS_SEARCH_URL",
-    "https://www.lodgis.com/locations-paris?prixMax=1000&surfaceMin=25",
-)
-
-DEFAULT_SEARCH_IMMOJEUNE_URL: str = os.getenv(
-    "IMMOJEUNE_SEARCH_URL",
-    "https://www.immojeune.com/locations?ville=paris&loyer-max=1000&surface-min=25",
-)
-
-DEFAULT_SEARCH_LOCSERVICE_URL: str = os.getenv(
-    "LOCSERVICE_SEARCH_URL",
-    "https://www.locservice.fr/recherche.html?ville=paris&loyer-max=1000",
-)
-
-DEFAULT_SEARCH_ROOMLALA_URL: str = os.getenv(
-    "ROOMLALA_SEARCH_URL",
-    "https://www.roomlala.com/fr/recherche?city=paris&priceMax=1000",
-)
+# Disabled by default — generic-card parser returned nav/UI junk on first run.
+# Set the env var to a search URL copied from your browser to re-enable
+# (parser will likely still need site-specific tuning).
+DEFAULT_SEARCH_LODGIS_URL: str = os.getenv("LODGIS_SEARCH_URL", "")
+DEFAULT_SEARCH_IMMOJEUNE_URL: str = os.getenv("IMMOJEUNE_SEARCH_URL", "")
+DEFAULT_SEARCH_LOCSERVICE_URL: str = os.getenv("LOCSERVICE_SEARCH_URL", "")
+DEFAULT_SEARCH_ROOMLALA_URL: str = os.getenv("ROOMLALA_SEARCH_URL", "")
 
 # ── Fast poller (mode veille) ─────────────────────────────────────────────────
 FAST_POLL_INTERVAL_MIN: int = int(os.getenv("FAST_POLL_INTERVAL_MIN", "15"))
