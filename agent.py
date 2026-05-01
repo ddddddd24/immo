@@ -408,13 +408,13 @@ async def prescreen_listing(listing: Listing) -> dict:
 _INTENT_TOOLS = [
     {
         "name": "run_search",
-        "description": "Lancer un scraping d'annonces LeBonCoin. Utiliser quand l'utilisateur veut chercher des appartements.",
+        "description": "Lancer un scraping ponctuel d'une seule source. Utiliser quand l'utilisateur veut tester une URL de recherche spécifique. Pour la recherche multi-sources complète, préférer run_campagne.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "URL de recherche LeBonCoin (optionnel, utiliser l'URL par défaut si non précisée)",
+                    "description": "URL de recherche (LBC, SeLoger, PAP, Bien'ici, Logic-Immo, Studapart, Paris Attitude, Lodgis, ImmoJeune ou LocService). Optionnel — utiliser l'URL par défaut LBC si non précisée.",
                 }
             },
             "required": [],
@@ -422,13 +422,13 @@ _INTENT_TOOLS = [
     },
     {
         "name": "run_simulate",
-        "description": "Analyser une annonce et générer le message qui serait envoyé, sans l'envoyer. Utiliser quand l'utilisateur envoie une URL LeBonCoin ou veut voir ce que le bot dirait.",
+        "description": "Analyser UNE annonce précise et générer le message qui serait envoyé, sans l'envoyer. Utiliser quand l'utilisateur envoie une URL d'annonce (depuis n'importe lequel des sites supportés) ou veut voir ce que le bot dirait sur un bien spécifique.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "URL de l'annonce LeBonCoin à analyser",
+                    "description": "URL d'une annonce individuelle (leboncoin.fr, seloger.com, pap.fr, bienici.com, logic-immo.com, studapart.com, parisattitude.com, lodgis.com, immojeune.com, locservice.fr).",
                 }
             },
             "required": ["url"],
@@ -436,33 +436,33 @@ _INTENT_TOOLS = [
     },
     {
         "name": "run_campagne",
-        "description": "Lancer la campagne automatique complète : scraping + génération de messages + envoi.",
+        "description": "Lancer une campagne complète : scraping multi-sources + analyse + envoi de messages. À utiliser quand l'utilisateur veut 'lancer la recherche', 'envoyer les messages', 'contacter les annonces', etc.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "run_rapport",
-        "description": "Afficher les statistiques du jour : annonces scrapées, messages envoyés, réponses reçues.",
+        "description": "Afficher les statistiques du jour : annonces scrapées, messages envoyés, réponses reçues. Utiliser pour 'rapport', 'stats', 'bilan', 'comment ça avance', etc.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "run_stop",
-        "description": "Arrêter la campagne en cours.",
+        "description": "Arrêter la campagne EN COURS d'exécution. Pour désactiver la campagne automatique récurrente, utiliser run_autostop.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "run_settings",
-        "description": "Afficher les critères de recherche actuels.",
+        "description": "Afficher les critères de recherche actuels (budget, surface, zones, etc.).",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "run_autostart",
-        "description": "Activer la campagne automatique répétée toutes les N heures.",
+        "description": "Activer la campagne automatique récurrente toutes les N heures. Utiliser pour 'lance la campagne en boucle', 'tourne tous les X heures', etc.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "hours": {
                     "type": "number",
-                    "description": "Intervalle en heures (défaut 3)",
+                    "description": "Intervalle en heures (défaut 3).",
                 }
             },
             "required": [],
@@ -470,23 +470,59 @@ _INTENT_TOOLS = [
     },
     {
         "name": "run_autostop",
-        "description": "Arrêter la campagne automatique.",
+        "description": "Arrêter la campagne automatique récurrente (désactive la boucle, contrairement à run_stop qui n'arrête que l'exécution courante).",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "run_watch",
+        "description": "Activer le mode veille : poll rapide toutes les N minutes pour chopper les nouvelles annonces dès qu'elles apparaissent et les contacter immédiatement. Utiliser pour 'mode veille', 'surveille', 'préviens-moi des nouveautés', 'temps réel', etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "minutes": {
+                    "type": "number",
+                    "description": "Intervalle de poll en minutes (défaut 15).",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "run_unwatch",
+        "description": "Désactiver le mode veille (poll rapide). Utiliser pour 'arrête la veille', 'plus de surveillance', etc.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "run_visite",
+        "description": "Enregistrer une visite planifiée pour un bien. Nécessite l'URL de l'annonce ET la date/heure du rendez-vous.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL de l'annonce visitée."},
+                "date": {"type": "string", "description": "Date et heure du rendez-vous en français libre, ex: 'Samedi 5 avril 10h'."},
+            },
+            "required": ["url", "date"],
+        },
+    },
+    {
         "name": "run_visites",
-        "description": "Afficher la liste des visites planifiées.",
+        "description": "Afficher la liste des visites planifiées à venir.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "run_boite",
+        "description": "Vérifier la boîte de réception LeBonCoin pour voir les nouvelles réponses des annonceurs. Utiliser pour 'check ma boîte', 'des réponses?', 'vérifie les messages reçus', etc.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "reply",
-        "description": "Répondre directement à l'utilisateur sans déclencher d'action. Utiliser pour les questions, les conversations, les explications.",
+        "description": "Répondre directement à l'utilisateur sans déclencher d'action. Utiliser pour les salutations, questions générales, explications, ou si la demande ne correspond à aucun outil. La réponse doit être chaleureuse, en français, et donner envie de poursuivre la conversation.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "La réponse à envoyer à l'utilisateur, en français",
+                    "description": "La réponse à envoyer à l'utilisateur, en français, ton naturel et amical.",
                 }
             },
             "required": ["text"],
@@ -495,11 +531,32 @@ _INTENT_TOOLS = [
 ]
 
 _INTENT_SYSTEM = """
-Tu es l'assistant du bot immobilier d'Illan Krief.
-Illan cherche un appartement meublé en Île-de-France (max 800€, 25m²+, dispo sept 2026).
-Ton rôle : comprendre ce qu'Illan veut faire et choisir l'outil approprié.
+Tu es l'assistant conversationnel du bot immobilier d'Illan Krief.
+
+Profil d'Illan :
+- Cherche un appartement meublé en Île-de-France
+- Budget max 1000€ CC, surface mini 25m², emménagement septembre 2026
+- Alternant SNCF Voyageurs
+
+Sources scrapées : LeBonCoin, SeLoger, PAP, Bien'ici, Logic-Immo, Studapart,
+Paris Attitude, Lodgis, ImmoJeune, LocService.
+
+Ton rôle : comprendre ce qu'Illan veut faire en langage naturel et choisir
+l'outil approprié. Tu DOIS appeler exactement un outil par message.
+
+Règles clés :
+- Si le message contient une URL d'annonce (depuis n'importe quel site
+  supporté ci-dessus), utilise run_simulate avec cette URL.
+- Si Illan dit bonjour, te remercie, plaisante, ou pose une question
+  conversationnelle (sans demander d'action), utilise reply avec une réponse
+  chaleureuse et naturelle en français.
+- Distingue bien run_stop (arrêter la campagne en cours) de run_autostop
+  (désactiver la campagne automatique récurrente).
+- Distingue run_watch (mode veille rapide, intervalles courts en minutes) de
+  run_autostart (campagne complète récurrente, intervalles longs en heures).
+- Si l'intention est ambiguë, choisis reply et demande une clarification.
+
 Réponds TOUJOURS en français.
-Si le message contient une URL leboncoin.fr, utilise run_simulate avec cette URL.
 """.strip()
 
 
@@ -541,7 +598,14 @@ def classify_intent(user_message: str) -> dict:
         if block.type == "tool_use":
             return {"tool": block.name, **block.input}
 
-    return {"tool": "reply", "text": "Je n'ai pas compris. Envoie-moi une URL LeBonCoin ou décris ce que tu veux faire."}
+    # Fallback: if the LLM replied with plain text instead of picking a tool
+    # (DeepSeek does this for chitchat like "salut" / "merci"), surface the
+    # text directly as a conversational reply rather than the canned fallback.
+    text_reply = _first_text(resp).strip()
+    if text_reply:
+        return {"tool": "reply", "text": text_reply}
+
+    return {"tool": "reply", "text": "Je n'ai pas compris. Envoie-moi une URL d'annonce ou décris ce que tu veux faire."}
 
 
 def format_simulation_text(result: AnalysisResult) -> str:

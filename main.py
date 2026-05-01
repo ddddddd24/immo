@@ -826,14 +826,34 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif tool == "run_autostop":
         await cmd_autostop(update, ctx)
 
+    elif tool == "run_watch":
+        minutes = intent.get("minutes")
+        ctx.args = [str(int(minutes))] if minutes else []
+        await cmd_watch(update, ctx)
+
+    elif tool == "run_unwatch":
+        await cmd_unwatch(update, ctx)
+
+    elif tool == "run_visite":
+        url = (intent.get("url") or "").strip()
+        date = (intent.get("date") or "").strip()
+        if not url or not date:
+            await _reply(update, "🔗 Donne-moi l'URL de l'annonce et la date/heure de la visite.")
+            return
+        ctx.args = [url, *date.split()]
+        await cmd_visite(update, ctx)
+
     elif tool == "run_visites":
         await cmd_visites(update, ctx)
+
+    elif tool == "run_boite":
+        await cmd_boite(update, ctx)
 
     elif tool == "reply":
         await _reply(update, intent.get("text", "Je n'ai pas compris, peux-tu reformuler ?"))
 
     else:
-        await _reply(update, "Je n'ai pas compris. Envoie-moi une URL LeBonCoin ou décris ce que tu veux faire.")
+        await _reply(update, "Je n'ai pas compris. Envoie-moi une URL d'annonce ou décris ce que tu veux faire.")
 
 
 # ─── Error handler ────────────────────────────────────────────────────────────
