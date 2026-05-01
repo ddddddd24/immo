@@ -408,14 +408,22 @@ async def prescreen_listing(listing: Listing) -> dict:
 _INTENT_TOOLS = [
     {
         "name": "run_search",
-        "description": "Lancer un scraping ponctuel d'une seule source. Utiliser quand l'utilisateur veut tester une URL de recherche spécifique. Pour la recherche multi-sources complète, préférer run_campagne.",
+        "description": "Lancer un scraping ponctuel d'UNE source pour tester ou voir les résultats bruts. Pour la recherche multi-sources complète préférer run_campagne.",
         "input_schema": {
             "type": "object",
             "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": [
+                        "leboncoin", "seloger", "pap", "bienici", "logicimmo",
+                        "studapart", "parisattitude", "lodgis", "immojeune", "locservice",
+                    ],
+                    "description": "Nom de la source à scraper. UTILISE TOUJOURS ce paramètre quand l'utilisateur nomme un site (ex: 'paris attitude' → 'parisattitude', 'seloger' → 'seloger'). N'INVENTE JAMAIS d'URL.",
+                },
                 "url": {
                     "type": "string",
-                    "description": "URL de recherche (LBC, SeLoger, PAP, Bien'ici, Logic-Immo, Studapart, Paris Attitude, Lodgis, ImmoJeune ou LocService). Optionnel — utiliser l'URL par défaut LBC si non précisée.",
-                }
+                    "description": "URL EXACTE de recherche, UNIQUEMENT si l'utilisateur l'a explicitement collée dans son message. Sinon utilise `source`.",
+                },
             },
             "required": [],
         },
@@ -544,17 +552,42 @@ Paris Attitude, Lodgis, ImmoJeune, LocService.
 Ton rôle : comprendre ce qu'Illan veut faire en langage naturel et choisir
 l'outil approprié. Tu DOIS appeler exactement un outil par message.
 
-Règles clés :
-- Si le message contient une URL d'annonce (depuis n'importe quel site
-  supporté ci-dessus), utilise run_simulate avec cette URL.
-- Si Illan dit bonjour, te remercie, plaisante, ou pose une question
-  conversationnelle (sans demander d'action), utilise reply avec une réponse
-  chaleureuse et naturelle en français.
-- Distingue bien run_stop (arrêter la campagne en cours) de run_autostop
-  (désactiver la campagne automatique récurrente).
-- Distingue run_watch (mode veille rapide, intervalles courts en minutes) de
-  run_autostart (campagne complète récurrente, intervalles longs en heures).
-- Si l'intention est ambiguë, choisis reply et demande une clarification.
+RÈGLES CRITIQUES — à respecter absolument :
+
+1. URLs : N'INVENTE JAMAIS d'URL. Pour cibler un site précis avec run_search,
+   utilise le paramètre `source` (ex: 'parisattitude', 'studapart'). Utilise
+   `url` UNIQUEMENT si l'utilisateur a collé une URL textuelle dans son
+   message.
+
+2. Filtres NON supportés — utilise reply pour expliquer poliment :
+   - Filtrer par date ("du jour", "aujourd'hui", "dernières 24h", "cette
+     semaine", "dernière heure") — aucune source ne supporte ce filtre côté
+     bot.
+   - "Ignorer mes préférences", "sans le filtre budget", "tout afficher" —
+     le filtre budget de 1000€ s'applique toujours pour la campagne
+     (run_campagne) et le mode veille (run_watch). Pour scraper les
+     résultats bruts d'un site sans filtre, run_search persiste tout en DB
+     mais ne contacte rien — précise-le.
+   - Tri custom (par prix croissant, par surface, etc.).
+   - Filtrage par arrondissement spécifique non configuré dans l'URL par
+     défaut.
+   Dans tous ces cas, dis clairement à Illan que la fonctionnalité n'est pas
+   supportée, propose ce que le bot PEUT faire à la place.
+
+3. Si le message contient une URL d'annonce individuelle (depuis n'importe
+   quel site supporté), utilise run_simulate avec cette URL.
+
+4. Si Illan dit bonjour, te remercie, plaisante, ou pose une question
+   conversationnelle (sans demander d'action), utilise reply avec une
+   réponse chaleureuse et naturelle en français.
+
+5. Distinctions à respecter :
+   - run_stop = arrêter la campagne en cours d'exécution
+   - run_autostop = désactiver la campagne automatique récurrente
+   - run_watch = mode veille rapide (intervalles en minutes)
+   - run_autostart = campagne complète récurrente (intervalles en heures)
+
+6. Si l'intention est ambiguë, choisis reply et demande une clarification.
 
 Réponds TOUJOURS en français.
 """.strip()

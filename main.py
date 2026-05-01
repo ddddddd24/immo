@@ -794,7 +794,31 @@ async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     tool = intent.get("tool")
 
     if tool == "run_search":
-        url = intent.get("url") or config.DEFAULT_SEARCH_URL
+        source = (intent.get("source") or "").strip().lower()
+        url = (intent.get("url") or "").strip()
+        if source:
+            source_url_map = {
+                "leboncoin":     config.DEFAULT_SEARCH_URL,
+                "seloger":       config.DEFAULT_SEARCH_SELOGER_URL,
+                "pap":           config.DEFAULT_SEARCH_PAP_URL,
+                "bienici":       config.DEFAULT_SEARCH_BIENICI_URL,
+                "logicimmo":     config.DEFAULT_SEARCH_LOGICIMMO_URL,
+                "studapart":     config.DEFAULT_SEARCH_STUDAPART_URL,
+                "parisattitude": config.DEFAULT_SEARCH_PARISATTITUDE_URL,
+                "lodgis":        config.DEFAULT_SEARCH_LODGIS_URL,
+                "immojeune":     config.DEFAULT_SEARCH_IMMOJEUNE_URL,
+                "locservice":    config.DEFAULT_SEARCH_LOCSERVICE_URL,
+            }
+            url = source_url_map.get(source, "")
+            if not url:
+                await _reply(
+                    update,
+                    f"⚠️ La source `{source}` n'est pas configurée (URL vide). "
+                    "Utilise une autre source ou colle l'URL exacte.",
+                )
+                return
+        if not url:
+            url = config.DEFAULT_SEARCH_URL  # fallback to LBC
         ctx.args = [url] if url != config.DEFAULT_SEARCH_URL else []
         await cmd_search(update, ctx)
 
