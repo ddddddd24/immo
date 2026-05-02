@@ -472,6 +472,11 @@ _INTENT_TOOLS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "sync_sheet",
+        "description": "Synchroniser la base d'annonces vers le Google Sheet (si configuré). Utilise pour 'sync sheet', 'mets à jour le tableur', 'pousse vers google sheets', 'synchronise', 'envoie au sheet'.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "list_recent",
         "description": "Lister les VRAIES annonces récemment scrapées en base (toutes sources, qu'elles soient préparées ou non). À UTILISER OBLIGATOIREMENT pour 'qu'as-tu trouvé en dernier', 'donne-moi les annonces récentes', 'montre-moi les dernières annonces', 'liste tout ce que t'as scrapé'. Toujours préférer cet outil à reply quand l'utilisateur veut voir des annonces concrètes.",
         "input_schema": {

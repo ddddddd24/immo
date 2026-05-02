@@ -162,3 +162,11 @@ STALE_DAYS: int = int(os.getenv("STALE_DAYS", "5"))
 # Listings scored ≥ INTEREST_THRESHOLD trigger a 🔥 priority alert in addition
 # to the regular contact flow. Default 8/10 = strong match only.
 INTEREST_THRESHOLD: int = int(os.getenv("INTEREST_THRESHOLD", "8"))
+
+# ── Google Sheets sync (optional — auto-disabled if either var is missing) ───
+# See sheets_sync.py module docstring for setup steps.
+GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
+GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_JSON", "data/google_service_account.json"
+)
+SYNC_AFTER_CAMPAIGN: bool = os.getenv("SYNC_AFTER_CAMPAIGN", "true").lower() in ("true", "1", "yes")

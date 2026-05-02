@@ -749,6 +749,20 @@ async def _run_campaign_body(
             except Exception as exc:
                 logger.error("Smart re-contact prep failed for %s: %s", drop["url"], exc)
 
+    # Auto-sync to Google Sheets if configured
+    if config.SYNC_AFTER_CAMPAIGN:
+        try:
+            import sheets_sync
+            if sheets_sync.is_configured():
+                summary = await asyncio.to_thread(sheets_sync.sync_listings)
+                await _reply(
+                    update,
+                    f"📤 Sheets sync : {summary['updated']} màj, "
+                    f"{summary['appended']} nouvelles."
+                )
+        except Exception as exc:
+            logger.warning("Auto Sheets sync failed (non-fatal): %s", exc)
+
     # Check LBC inbox for new replies
     try:
         new_replies = await check_inbox_lbc()
@@ -996,6 +1010,36 @@ async def cmd_query(
             lines.append(_fmt_listing(l))
 
     await _reply(update, "\n".join(lines))
+
+
+# ─── /sync — Google Sheets sync ──────────────────────────────────────────────
+
+async def cmd_sync_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Push current DB listings to the configured Google Sheet."""
+    import sheets_sync
+    if not sheets_sync.is_configured():
+        await _reply(
+            update,
+            "⚠️ Google Sheets sync n'est pas configuré.\n"
+            "Renseigne `GOOGLE_SHEET_ID` et `GOOGLE_SERVICE_ACCOUNT_JSON` "
+            "dans `.env`. Voir `sheets_sync.py` pour les étapes.",
+        )
+        return
+    await _reply(update, "📤 Synchronisation Google Sheets en cours…")
+    try:
+        summary = await asyncio.to_thread(sheets_sync.sync_listings)
+    except FileNotFoundError as exc:
+        await _reply(update, f"⚠️ {exc}")
+        return
+    except Exception as exc:
+        logger.error("Sheets sync failed: %s", exc)
+        await _reply(update, f"❌ Erreur sync : `{exc}`")
+        return
+    await _reply(
+        update,
+        f"✅ Sync terminée : {summary['updated']} mises à jour, "
+        f"{summary['appended']} ajouts, {summary['total']} annonces totales.",
+    )
 
 
 # ─── /rapport ─────────────────────────────────────────────────────────────────
@@ -1334,6 +1378,9 @@ async def _cmd_chat_inner(
         limit = intent.get("limit") or 10
         await cmd_list_recent(update, ctx, limit=int(limit))
 
+    elif tool == "sync_sheet":
+        await cmd_sync_sheet(update, ctx)
+
     elif tool == "query_listings":
         await cmd_query(
             update, ctx,
@@ -1432,6 +1479,7 @@ def main() -> None:
     app.add_handler(CommandHandler("confirmer", cmd_confirmer))
     app.add_handler(CommandHandler("pending", cmd_list_pending))
     app.add_handler(CommandHandler("recent", cmd_list_recent))
+    app.add_handler(CommandHandler("sync", cmd_sync_sheet))
 
     async def _cmd_rapport_complet(update, ctx):
         """Default /rapport_complet: groups by source, sorts by surface."""
