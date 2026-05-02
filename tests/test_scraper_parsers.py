@@ -57,6 +57,38 @@ def test_lbc_ad_to_listing_returns_none_without_id():
     assert _ad_to_listing({"subject": "no id"}) is None
 
 
+def test_lbc_ad_to_listing_returns_none_for_non_dict():
+    """Regression: 'str' object has no attribute 'get' on schema drift."""
+    from scraper import _ad_to_listing
+    assert _ad_to_listing("not a dict") is None
+    assert _ad_to_listing(None) is None
+    assert _ad_to_listing(42) is None
+
+
+@pytest.mark.parametrize("malformed_field", [
+    {"images": "not a dict"},                      # images as string
+    {"images": [{"not_url_key": "x"}]},            # images list with weird entries
+    {"images": [None, "https://direct-url.jpg"]},  # images list with None + str
+    {"location": "Paris"},                         # location as string instead of dict
+    {"owner": "Marie"},                            # owner as string
+    {"attributes": "not a list"},                  # attributes as string
+    {"attributes": ["just a string"]},             # attributes list with non-dict items
+    {"price": "not a list"},                       # price as string instead of [int]
+])
+def test_lbc_ad_to_listing_survives_malformed_fields(malformed_field):
+    """Regression: any single field with the wrong type used to crash.
+
+    All these were variants of "'str' object has no attribute 'get'" before
+    the defensive parsing fix.
+    """
+    from scraper import _ad_to_listing
+    ad = {"list_id": 9999, "subject": "Test"}
+    ad.update(malformed_field)
+    listing = _ad_to_listing(ad)
+    assert listing is not None
+    assert listing.lbc_id == "9999"
+
+
 # ─── Per-site parser snapshots against captured HTML ────────────────────────
 #
 # Each test loads the real HTML we captured during scraper development and

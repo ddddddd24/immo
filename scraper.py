@@ -128,6 +128,28 @@ def _is_seloger(url: str) -> bool:
 
 # ─── Listing normalisation ────────────────────────────────────────────────────
 
+def _dig(obj, *path, default=None):
+    """Walk a nested dict chain safely. Returns `default` the moment any level
+    isn't a dict (instead of crashing on '.get'). Used everywhere we parse
+    third-party JSON whose schema can drift on us.
+    """
+    for key in path:
+        if not isinstance(obj, dict):
+            return default
+        obj = obj.get(key)
+    return obj if obj is not None else default
+
+
+def _ensure_dict(value) -> dict:
+    """Return value if it's a dict, else an empty dict."""
+    return value if isinstance(value, dict) else {}
+
+
+def _ensure_list(value) -> list:
+    """Return value if it's a list, else an empty list."""
+    return value if isinstance(value, list) else []
+
+
 def _parse_price(raw) -> Optional[int]:
     """Extract a single rent value from raw input.
 
@@ -173,7 +195,14 @@ def _parse_price(raw) -> Optional[int]:
 
 
 def _ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
-    """Convert a LBC ad dict (from __NEXT_DATA__) to a Listing."""
+    """Convert a LBC ad dict (from __NEXT_DATA__) to a Listing.
+
+    Hardened against schema drift: every nested field is type-checked with
+    _ensure_dict / _ensure_list before chained .get() calls. A single
+    malformed field returns reasonable defaults instead of crashing.
+    """
+    if not isinstance(ad, dict):
+        return None
     lbc_id = str(ad.get("list_id") or ad.get("id") or "")
     if not lbc_id:
         return None
@@ -181,30 +210,50 @@ def _ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
     if not url:
         url = f"https://www.leboncoin.fr/ad/locations/{lbc_id}"
 
-    # Price — check attributes array first, then top-level price field
+    # Price — check attributes array first (skip non-dict entries), then top-level
     price_raw = None
-    for attr in (ad.get("attributes") or []):
+    for attr in _ensure_list(ad.get("attributes")):
+        if not isinstance(attr, dict):
+            continue
         if attr.get("key") == "price":
-            price_raw = attr.get("value_label") or attr.get("values", [None])[0]
+            values = attr.get("values")
+            first_val = values[0] if isinstance(values, list) and values else None
+            price_raw = attr.get("value_label") or first_val
             break
     if price_raw is None:
-        p = ad.get("price", [None])
-        price_raw = p[0] if isinstance(p, list) else p
+        p = ad.get("price")
+        if isinstance(p, list):
+            price_raw = p[0] if p else None
+        else:
+            price_raw = p
 
-    loc = ad.get("location") or {}
+    loc = _ensure_dict(ad.get("location"))
     location = ", ".join(filter(None, [loc.get("city"), loc.get("zipcode")]))
 
-    owner = ad.get("owner") or {}
+    owner = _ensure_dict(ad.get("owner"))
     seller_name = owner.get("name") or owner.get("store_name") or ""
     seller_type_hint = owner.get("type") or ""
 
-    # Extract photo URLs (LBC stores them in images array)
-    images = [
-        img.get("url") or img.get("thumb_url") or ""
-        for img in (ad.get("images", {}).get("urls_large") or ad.get("images", {}).get("urls") or [])
-        if img
-    ]
-    images = [u for u in images if u]
+    # Photos: ad.images may be a dict-of-lists, a flat list, or absent entirely
+    images_field = ad.get("images")
+    images_pool: list = []
+    if isinstance(images_field, dict):
+        images_pool = (
+            _ensure_list(images_field.get("urls_large"))
+            or _ensure_list(images_field.get("urls"))
+        )
+    elif isinstance(images_field, list):
+        images_pool = images_field
+    images: list[str] = []
+    for img in images_pool:
+        if isinstance(img, dict):
+            u = img.get("url") or img.get("thumb_url") or ""
+        elif isinstance(img, str):
+            u = img
+        else:
+            u = ""
+        if u:
+            images.append(u)
 
     return Listing(
         lbc_id=lbc_id,
@@ -310,26 +359,41 @@ async def _search_with_playwright(search_url: str, max_results: int) -> list[Lis
     logger.info("[PLAYWRIGHT] Scraping search page: %s", search_url)
     data = await _pw_get_next_data(search_url)
     if not data:
-        raise RuntimeError("Playwright could not fetch search page — DataDome blocked or page structure changed")
+        raise RuntimeError(
+            "Playwright could not fetch search page — DataDome blocked or page structure changed"
+        )
 
-    props = data.get("props", {}).get("pageProps", {})
-    # LBC stores results under searchData.ads or directly ads
+    props = _ensure_dict(_dig(data, "props", "pageProps"))
+    # LBC stores results under searchData.ads or directly ads. Either may be
+    # missing or have a different shape; ensure list before iterating.
     ads = (
-        props.get("searchData", {}).get("ads")
+        _dig(props, "searchData", "ads")
         or props.get("ads")
         or []
     )
+    ads = _ensure_list(ads)
 
     if not ads:
         logger.warning("No ads found in __NEXT_DATA__. pageProps keys: %s", list(props.keys()))
 
     listings = []
     for ad in ads[:max_results]:
-        lbc_id = str(ad.get("list_id") or ad.get("id") or "")
-        url = f"https://www.leboncoin.fr/ad/locations/{lbc_id}" if lbc_id else search_url
-        listing = _ad_to_listing(ad, url)
-        if listing:
-            listings.append(listing)
+        if not isinstance(ad, dict):
+            logger.debug("Skipping non-dict ad entry: %r", type(ad).__name__)
+            continue
+        try:
+            lbc_id = str(ad.get("list_id") or ad.get("id") or "")
+            url = f"https://www.leboncoin.fr/ad/locations/{lbc_id}" if lbc_id else search_url
+            listing = _ad_to_listing(ad, url)
+            if listing:
+                listings.append(listing)
+        except Exception as exc:
+            # One malformed listing must not kill the whole batch.
+            logger.warning(
+                "Skipping malformed LBC ad (%s): %s",
+                ad.get("list_id") or ad.get("id") or "?",
+                exc,
+            )
 
     logger.info("[PLAYWRIGHT] Found %d listings", len(listings))
     return listings
