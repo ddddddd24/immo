@@ -548,31 +548,55 @@ async def _run_campaign_body(
         except Exception:
             pass  # Telegram rate-limits edits; ignore non-critical failures
 
+    # Per-source timeout. Camoufox cold-start (~15-30s) + page load (~30s) +
+    # post_delay (~5s) easily exceeds 90s. Bien'ici has a 3-stage fallback
+    # chain (Playwright → Camoufox → XHR intercept) that needs even more.
+    _TIMEOUT_BY_LABEL = {
+        # Pure Playwright + stealth — fast (~20-40s typical)
+        "LBC": 90.0,
+        "PAP": 90.0,
+        "Logic-Immo": 90.0,
+        # Camoufox-based — needs cold-start headroom
+        "Studapart": 180.0,
+        "Lodgis": 180.0,
+        "ImmoJeune": 180.0,
+        "LocService": 180.0,
+        "Paris Attitude": 120.0,  # Playwright-only but heavy page
+        # Multi-stage fallback chain
+        "Bien'ici": 240.0,
+        "SeLoger": 180.0,  # Camoufox + LZString decode
+    }
+    DEFAULT_TIMEOUT = 90.0
+
     per_source: list[tuple[str, int, list]] = []
     listings: list = []
-    PER_SOURCE_TIMEOUT = 90.0  # seconds — kill any source that hangs past this
     for i, (url, label) in enumerate(sources):
         states[i] = f"🔄 *{label}* : en cours…"
         await _refresh_board()
+        timeout = _TIMEOUT_BY_LABEL.get(label, DEFAULT_TIMEOUT)
+        t0 = time.time()
         try:
             results = await asyncio.wait_for(
                 search_listings(url, max_results=25),
-                timeout=PER_SOURCE_TIMEOUT,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
-            logger.warning("%s scrape timed out (>%.0fs)", label, PER_SOURCE_TIMEOUT)
+            elapsed = time.time() - t0
+            logger.warning("%s scrape timed out after %.1fs (limit %.0fs)", label, elapsed, timeout)
             results = []
-            states[i] = f"⏱ {label} : timeout (>{PER_SOURCE_TIMEOUT:.0f}s)"
+            states[i] = f"⏱ {label} : timeout (>{timeout:.0f}s)"
         except Exception as exc:
             logger.error("%s scrape failed: %s", label, exc)
             results = []
             states[i] = f"❌ {label} : échec ({type(exc).__name__})"
         else:
             n = len(results)
+            elapsed = time.time() - t0
+            logger.info("%s scrape done in %.1fs: %d listings", label, elapsed, n)
             if n == 0:
-                states[i] = f"⚪ {label} : 0 annonce"
+                states[i] = f"⚪ {label} : 0 annonce ({elapsed:.0f}s)"
             else:
-                states[i] = f"✅ {label} : *{n}* annonce{'s' if n > 1 else ''}"
+                states[i] = f"✅ {label} : *{n}* annonce{'s' if n > 1 else ''} ({elapsed:.0f}s)"
         await _refresh_board()
         per_source.append((label, len(results), results))
         listings.extend(results)

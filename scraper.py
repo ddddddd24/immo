@@ -1315,7 +1315,9 @@ async def _fetch_html_with_camoufox(url: str, post_delay: tuple[float, float] = 
     async with AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows") as browser:
         page = await browser.new_page()
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            # 60s goto timeout: Camoufox cold-start + page load + DOM ready
+            # easily takes 30-45s on heavy sites (Lodgis, ImmoJeune).
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             await _handle_cookie_banner(page)
             await asyncio.sleep(random.uniform(*post_delay))
             return await page.content()
