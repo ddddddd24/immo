@@ -103,8 +103,9 @@ DEFAULT_SEARCH_BIENICI_URL: str = os.getenv(
 # ⚠️ Copy the URL from your browser after filtering on logic-immo.com with your criteria
 DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
     "LOGICIMMO_SEARCH_URL",
-    "https://www.logic-immo.com/location-appartement/paris,ile-de-france"
-    "?avec=meuble&surface-min=25&prix-max=1000",
+    # Updated 2026-05-02: old /location-appartement/ path now redirects to
+    # homepage. Current URL pattern uses /recherche-immo/ + ad06fr76 suffix.
+    "https://www.logic-immo.com/recherche-immo/location/appartement/meuble/ile-de-france/paris-75/ad06fr76",
 )
 
 # ── Phase 2: student / young-pro platforms ────────────────────────────────────

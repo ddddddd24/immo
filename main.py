@@ -568,6 +568,26 @@ async def _run_campaign_body(
     }
     DEFAULT_TIMEOUT = 90.0
 
+    from scraper import detect_housing_type
+
+    def _persist_batch(batch: list) -> int:
+        """Upsert a batch of just-scraped listings to DB. Called per-source so
+        partial campaigns (timeout / abort mid-flight) don't lose data."""
+        n = 0
+        for lst in batch:
+            try:
+                htype, n_room = detect_housing_type(lst.title or "", lst.description or "")
+                database.upsert_listing(
+                    lbc_id=lst.lbc_id, title=lst.title, price=lst.price,
+                    location=lst.location, seller_name=lst.seller_name,
+                    seller_type="", url=lst.url, source=lst.source,
+                    surface=lst.surface, housing_type=htype, roommate_count=n_room,
+                )
+                n += 1
+            except Exception as exc:
+                logger.warning("Failed to persist listing %s: %s", lst.lbc_id, exc)
+        return n
+
     per_source: list[tuple[str, int, list]] = []
     listings: list = []
     for i, (url, label) in enumerate(sources):
@@ -597,6 +617,9 @@ async def _run_campaign_body(
                 states[i] = f"⚪ {label} : 0 annonce ({elapsed:.0f}s)"
             else:
                 states[i] = f"✅ {label} : *{n}* annonce{'s' if n > 1 else ''} ({elapsed:.0f}s)"
+        # Persist immediately — survives subsequent source timeouts / aborts
+        if results:
+            _persist_batch(results)
         await _refresh_board()
         per_source.append((label, len(results), results))
         listings.extend(results)
@@ -618,32 +641,8 @@ async def _run_campaign_body(
         await _reply(update, "😕 Aucune annonce à analyser.")
         return
 
-    # Persist EVERY scraped listing to DB before the eligibility filter, so the
-    # dashboard / Sheets / /recent show the full picture (including over-budget
-    # PA, etc.). Contact creation still only happens for eligible ones below.
-    from scraper import detect_housing_type
-    persisted = 0
-    for listing in listings:
-        try:
-            htype, n_room = detect_housing_type(listing.title or "", listing.description or "")
-            database.upsert_listing(
-                lbc_id=listing.lbc_id,
-                title=listing.title,
-                price=listing.price,
-                location=listing.location,
-                seller_name=listing.seller_name,
-                seller_type="",  # filled in later for eligible ones via analyse_listing
-                url=listing.url,
-                source=listing.source,
-                surface=listing.surface,
-                housing_type=htype,
-                roommate_count=n_room,
-            )
-            persisted += 1
-        except Exception as exc:
-            logger.warning("Failed to persist scraped listing %s: %s", listing.lbc_id, exc)
-
-    await _reply(update, f"🧠 Analyse de *{len(listings)}* annonces en cours… ({persisted} persistées en DB)")
+    # Listings already persisted per-source above (see _persist_batch).
+    await _reply(update, f"🧠 Analyse de *{len(listings)}* annonces en cours…")
 
     sent = 0  # count of messages PREPARED in this run
     skipped = {
