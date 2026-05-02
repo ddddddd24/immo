@@ -406,16 +406,22 @@ def _deduplicate(listings: list) -> list:
     return unique
 
 
+_HOUSING_DEALBREAKERS = {"coloc", "coliving", "chambre"}
+
+
 def _should_contact(listing) -> tuple[bool, str, str]:
     """Centralised eligibility check shared by /campagne and /watch.
 
     Returns (eligible, category, fr_reason). Categories are stable identifiers
     used by the campaign report to break down skipped listings:
-    'qualité' / 'budget' / 'suspect' / 'déjà_préparée'.
+    'qualité' / 'budget' / 'suspect' / 'déjà_préparée' / 'type_logement'.
     Order matters: cheapest checks first, DB hit last.
     """
     if not is_real_offer(listing):
         return False, "qualité", "annonce filtrée"
+    htype = getattr(listing, "housing_type", "") or ""
+    if htype in _HOUSING_DEALBREAKERS:
+        return False, "type_logement", f"type {htype} (couple-only)"
     if listing.price and listing.price > PROFILE["search"]["max_rent"]:
         return False, "budget", f"{listing.price}€ > {PROFILE['search']['max_rent']}€"
     suspicious, reason = is_suspicious(listing)
@@ -650,6 +656,7 @@ async def _run_campaign_body(
         "qualité": 0,
         "suspect": 0,
         "déjà_préparée": 0,
+        "type_logement": 0,   # coloc/coliving/chambre — Illan veut un appart privé pour 2
         "dossier": 0,         # prescreen rejected (only if ENABLE_PRESCREENING)
         "score_bas": 0,       # score < MIN_SCORE (only if ENABLE_SCORING)
     }
@@ -737,6 +744,7 @@ async def _run_campaign_body(
         "qualité": "filtrées (qualité)",
         "suspect": "suspectes",
         "déjà_préparée": "déjà préparées",
+        "type_logement": "coloc/coliving/chambre",
         "dossier": "dossier incompatible",
         "score_bas": f"score < {config.MIN_SCORE}",
     }

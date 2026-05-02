@@ -67,6 +67,79 @@ def test_should_contact_rejects_skip_title(tmp_db, make_listing):
     assert category == "qualité"
 
 
+@pytest.mark.parametrize("housing_type", ["coloc", "coliving", "chambre"])
+def test_should_contact_rejects_shared_housing(tmp_db, make_listing, housing_type):
+    """Illan wants couple-only (Illan + Iqleema). No shared housing."""
+    import main
+    listing = make_listing(lbc_id=f"shared_{housing_type}", price=850)
+    listing.housing_type = housing_type
+    eligible, category, reason = main._should_contact(listing)
+    assert eligible is False
+    assert category == "type_logement"
+    assert housing_type in reason
+
+
+def test_should_contact_accepts_studio_t1_t2(tmp_db, make_listing):
+    """Standard private apartment types are fine."""
+    import main
+    for ht in ["studio", "T1", "T2", "T3", "residence", ""]:
+        listing = make_listing(lbc_id=f"private_{ht}", price=850)
+        listing.housing_type = ht
+        eligible, _, _ = main._should_contact(listing)
+        assert eligible is True, f"{ht} should be eligible"
+
+
+# ─── preferences.py dealbreakers ─────────────────────────────────────────────
+
+def test_preferences_dealbreaker_coloc():
+    import preferences
+    blocked, reason = preferences.is_dealbreaker(
+        housing_type="coloc", roommate_count=None,
+        title="Coloc Paris 11", description="",
+    )
+    assert blocked
+    assert "coloc" in reason
+
+
+def test_preferences_dealbreaker_high_roommate_count():
+    import preferences
+    blocked, reason = preferences.is_dealbreaker(
+        housing_type="", roommate_count=4,
+        title="T5 spacieux", description="",
+    )
+    assert blocked
+    assert "4" in reason
+
+
+def test_preferences_dealbreaker_keyword():
+    import preferences
+    blocked, reason = preferences.is_dealbreaker(
+        housing_type="studio", roommate_count=None,
+        title="Studio sous-location 2 mois", description="",
+    )
+    assert blocked
+    assert "sous-location" in reason
+
+
+def test_preferences_no_dealbreaker_for_normal_listing():
+    import preferences
+    blocked, _ = preferences.is_dealbreaker(
+        housing_type="studio", roommate_count=None,
+        title="Studio meublé Paris 11", description="Beau studio calme",
+    )
+    assert blocked is False
+
+
+def test_preferences_build_prompt_block_includes_zones():
+    """Sanity check that the prompt-building helper produces something usable."""
+    import preferences
+    block = preferences.build_prompt_block()
+    assert "Saint-Denis" in block          # work location
+    assert "Vincennes" in block            # preferred zone
+    assert "balcon" in block               # preferred feature
+    assert "95 lointain" in block          # avoid zone label
+
+
 # ─── _escape_md ──────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("inp, expected", [

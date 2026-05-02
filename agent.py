@@ -238,27 +238,51 @@ def _generate_message(listing: Listing, seller_type: SellerType) -> str:
 # ─── Scoring (optional, ENABLE_SCORING=true) ─────────────────────────────────
 
 async def score_listing(listing: Listing) -> dict:
-    """Rate a listing 1-10. Returns {"score": int, "reason": str}."""
+    """Rate a listing 1-10 against Illan's structured preferences.
+
+    Returns {"score": int, "reason": str}. Score 0 means a dealbreaker
+    matched (no LLM call needed, saves tokens). 1-10 reflects how well
+    the listing fits the preferences in preferences.py.
+    """
     if config.MOCK_MODE or not config.ENABLE_SCORING:
         return {"score": 7, "reason": "mock score"}
 
-    s = PROFILE["search"]
+    # Pre-filter: dealbreakers short-circuit without LLM call
+    import preferences
+    blocked, reason = preferences.is_dealbreaker(
+        housing_type=getattr(listing, "housing_type", ""),
+        roommate_count=getattr(listing, "roommate_count", None),
+        title=listing.title or "",
+        description=(listing.description or "")[:500],
+    )
+    if blocked:
+        logger.info("Dealbreaker on %s: %s", listing.lbc_id, reason)
+        return {"score": 0, "reason": f"dealbreaker: {reason}"}
+
+    prefs_block = preferences.build_prompt_block()
     prompt = (
-        f"Note cette annonce de 1 à 10 pour ce locataire :\n"
-        f"- Budget max : {s['max_rent']}€, surface min : {s['min_surface']}m²\n"
-        f"- Zones préférées : Paris intra-muros et petite couronne proche\n\n"
-        f"Annonce :\n"
+        f"Tu notes une annonce immobilière pour Illan de 1 à 10 selon SES préférences.\n\n"
+        f"{prefs_block}\n\n"
+        f"Règles de notation :\n"
+        f"  • 9-10 = match excellent (zone préférée + plusieurs caractéristiques préférées)\n"
+        f"  • 7-8  = bon match (zone OK + au moins une caractéristique préférée)\n"
+        f"  • 5-6  = correct (rien de bloquant mais rien d'enthousiasmant)\n"
+        f"  • 3-4  = signaux négatifs (zone à éviter, ou caractéristiques manquantes)\n"
+        f"  • 1-2  = mauvais match (zone à éviter ET commute long ET 0 caractéristique préférée)\n\n"
+        f"Annonce à évaluer :\n"
         f"- Titre : {listing.title}\n"
+        f"- Type : {getattr(listing, 'housing_type', '') or 'inconnu'}\n"
         f"- Prix : {listing.price}€\n"
+        f"- Surface : {getattr(listing, 'surface', '') or '?'}m²\n"
         f"- Localisation : {listing.location}\n"
-        f"- Description : {listing.description[:300]}\n\n"
-        "Réponds UNIQUEMENT sous cette forme (2 lignes) :\n"
-        "SCORE: <chiffre 1-10>\n"
-        "RAISON: <une phrase courte>"
+        f"- Description : {(listing.description or '')[:400]}\n\n"
+        f"Réponds STRICTEMENT sous cette forme (2 lignes max) :\n"
+        f"SCORE: <chiffre 1-10>\n"
+        f"RAISON: <une phrase concise mentionnant 2-3 facteurs concrets de l'annonce>"
     )
     resp = _call_claude(
         model=config.CLAUDE_MODEL,
-        max_tokens=60,
+        max_tokens=200,  # bumped from 60 — richer reasoning needs more room
         messages=[{"role": "user", "content": prompt}],
     )
     text = _first_text(resp).strip()
@@ -272,6 +296,7 @@ async def score_listing(listing: Listing) -> dict:
                 pass
         elif line.upper().startswith("RAISON:"):
             reason = line.split(":", 1)[-1].strip()
+    score = max(1, min(score, 10))  # clamp into [1, 10]
     return {"score": score, "reason": reason}
 
 
