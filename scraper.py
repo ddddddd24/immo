@@ -160,6 +160,62 @@ def _to_int_safe(value) -> Optional[int]:
         return None
 
 
+def detect_housing_type(title: str, description: str = "") -> tuple[str, Optional[int]]:
+    """Classify a listing by housing type. Returns (type, roommate_count).
+
+    Categories (priority order — most specific first):
+      'coliving'  — coliving spaces (often resemble coloc but managed)
+      'coloc'     — colocation, with optional roommate count
+      'residence' — student residence (NOMAD, Studéa, Twenty Campus...)
+      'chambre'   — single room rental (in someone's place)
+      'studio'    — studio (single-room apartment)
+      'T1'..'T5'  — typology (T1=1pce, T2=2pces, ...)
+      ''          — unclassified
+    """
+    blob = f"{title} {description}".lower()
+
+    if "coliving" in blob:
+        m = _re.search(r"(\d+)\s*(?:chambres?|colocataires?|personnes?)", blob)
+        return "coliving", _to_int_safe(m.group(1)) if m else None
+
+    if _re.search(r"\bcoloc(?:ation|ataire)?", blob):
+        # Try to extract roommate count: 'coloc 4 chambres', 'colocation à 3', '4 colocataires'
+        for pat in (
+            r"coloc\w*\s+(?:à|de|à\s+\d+|pour)?\s*(\d+)\s*(?:chambres?|pers|colocataires?)",
+            r"(\d+)\s*colocataires?",
+            r"(\d+)\s*chambres?\s+\w*coloc",
+            r"coloc\w*\s+(\d+)\s*chambres?",
+        ):
+            m = _re.search(pat, blob)
+            if m:
+                n = _to_int_safe(m.group(1))
+                if n and 2 <= n <= 10:
+                    return "coloc", n
+        return "coloc", None
+
+    if _re.search(r"r[ée]sidence\s+(?:[ée]tudiante|jeune|service)", blob):
+        return "residence", None
+
+    if _re.search(r"\bchambre\s+(?:à\s+lou|chez|libre|dispo|meubl|priv)", blob):
+        return "chambre", None
+
+    # T1/T2/etc — common French apartment typology shorthand
+    m = _re.search(r"\b(t|f)\s?([1-5])\b", blob)
+    if m:
+        return f"T{m.group(2)}", None
+
+    if _re.search(r"\bstudio\b", blob):
+        return "studio", None
+
+    if _re.search(r"(\d+)\s*pi[èe]ces?", blob):
+        m = _re.search(r"(\d+)\s*pi[èe]ces?", blob)
+        n = _to_int_safe(m.group(1))
+        if n and 1 <= n <= 5:
+            return f"T{n}", None
+
+    return "", None
+
+
 def _parse_price(raw) -> Optional[int]:
     """Extract a single rent value from raw input.
 

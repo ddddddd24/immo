@@ -74,6 +74,7 @@ def _render_listings() -> str:
     listings = _query("""
         SELECT l.lbc_id, l.source, l.title, l.price, l.surface, l.location,
                l.url, l.scraped_at, l.score, l.score_reason,
+               l.housing_type, l.roommate_count,
                (SELECT c.status FROM contacts c WHERE c.listing_id = l.id ORDER BY c.id DESC LIMIT 1) as status
         FROM listings l
         ORDER BY l.id DESC
@@ -81,10 +82,16 @@ def _render_listings() -> str:
     """)
     s = _stats()
     sources = sorted({l["source"] for l in listings if l["source"]})
+    housing_types = sorted({l["housing_type"] for l in listings if l["housing_type"]})
 
     # Build the rows once on the server; client-side JS handles sort/filter.
     row_data = []
     for l in listings:
+        ht = l["housing_type"] or ""
+        if ht in ("coloc", "coliving") and l["roommate_count"]:
+            ht_display = f"{ht} {l['roommate_count']}p"
+        else:
+            ht_display = ht
         row_data.append({
             "id": l["lbc_id"],
             "source": l["source"] or "",
@@ -97,13 +104,17 @@ def _render_listings() -> str:
             "score_reason": l["score_reason"] or "",
             "status": l["status"] or "",
             "scraped": (l["scraped_at"] or "")[:10],
+            "housing_type": ht,
+            "housing_display": ht_display,
         })
 
     rows_json = json.dumps(row_data)
-    sources_options = "".join(f'<option value="{_esc(s)}">{_esc(s)}</option>' for s in sources)
     source_filter = ['<option value="">Toutes</option>'] + [
         f'<option value="{_esc(s)}">{SOURCE_EMOJI.get(s, "⚪")} {_esc(s)}</option>'
         for s in sources
+    ]
+    type_filter = ['<option value="">Tous types</option>'] + [
+        f'<option value="{_esc(t)}">{_esc(t)}</option>' for t in housing_types
     ]
 
     return f"""<!DOCTYPE html>
@@ -167,6 +178,7 @@ def _render_listings() -> str:
 
   <div class="filters">
     <label>Source <select id="f-source">{"".join(source_filter)}</select></label>
+    <label>Type <select id="f-type">{"".join(type_filter)}</select></label>
     <label>Prix max <input id="f-maxprice" type="number" placeholder="1000" /></label>
     <label>m² min <input id="f-minsurface" type="number" placeholder="20" /></label>
     <label>Recherche <input id="f-search" type="text" placeholder="titre / ville…" style="width:180px" /></label>
@@ -178,6 +190,7 @@ def _render_listings() -> str:
       <tr>
         <th data-sort="source">Source <span class="sort-arrow"></span></th>
         <th data-sort="title">Annonce <span class="sort-arrow"></span></th>
+        <th data-sort="housing_type">Type <span class="sort-arrow"></span></th>
         <th data-sort="location">Ville <span class="sort-arrow"></span></th>
         <th data-sort="price" class="num">Prix <span class="sort-arrow"></span></th>
         <th data-sort="surface" class="num">m² <span class="sort-arrow"></span></th>
@@ -200,12 +213,14 @@ def _render_listings() -> str:
 
   function render() {{
     const src = document.getElementById('f-source').value;
+    const type = document.getElementById('f-type').value;
     const maxPrice = parseInt(document.getElementById('f-maxprice').value) || null;
     const minSurface = parseInt(document.getElementById('f-minsurface').value) || null;
     const search = (document.getElementById('f-search').value || '').toLowerCase();
 
     let rows = ROWS.filter(r => {{
       if (src && r.source !== src) return false;
+      if (type && r.housing_type !== type) return false;
       if (maxPrice && (r.price === null || r.price > maxPrice)) return false;
       if (minSurface && (r.surface === null || r.surface < minSurface)) return false;
       if (search) {{
@@ -239,9 +254,13 @@ def _render_listings() -> str:
         : '<span style="color:#475569">—</span>';
       const surface = r.surface ? r.surface + 'm²' : '<span style="color:#475569">—</span>';
       const price = r.price ? r.price + '€' : '<span style="color:#475569">—</span>';
+      const typeBadge = r.housing_display
+        ? `<span style="font-size:0.75rem;color:#cbd5e1;background:#334155;padding:2px 6px;border-radius:6px">${{escape(r.housing_display)}}</span>`
+        : '<span style="color:#475569">—</span>';
       return `<tr>
         <td><span class="src">${{emoji}} ${{escape(r.source)}}</span></td>
         <td><a href="${{escape(r.url)}}" target="_blank">${{escape(r.title.slice(0, 60))}}</a></td>
+        <td>${{typeBadge}}</td>
         <td>${{escape(r.location.slice(0, 30))}}</td>
         <td class="num"><b>${{price}}</b></td>
         <td class="num">${{surface}}</td>
@@ -249,7 +268,7 @@ def _render_listings() -> str:
         <td>${{statusBadge}}</td>
         <td style="color:#64748b;font-size:0.75rem">${{escape(r.scraped)}}</td>
       </tr>`;
-    }}).join('') || '<tr><td colspan="8" class="empty">Aucune annonce ne matche les filtres.</td></tr>';
+    }}).join('') || '<tr><td colspan="9" class="empty">Aucune annonce ne matche les filtres.</td></tr>';
 
     document.querySelectorAll('th').forEach(th => {{
       th.classList.remove('asc', 'desc');
@@ -265,7 +284,7 @@ def _render_listings() -> str:
       render();
     }});
   }});
-  ['f-source', 'f-maxprice', 'f-minsurface', 'f-search'].forEach(id => {{
+  ['f-source', 'f-type', 'f-maxprice', 'f-minsurface', 'f-search'].forEach(id => {{
     document.getElementById(id).addEventListener('input', render);
   }});
 

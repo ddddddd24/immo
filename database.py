@@ -103,6 +103,12 @@ def init_db() -> None:
         if "surface" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN surface INTEGER")
             logger.info("Migrated listings table: added surface column (m²)")
+        if "housing_type" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN housing_type TEXT")
+            logger.info("Migrated listings table: added housing_type column")
+        if "roommate_count" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN roommate_count INTEGER")
+            logger.info("Migrated listings table: added roommate_count column")
 
     logger.info("Database initialised at %s", config.DB_PATH)
 
@@ -150,6 +156,8 @@ def upsert_listing(
     url: str,
     source: str = "leboncoin",
     surface: Optional[int] = None,
+    housing_type: str = "",
+    roommate_count: Optional[int] = None,
 ) -> int:
     """Insert listing or update in place. Tracks downward price changes. Returns row id.
 
@@ -168,15 +176,17 @@ def upsert_listing(
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO listings
-               (lbc_id, source, title, price, location, seller_name, seller_type, url, scraped_at, surface)
-               VALUES (?,?,?,?,?,?,?,?,?,?)
+               (lbc_id, source, title, price, location, seller_name, seller_type, url, scraped_at, surface, housing_type, roommate_count)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(lbc_id) DO UPDATE SET
-                 title       = excluded.title,
-                 location    = excluded.location,
-                 seller_name = excluded.seller_name,
-                 seller_type = excluded.seller_type,
-                 url         = excluded.url,
-                 surface     = COALESCE(excluded.surface, listings.surface),
+                 title          = excluded.title,
+                 location       = excluded.location,
+                 seller_name    = excluded.seller_name,
+                 seller_type    = excluded.seller_type,
+                 url            = excluded.url,
+                 surface        = COALESCE(excluded.surface, listings.surface),
+                 housing_type   = COALESCE(NULLIF(excluded.housing_type, ''), listings.housing_type),
+                 roommate_count = COALESCE(excluded.roommate_count, listings.roommate_count),
                  price_prev  = CASE
                      WHEN excluded.price IS NOT NULL
                           AND listings.price IS NOT NULL
@@ -193,7 +203,7 @@ def upsert_listing(
                  END
                RETURNING id""",
             (lbc_id, source, title, price, location, seller_name, seller_type, url,
-             datetime.utcnow().isoformat(), surface),
+             datetime.utcnow().isoformat(), surface, housing_type or "", roommate_count),
         )
         return cur.fetchone()[0]
 
@@ -253,7 +263,8 @@ def get_recent_listings(limit: int = 10) -> list[dict]:
     """
     with _conn() as conn:
         rows = conn.execute(
-            """SELECT lbc_id, source, title, price, location, url, scraped_at, score, surface
+            """SELECT lbc_id, source, title, price, location, url, scraped_at,
+                      score, surface, housing_type, roommate_count
                FROM listings
                ORDER BY id DESC
                LIMIT ?""",
@@ -310,7 +321,8 @@ def query_listings(
         "recent":  "ORDER BY id DESC",
     }[sort_by]
     sql = (
-        "SELECT lbc_id, source, title, price, location, url, scraped_at, score, surface "
+        "SELECT lbc_id, source, title, price, location, url, scraped_at, "
+        "score, surface, housing_type, roommate_count "
         f"FROM listings{where_sql} {order_sql} LIMIT ?"
     )
     params.append(limit)

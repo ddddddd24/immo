@@ -621,9 +621,11 @@ async def _run_campaign_body(
     # Persist EVERY scraped listing to DB before the eligibility filter, so the
     # dashboard / Sheets / /recent show the full picture (including over-budget
     # PA, etc.). Contact creation still only happens for eligible ones below.
+    from scraper import detect_housing_type
     persisted = 0
     for listing in listings:
         try:
+            htype, n_room = detect_housing_type(listing.title or "", listing.description or "")
             database.upsert_listing(
                 lbc_id=listing.lbc_id,
                 title=listing.title,
@@ -634,6 +636,8 @@ async def _run_campaign_body(
                 url=listing.url,
                 source=listing.source,
                 surface=listing.surface,
+                housing_type=htype,
+                roommate_count=n_room,
             )
             persisted += 1
         except Exception as exc:

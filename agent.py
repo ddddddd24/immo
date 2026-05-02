@@ -93,6 +93,8 @@ class Listing:
     source: str = "leboncoin"         # "leboncoin" | "seloger" | "pap" ...
     images: list = field(default_factory=list)  # photo URLs
     surface: int | None = None        # square meters (m²), parsed from title/description
+    housing_type: str = ""            # 'studio'|'T1'..'T5+'|'coloc'|'residence'|'coliving'|'chambre'
+    roommate_count: int | None = None # only set for coloc/coliving when count is parseable
 
 
 @dataclass

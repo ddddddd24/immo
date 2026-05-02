@@ -216,3 +216,27 @@ def test_is_suspicious_catches_low_price(make_listing):
     sus, reason = is_suspicious(make_listing(price=300))
     assert sus is True
     assert "anormalement bas" in reason.lower()
+
+
+# ─── detect_housing_type ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("title, desc, expected_type, expected_count", [
+    ("Studio meublé 28m² Paris 11", "", "studio", None),
+    ("T2 meublé 35m² Maisons-Alfort", "", "T2", None),
+    ("Appartement T3 lumineux", "", "T3", None),
+    ("F1 26m² Saint-Maur", "", "T1", None),
+    ("Coloc 4 chambres Paris 13", "", "coloc", 4),
+    ("Colocation à 3 personnes - Belleville", "", "coloc", 3),
+    ("Coliving PROSPERO Paris 20", "", "coliving", None),
+    ("Coliving 5 chambres avec espaces communs", "", "coliving", 5),
+    ("Studéa Paris Riquet : T1", "Résidence étudiante sécurisée", "residence", None),
+    ("Appartement 1 pièce 27 m² Paris 17", "", "T1", None),
+    ("Appartement 3 pièces 75m²", "", "T3", None),
+    ("Chambre à louer chez l'habitant", "", "chambre", None),
+    ("NOMAD Campus The Place", "", "", None),  # unclassified
+])
+def test_detect_housing_type(title, desc, expected_type, expected_count):
+    from scraper import detect_housing_type
+    htype, n = detect_housing_type(title, desc)
+    assert htype == expected_type, f"{title!r} → got {htype!r}, expected {expected_type!r}"
+    assert n == expected_count, f"{title!r} count: got {n}, expected {expected_count}"
