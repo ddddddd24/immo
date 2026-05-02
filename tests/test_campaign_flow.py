@@ -140,6 +140,31 @@ def test_campaign_filters_over_budget(campaign_env, tmp_db, make_listing):
     assert "hors budget" in full_text
 
 
+def test_campaign_persists_all_scraped_listings_for_browsing(
+    campaign_env, tmp_db, make_listing,
+):
+    """Regression: dashboard / Sheets / /recent must see EVERY scraped listing,
+    even those filtered out for contact (over-budget, etc.). Before this fix,
+    Paris Attitude scrapes (typically 1500€+) never reached the DB and the
+    dashboard showed only LBC + Studapart."""
+    import main
+    campaign_env["listings"] = [
+        make_listing(lbc_id="cheap", price=850, source="leboncoin"),
+        make_listing(lbc_id="exp_1", price=2500, source="parisattitude"),
+        make_listing(lbc_id="exp_2", price=3500, source="parisattitude"),
+    ]
+    update = _FakeUpdate()
+    _run(main._run_campaign_body(update, _FakeContext(), source="leboncoin"))
+
+    # Only the in-budget one becomes a pending contact
+    assert tmp_db.count_pending_contacts() == 1
+
+    # But ALL three landed in the listings table for browsing
+    listings_in_db = tmp_db.get_recent_listings(limit=10)
+    db_ids = {l["lbc_id"] for l in listings_in_db}
+    assert {"cheap", "exp_1", "exp_2"} <= db_ids
+
+
 def test_campaign_with_prescreening_does_not_crash(
     campaign_env, tmp_db, monkeypatch, make_listing
 ):

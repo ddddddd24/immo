@@ -594,7 +594,28 @@ async def _run_campaign_body(
         await _reply(update, "😕 Aucune annonce à analyser.")
         return
 
-    await _reply(update, f"🧠 Analyse de *{len(listings)}* annonces en cours…")
+    # Persist EVERY scraped listing to DB before the eligibility filter, so the
+    # dashboard / Sheets / /recent show the full picture (including over-budget
+    # PA, etc.). Contact creation still only happens for eligible ones below.
+    persisted = 0
+    for listing in listings:
+        try:
+            database.upsert_listing(
+                lbc_id=listing.lbc_id,
+                title=listing.title,
+                price=listing.price,
+                location=listing.location,
+                seller_name=listing.seller_name,
+                seller_type="",  # filled in later for eligible ones via analyse_listing
+                url=listing.url,
+                source=listing.source,
+                surface=listing.surface,
+            )
+            persisted += 1
+        except Exception as exc:
+            logger.warning("Failed to persist scraped listing %s: %s", listing.lbc_id, exc)
+
+    await _reply(update, f"🧠 Analyse de *{len(listings)}* annonces en cours… ({persisted} persistées en DB)")
 
     sent = 0  # count of messages PREPARED in this run
     skipped = {
