@@ -164,6 +164,89 @@ def test_get_recent_listings_respects_limit(tmp_db):
 
 # ─── indexes (regression: speeds up rate-limit + tone reports) ───────────────
 
+def test_surface_persists_through_upsert(tmp_db):
+    """Surface (m²) was added in the latest schema migration."""
+    tmp_db.upsert_listing(
+        lbc_id="surf1", title="Studio", price=900, location="Paris",
+        seller_name="X", seller_type="", url="http://x", source="leboncoin",
+        surface=28,
+    )
+    row = tmp_db.get_listing_by_lbc_id("surf1")
+    assert row["surface"] == 28
+
+
+def test_surface_not_overwritten_by_null_on_reupsert(tmp_db):
+    """If a re-scrape doesn't see surface, the previous value should stick."""
+    tmp_db.upsert_listing(
+        lbc_id="surf2", title="T", price=900, location="Paris", seller_name="X",
+        seller_type="", url="http://x", source="leboncoin", surface=30,
+    )
+    tmp_db.upsert_listing(  # re-upsert without surface
+        lbc_id="surf2", title="T", price=900, location="Paris", seller_name="X",
+        seller_type="", url="http://x", source="leboncoin", surface=None,
+    )
+    assert tmp_db.get_listing_by_lbc_id("surf2")["surface"] == 30
+
+
+# ─── query_listings ──────────────────────────────────────────────────────────
+
+def _seed(db, lbc_id, **fields):
+    defaults = dict(title="T", price=900, location="Paris", seller_name="X",
+                    seller_type="", url=f"http://{lbc_id}", source="leboncoin",
+                    surface=None)
+    defaults.update(fields)
+    db.upsert_listing(lbc_id=lbc_id, **defaults)
+
+
+def test_query_listings_no_filters_returns_all(tmp_db):
+    for i in range(3):
+        _seed(tmp_db, f"q{i}", price=800 + i)
+    assert len(tmp_db.query_listings()) == 3
+
+
+def test_query_listings_filter_max_price(tmp_db):
+    _seed(tmp_db, "p1", price=500)
+    _seed(tmp_db, "p2", price=1500)
+    rows = tmp_db.query_listings(max_price=1000)
+    assert [r["lbc_id"] for r in rows] == ["p1"]
+
+
+def test_query_listings_filter_min_surface(tmp_db):
+    _seed(tmp_db, "s1", surface=20)
+    _seed(tmp_db, "s2", surface=30)
+    _seed(tmp_db, "s3", surface=None)  # NULL surface should be excluded
+    rows = tmp_db.query_listings(min_surface=25)
+    assert {r["lbc_id"] for r in rows} == {"s2"}
+
+
+def test_query_listings_filter_source(tmp_db):
+    _seed(tmp_db, "x1", source="leboncoin")
+    _seed(tmp_db, "x2", source="studapart")
+    rows = tmp_db.query_listings(source="studapart")
+    assert [r["lbc_id"] for r in rows] == ["x2"]
+
+
+def test_query_listings_sort_by_surface_desc(tmp_db):
+    _seed(tmp_db, "ss1", surface=20)
+    _seed(tmp_db, "ss2", surface=50)
+    _seed(tmp_db, "ss3", surface=35)
+    rows = tmp_db.query_listings(sort_by="surface")
+    assert [r["lbc_id"] for r in rows[:3]] == ["ss2", "ss3", "ss1"]
+
+
+def test_query_listings_sort_by_price_asc(tmp_db):
+    _seed(tmp_db, "pp1", price=900)
+    _seed(tmp_db, "pp2", price=500)
+    _seed(tmp_db, "pp3", price=700)
+    rows = tmp_db.query_listings(sort_by="price")
+    assert [r["lbc_id"] for r in rows[:3]] == ["pp2", "pp3", "pp1"]
+
+
+def test_query_listings_invalid_sort_raises(tmp_db):
+    with pytest.raises(ValueError, match="sort_by"):
+        tmp_db.query_listings(sort_by="bogus")
+
+
 def test_indexes_exist_after_init(tmp_db):
     import config
     con = sqlite3.connect(config.DB_PATH)

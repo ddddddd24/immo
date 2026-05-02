@@ -212,6 +212,8 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             seller_name=lst.seller_name,
             seller_type="",
             url=lst.url,
+            source=lst.source,
+            surface=lst.surface,
         )
         if not database.already_contacted(lst.lbc_id):
             new_count += 1
@@ -312,6 +314,8 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             seller_name=listing.seller_name,
             seller_type=result.seller_type,
             url=listing.url,
+            source=listing.source,
+            surface=listing.surface,
         )
         contact_id = database.create_contact(listing_id, result.message)
 
@@ -591,6 +595,7 @@ async def _run_campaign_body(
                 seller_type=result.seller_type,
                 url=listing.url,
                 source=listing.source,
+                surface=listing.surface,
             )
             # Persist score and fire high-interest alert
             if score_result is not None:
@@ -838,8 +843,99 @@ async def cmd_list_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE, limit:
         title = _escape_md(l["title"] or "")[:60]
         location = _escape_md(l["location"] or "")[:30]
         price = f"{l['price']}€" if l["price"] else "?€"
+        surface = f" · {l['surface']}m²" if l.get("surface") else ""
         score = f" ⭐{l['score']}/10" if l.get("score") else ""
-        lines.append(f"*{i}.* _{title}_ ({location}) — *{price}*{score}\n   {l['url']}")
+        lines.append(f"*{i}.* _{title}_ ({location}) — *{price}*{surface}{score}\n   {l['url']}")
+    await _reply(update, "\n".join(lines))
+
+
+# ─── /rapport_complet — flexible custom report ─────────────────────────────────
+
+_SORT_LABELS = {
+    "surface": "surface (m² desc)",
+    "price":   "prix (€ asc)",
+    "score":   "score (desc)",
+    "recent":  "récent (insertion desc)",
+}
+
+
+async def cmd_query(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    source: str | None = None,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    min_surface: int | None = None,
+    max_surface: int | None = None,
+    sort_by: str = "surface",
+    group_by_source: bool = False,
+    limit: int = 50,
+) -> None:
+    """Custom listing report from DB. Filters + sort + optional grouping by source."""
+    try:
+        listings = database.query_listings(
+            source=source,
+            min_price=min_price,
+            max_price=max_price,
+            min_surface=min_surface,
+            max_surface=max_surface,
+            sort_by=sort_by,
+            limit=limit,
+        )
+    except ValueError as exc:
+        await _reply(update, f"⚠️ Paramètre invalide : {exc}")
+        return
+
+    if not listings:
+        await _reply(
+            update,
+            "📭 Aucune annonce ne matche ces filtres. "
+            "Lance /campagne d'abord pour remplir la base.",
+        )
+        return
+
+    # Header — describe the filters applied so the user knows what they got
+    filters: list[str] = []
+    if source:
+        filters.append(f"source={source}")
+    if min_price is not None:
+        filters.append(f"≥{min_price}€")
+    if max_price is not None:
+        filters.append(f"≤{max_price}€")
+    if min_surface is not None:
+        filters.append(f"≥{min_surface}m²")
+    if max_surface is not None:
+        filters.append(f"≤{max_surface}m²")
+    filter_str = " · ".join(filters) if filters else "aucun filtre"
+
+    lines = [
+        f"📊 *{len(listings)} annonce(s)* — _{filter_str}_, tri par "
+        f"_{_SORT_LABELS.get(sort_by, sort_by)}_\n",
+    ]
+
+    def _fmt_listing(l: dict) -> str:
+        title = _escape_md(l["title"] or "")[:55]
+        location = _escape_md(l["location"] or "")[:25]
+        price = f"*{l['price']}€*" if l["price"] else "?€"
+        surface = f" · {l['surface']}m²" if l.get("surface") else ""
+        score = f" ⭐{l['score']}/10" if l.get("score") else ""
+        return f"  • {title} ({location}) — {price}{surface}{score}\n    {l['url']}"
+
+    if group_by_source:
+        from collections import defaultdict
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for l in listings:
+            groups[l["source"] or "?"].append(l)
+        # Each group keeps the global sort order
+        for src, items in sorted(groups.items()):
+            lines.append(f"\n*— {_SOURCE_LABELS.get(src, src)} ({len(items)}) —*")
+            for l in items:
+                lines.append(_fmt_listing(l))
+    else:
+        for l in listings:
+            lines.append(_fmt_listing(l))
+
     await _reply(update, "\n".join(lines))
 
 
@@ -1008,6 +1104,7 @@ async def _fast_poll_loop(update: Update, ctx: ContextTypes.DEFAULT_TYPE, interv
                         lbc_id=listing.lbc_id, title=listing.title, price=listing.price,
                         location=listing.location, seller_name=listing.seller_name,
                         seller_type=result.seller_type, url=listing.url, source=listing.source,
+                        surface=listing.surface,
                     )
                     contact_id = database.create_contact(listing_id, result.message)
                     success = await send_message_safe(listing.url, result.message, contact_id)
@@ -1123,6 +1220,8 @@ async def _cmd_chat_inner(
             seller_name=listing.seller_name,
             seller_type=result.seller_type,
             url=listing.url,
+            source=listing.source,
+            surface=listing.surface,
         )
         contact_id = database.create_contact(listing_id, custom_message)
         await _reply(update, "📤 Envoi du message modifié…")
@@ -1175,6 +1274,19 @@ async def _cmd_chat_inner(
     elif tool == "list_recent":
         limit = intent.get("limit") or 10
         await cmd_list_recent(update, ctx, limit=int(limit))
+
+    elif tool == "query_listings":
+        await cmd_query(
+            update, ctx,
+            source=(intent.get("source") or "").strip().lower() or None,
+            min_price=int(intent["min_price"]) if intent.get("min_price") is not None else None,
+            max_price=int(intent["max_price"]) if intent.get("max_price") is not None else None,
+            min_surface=int(intent["min_surface"]) if intent.get("min_surface") is not None else None,
+            max_surface=int(intent["max_surface"]) if intent.get("max_surface") is not None else None,
+            sort_by=(intent.get("sort_by") or "recent"),
+            group_by_source=bool(intent.get("group_by_source", False)),
+            limit=int(intent.get("limit") or 50),
+        )
 
     elif tool == "run_rapport":
         await cmd_rapport(update, ctx)
@@ -1257,6 +1369,12 @@ def main() -> None:
     app.add_handler(CommandHandler("confirmer", cmd_confirmer))
     app.add_handler(CommandHandler("pending", cmd_list_pending))
     app.add_handler(CommandHandler("recent", cmd_list_recent))
+
+    async def _cmd_rapport_complet(update, ctx):
+        """Default /rapport_complet: groups by source, sorts by surface."""
+        await cmd_query(update, ctx, group_by_source=True, sort_by="surface", limit=100)
+
+    app.add_handler(CommandHandler("rapport_complet", _cmd_rapport_complet))
     app.add_handler(CommandHandler("rapport", cmd_rapport))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("autostart", cmd_autostart))

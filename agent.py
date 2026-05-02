@@ -90,8 +90,9 @@ class Listing:
     seller_name: str
     url: str
     seller_type_hint: str = ""        # optional raw field from scraper
-    source: str = "leboncoin"         # "leboncoin" | "seloger" | "pap"
+    source: str = "leboncoin"         # "leboncoin" | "seloger" | "pap" ...
     images: list = field(default_factory=list)  # photo URLs
+    surface: int | None = None        # square meters (m²), parsed from title/description
 
 
 @dataclass
@@ -485,6 +486,50 @@ _INTENT_TOOLS = [
         },
     },
     {
+        "name": "query_listings",
+        "description": (
+            "Rapport custom sur les annonces en base avec filtres et tri configurables. "
+            "À UTILISER quand l'utilisateur demande un rapport groupé/trié/filtré, ex: "
+            "'groupe par site et trie par m²', 'montre-moi les studios sous 800€', "
+            "'classe par surface', 'donne-moi tout ce qui est dans mon budget rangé "
+            "par site', 'rapport complet', 'qu'est-ce qu'on a en base trié par...', "
+            "'tout ce qui est en-dessous de X€'. C'est l'outil PUISSANT pour des "
+            "questions de visualisation/analyse — préfère-le à list_recent dès que "
+            "l'utilisateur veut un filtre ou tri custom."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": [
+                        "leboncoin", "seloger", "pap", "bienici", "logicimmo",
+                        "studapart", "parisattitude", "lodgis", "immojeune", "locservice",
+                    ],
+                    "description": "Limiter à une source. Optionnel.",
+                },
+                "min_price": {"type": "number", "description": "Prix minimum en €. Optionnel."},
+                "max_price": {"type": "number", "description": "Prix maximum en €. Optionnel."},
+                "min_surface": {"type": "number", "description": "Surface minimum en m². Optionnel."},
+                "max_surface": {"type": "number", "description": "Surface maximum en m². Optionnel."},
+                "sort_by": {
+                    "type": "string",
+                    "enum": ["surface", "price", "recent", "score"],
+                    "description": "Tri : 'surface' (desc, plus grand au plus petit), 'price' (asc), 'recent' (dernières scrapées), 'score' (desc). Défaut 'recent'.",
+                },
+                "group_by_source": {
+                    "type": "boolean",
+                    "description": "Si true, groupe les résultats par site (LBC, SeLoger, etc.). Défaut false.",
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Nombre max d'annonces (défaut 50, max 200).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "run_rapport",
         "description": "Afficher les statistiques du jour : annonces scrapées, messages envoyés, réponses reçues. Utiliser pour 'rapport', 'stats', 'bilan', 'comment ça avance', etc.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
@@ -609,35 +654,44 @@ RÈGLES CRITIQUES — à respecter absolument :
    'studapart'). Utilise `url` UNIQUEMENT si l'utilisateur a collé une URL
    textuelle dans son message.
 
-3. Filtres NON supportés — utilise reply pour expliquer poliment :
-   - Filtrer par date ("du jour", "aujourd'hui", "dernières 24h", "cette
-     semaine", "dernière heure") — aucune source ne supporte ce filtre côté
-     bot.
-   - "Ignorer mes préférences", "sans le filtre budget", "tout afficher" —
-     le filtre budget de 1000€ s'applique toujours pour la campagne
-     (run_campagne) et le mode veille (run_watch). Pour scraper les
-     résultats bruts d'un site sans filtre, run_search persiste tout en DB
-     mais ne contacte rien — précise-le.
-   - Tri custom (par prix croissant, par surface, etc.).
-   - Filtrage par arrondissement spécifique non configuré dans l'URL par
-     défaut.
-   Dans tous ces cas, dis clairement à Illan que la fonctionnalité n'est pas
-   supportée, propose ce que le bot PEUT faire à la place.
+3. PORTÉE multi-source : si l'utilisateur dit « all / tous / toutes les
+   sources / partout / tous les sites » → utilise OBLIGATOIREMENT
+   run_campagne (sans paramètre source — ce qui scrape toutes les sources).
+   Ne fais JAMAIS un run_search dans ce cas (run_search ne touche qu'UNE
+   source).
 
-4. Si le message contient une URL d'annonce individuelle (depuis n'importe
+4. RAPPORTS / TRI / GROUPEMENT : pour toute demande de visualisation
+   personnalisée des annonces déjà en base — « groupe par site et trie
+   par m² », « montre-moi les studios sous 800€ », « classe par
+   surface », « rapport complet groupé » — utilise query_listings avec
+   les bons paramètres (source / min_price / max_price / min_surface /
+   max_surface / sort_by / group_by_source). C'est l'outil flexible.
+   N'utilise list_recent que pour une simple liste plate sans filtre.
+
+5. Filtres NON supportés (vraiment) — utilise reply pour expliquer :
+   - Filtrer par date ("du jour", "aujourd'hui", "cette semaine",
+     "dernière heure") — aucune source ne supporte ce filtre côté bot.
+   - "Ignorer mon budget" pour la campagne (run_campagne / run_watch
+     appliquent toujours le budget configuré).
+   - Filtrage par arrondissement spécifique non configuré dans l'URL.
+   Pour ces cas, dis clairement à Illan que la fonctionnalité n'est pas
+   supportée et propose ce que le bot PEUT faire (ex: query_listings
+   avec un max_price custom couvre 80% des "filtres budget custom").
+
+6. Si le message contient une URL d'annonce individuelle (depuis n'importe
    quel site supporté), utilise run_simulate avec cette URL.
 
-5. Si Illan dit bonjour, te remercie, plaisante, ou pose une question
+7. Si Illan dit bonjour, te remercie, plaisante, ou pose une question
    conversationnelle SANS demander de données factuelles ni d'action,
    utilise reply avec une réponse chaleureuse et naturelle en français.
 
-6. Distinctions à respecter :
+8. Distinctions à respecter :
    - run_stop = arrêter la campagne en cours d'exécution
    - run_autostop = désactiver la campagne automatique récurrente
    - run_watch = mode veille rapide (intervalles en minutes)
    - run_autostart = campagne complète récurrente (intervalles en heures)
 
-7. Si l'intention est ambiguë, choisis reply et demande une clarification.
+9. Si l'intention est ambiguë, choisis reply et demande une clarification.
 
 Réponds TOUJOURS en français.
 """.strip()

@@ -150,6 +150,16 @@ def _ensure_list(value) -> list:
     return value if isinstance(value, list) else []
 
 
+def _to_int_safe(value) -> Optional[int]:
+    """Coerce string/int/None → int or None. Used for surface (m²) parsing."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return None
+
+
 def _parse_price(raw) -> Optional[int]:
     """Extract a single rent value from raw input.
 
@@ -210,16 +220,21 @@ def _ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
     if not url:
         url = f"https://www.leboncoin.fr/ad/locations/{lbc_id}"
 
-    # Price — check attributes array first (skip non-dict entries), then top-level
+    # Price + Surface — both live in the attributes array. Walk it once.
     price_raw = None
+    surface = None
     for attr in _ensure_list(ad.get("attributes")):
         if not isinstance(attr, dict):
             continue
-        if attr.get("key") == "price":
+        key = attr.get("key")
+        if key == "price" and price_raw is None:
             values = attr.get("values")
             first_val = values[0] if isinstance(values, list) and values else None
             price_raw = attr.get("value_label") or first_val
-            break
+        elif key in ("square", "surface") and surface is None:
+            values = attr.get("values")
+            first_val = values[0] if isinstance(values, list) and values else None
+            surface = _to_int_safe(first_val or attr.get("value_label"))
     if price_raw is None:
         p = ad.get("price")
         if isinstance(p, list):
@@ -265,6 +280,7 @@ def _ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
         url=url,
         seller_type_hint=seller_type_hint,
         images=images,
+        surface=surface,
     )
 
 
@@ -328,6 +344,14 @@ def _seloger_ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
     keyfacts = hard_facts.get("keyfacts") or []
     title = hf_title + (" — " + ", ".join(keyfacts) if keyfacts else "")
 
+    # Surface: extract from keyfacts (entries like '37 m²')
+    surface = None
+    for kf in keyfacts if isinstance(keyfacts, list) else []:
+        m = _re.search(r"(\d+)\s*m²", str(kf))
+        if m:
+            surface = _to_int_safe(m.group(1))
+            break
+
     # Description: not available in search results (only on listing detail page)
     description = ad.get("description") or ad.get("descriptif") or ""
 
@@ -350,6 +374,7 @@ def _seloger_ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
         seller_type_hint="pro",
         source="seloger",
         images=images,
+        surface=surface,
     )
 
 
@@ -617,6 +642,7 @@ def _parse_pap_listing(item, base_url: str = "https://www.pap.fr") -> Optional[L
         seller_type_hint="particulier",
         source="pap",
         images=images,
+        surface=_to_int_safe(surface),
     )
 
 
@@ -807,6 +833,7 @@ def _bienici_ad_to_listing(ad: dict) -> Optional[Listing]:
         seller_type_hint=seller_type_hint,
         source="bienici",
         images=[u for u in images if u],
+        surface=_to_int_safe(surface),
     )
 
 
@@ -955,6 +982,7 @@ def _logicimmo_item_to_listing(item) -> Optional[Listing]:
         seller_type_hint="pro",
         source="logicimmo",
         images=images,
+        surface=_to_int_safe(surface),
     )
 
 
@@ -1119,6 +1147,7 @@ def _parse_generic_card(item, base_url: str, source: str, prefix: str) -> Option
         seller_type_hint="",
         source=source,
         images=images,
+        surface=_to_int_safe(surface),
     )
 
 
@@ -1444,6 +1473,10 @@ def _parisattitude_card_to_listing(card) -> Optional[Listing]:
     if location and type_part:
         title = f"{type_part} — {location}"
 
+    # Surface: type_part is e.g. "1 bedroom 28m²" or "Studio 24m²"
+    surface_m = _re.search(r"(\d+)\s*m²", type_part)
+    surface = _to_int_safe(surface_m.group(1)) if surface_m else None
+
     images = [
         src for img in card.find_all("img")
         if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
@@ -1460,6 +1493,7 @@ def _parisattitude_card_to_listing(card) -> Optional[Listing]:
         seller_type_hint="pro",
         source="parisattitude",
         images=images,
+        surface=surface,
     )
 
 
@@ -1563,6 +1597,7 @@ def _lodgis_card_to_listing(card) -> Optional[Listing]:
         seller_type_hint="pro",
         source="lodgis",
         images=images,
+        surface=_to_int_safe(surface),
     )
 
 
@@ -1655,6 +1690,7 @@ def _immojeune_card_to_listing(card) -> Optional[Listing]:
         seller_type_hint="",
         source="immojeune",
         images=images,
+        surface=_to_int_safe(surface),
     )
 
 
@@ -1735,6 +1771,10 @@ def _locservice_card_to_listing(card) -> Optional[Listing]:
     desc_m = _re2.search(r"€\s*/\s*mois\s*(.+?)$", text)
     description = desc_m.group(1).strip()[:500] if desc_m else ""
 
+    # Surface: "30 m²" pattern
+    surf_m = _re2.search(r"(\d+)\s*m²", text)
+    surface = _to_int_safe(surf_m.group(1)) if surf_m else None
+
     images = [
         src for img in card.find_all("img")
         if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
@@ -1751,6 +1791,7 @@ def _locservice_card_to_listing(card) -> Optional[Listing]:
         seller_type_hint="particulier",
         source="locservice",
         images=images,
+        surface=surface,
     )
 
 

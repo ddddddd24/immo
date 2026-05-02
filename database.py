@@ -77,6 +77,9 @@ def init_db() -> None:
         if "score_reason" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN score_reason TEXT")
             logger.info("Migrated listings table: added score_reason column")
+        if "surface" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN surface INTEGER")
+            logger.info("Migrated listings table: added surface column (m²)")
 
     logger.info("Database initialised at %s", config.DB_PATH)
 
@@ -107,23 +110,26 @@ def upsert_listing(
     seller_type: str,
     url: str,
     source: str = "leboncoin",
+    surface: Optional[int] = None,
 ) -> int:
     """Insert listing or update in place. Tracks downward price changes. Returns row id.
 
     Atomic via ON CONFLICT...DO UPDATE so concurrent /watch + /campagne calls
-    can't race on the SELECT-then-INSERT pattern.
+    can't race on the SELECT-then-INSERT pattern. Updates surface in place
+    if the scraper extracted a non-null m² value.
     """
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO listings
-               (lbc_id, source, title, price, location, seller_name, seller_type, url, scraped_at)
-               VALUES (?,?,?,?,?,?,?,?,?)
+               (lbc_id, source, title, price, location, seller_name, seller_type, url, scraped_at, surface)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(lbc_id) DO UPDATE SET
                  title       = excluded.title,
                  location    = excluded.location,
                  seller_name = excluded.seller_name,
                  seller_type = excluded.seller_type,
                  url         = excluded.url,
+                 surface     = COALESCE(excluded.surface, listings.surface),
                  price_prev  = CASE
                      WHEN excluded.price IS NOT NULL
                           AND listings.price IS NOT NULL
@@ -140,7 +146,7 @@ def upsert_listing(
                  END
                RETURNING id""",
             (lbc_id, source, title, price, location, seller_name, seller_type, url,
-             datetime.utcnow().isoformat()),
+             datetime.utcnow().isoformat(), surface),
         )
         return cur.fetchone()[0]
 
@@ -200,12 +206,69 @@ def get_recent_listings(limit: int = 10) -> list[dict]:
     """
     with _conn() as conn:
         rows = conn.execute(
-            """SELECT lbc_id, source, title, price, location, url, scraped_at, score
+            """SELECT lbc_id, source, title, price, location, url, scraped_at, score, surface
                FROM listings
                ORDER BY id DESC
                LIMIT ?""",
             (limit,),
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+_VALID_SORT = {"surface", "price", "recent", "score"}
+
+
+def query_listings(
+    *,
+    source: Optional[str] = None,
+    min_price: Optional[int] = None,
+    max_price: Optional[int] = None,
+    min_surface: Optional[int] = None,
+    max_surface: Optional[int] = None,
+    sort_by: str = "recent",
+    limit: int = 100,
+) -> list[dict]:
+    """Polyvalent listing query for the NL `query_listings` / /rapport tool.
+
+    Filters by source / price range / surface range; sorts by surface
+    (descending), price (ascending), recent (insertion order desc), or
+    score (descending). All filters are optional. Returns up to `limit`
+    rows with full listing fields including surface.
+    """
+    if sort_by not in _VALID_SORT:
+        raise ValueError(f"sort_by must be one of {sorted(_VALID_SORT)}")
+    where = []
+    params: list = []
+    if source:
+        where.append("source = ?")
+        params.append(source)
+    if min_price is not None:
+        where.append("price >= ?")
+        params.append(min_price)
+    if max_price is not None:
+        where.append("(price IS NOT NULL AND price <= ?)")
+        params.append(max_price)
+    if min_surface is not None:
+        where.append("(surface IS NOT NULL AND surface >= ?)")
+        params.append(min_surface)
+    if max_surface is not None:
+        where.append("(surface IS NOT NULL AND surface <= ?)")
+        params.append(max_surface)
+    where_sql = " WHERE " + " AND ".join(where) if where else ""
+
+    order_sql = {
+        "surface": "ORDER BY surface DESC NULLS LAST, id DESC",
+        "price":   "ORDER BY price ASC NULLS LAST, id DESC",
+        "score":   "ORDER BY score DESC NULLS LAST, id DESC",
+        "recent":  "ORDER BY id DESC",
+    }[sort_by]
+    sql = (
+        "SELECT lbc_id, source, title, price, location, url, scraped_at, score, surface "
+        f"FROM listings{where_sql} {order_sql} LIMIT ?"
+    )
+    params.append(limit)
+    with _conn() as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
     return [dict(r) for r in rows]
 
 
