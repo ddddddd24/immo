@@ -13,6 +13,29 @@ logger = logging.getLogger(__name__)
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
 
+def purge_mock_listings() -> int:
+    """One-shot cleanup: drop any mock_data.py fixtures that polluted the
+    production DB before the upsert guard was in place. Returns count deleted.
+
+    Safe to run at every startup: idempotent, logs nothing if no rows match.
+    """
+    with _conn() as conn:
+        # Cascade-delete contacts first (foreign key)
+        conn.execute(
+            """DELETE FROM contacts WHERE listing_id IN (
+                   SELECT id FROM listings
+                   WHERE lbc_id LIKE 'mock_%' OR url LIKE '%/mock%'
+               )"""
+        )
+        cur = conn.execute(
+            "DELETE FROM listings WHERE lbc_id LIKE 'mock_%' OR url LIKE '%/mock%'"
+        )
+        n = cur.rowcount
+    if n > 0:
+        logger.info("Purged %d mock listing(s) from production DB", n)
+    return n
+
+
 def init_db() -> None:
     """Create tables if they don't exist."""
     Path(config.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +124,22 @@ def _conn():
 
 # ─── Listings ─────────────────────────────────────────────────────────────────
 
+_MOCK_LBC_ID_PREFIX = "mock_"
+_MOCK_URL_HINT = "/mock"
+
+
+def _is_mock_listing(lbc_id: str, url: str) -> bool:
+    """Detect mock_data.py fixtures so they never pollute production DB.
+
+    mock_data.MOCK_LISTINGS uses lbc_id 'mock_001' .. 'mock_NNN' and URLs
+    matching '...annonces/mock_NNN.htm'. Real LBC IDs are pure digits.
+    """
+    return (
+        lbc_id.startswith(_MOCK_LBC_ID_PREFIX)
+        or _MOCK_URL_HINT in (url or "")
+    )
+
+
 def upsert_listing(
     lbc_id: str,
     title: str,
@@ -117,7 +156,15 @@ def upsert_listing(
     Atomic via ON CONFLICT...DO UPDATE so concurrent /watch + /campagne calls
     can't race on the SELECT-then-INSERT pattern. Updates surface in place
     if the scraper extracted a non-null m² value.
+
+    Refuses to persist mock_data.py fixtures — those are for UI smoke tests
+    only and would surface as fake listings to the user later.
     """
+    if _is_mock_listing(lbc_id, url):
+        logger.debug("Refusing to persist mock listing %s — production DB only", lbc_id)
+        # Return a sentinel id 0 so callers don't crash; real id is never 0
+        # (AUTOINCREMENT starts at 1).
+        return 0
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO listings

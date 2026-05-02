@@ -1410,6 +1410,9 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     database.init_db()
+    # Idempotent cleanup: remove any mock fixtures that may have been
+    # persisted before the upsert guard existed.
+    database.purge_mock_listings()
 
     # Use longer timeouts + respect system proxy (fixes Windows firewall/proxy issues)
     request = HTTPXRequest(

@@ -247,6 +247,55 @@ def test_query_listings_invalid_sort_raises(tmp_db):
         tmp_db.query_listings(sort_by="bogus")
 
 
+def test_upsert_refuses_mock_listing_by_id(tmp_db):
+    """Regression: mock_data.MOCK_LISTINGS used to leak into production DB."""
+    rid = tmp_db.upsert_listing(
+        lbc_id="mock_001", title="Fake", price=790, location="Paris",
+        seller_name="X", seller_type="", url="https://www.leboncoin.fr/annonces/mock_001.htm",
+        source="leboncoin",
+    )
+    assert rid == 0  # sentinel: not persisted
+    assert tmp_db.get_listing_by_lbc_id("mock_001") is None
+
+
+def test_upsert_refuses_mock_listing_by_url(tmp_db):
+    rid = tmp_db.upsert_listing(
+        lbc_id="real_42", title="Studio", price=900, location="Paris",
+        seller_name="X", seller_type="", url="https://example.com/foo/mock/bar",
+        source="leboncoin",
+    )
+    assert rid == 0
+
+
+def test_purge_mock_listings_removes_existing(tmp_db):
+    """Idempotent cleanup of any mock rows persisted before the guard."""
+    import sqlite3, config
+    # Bypass the upsert guard to seed legacy mock rows directly
+    with sqlite3.connect(config.DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO listings (lbc_id, source, title, price, location, "
+            "seller_name, seller_type, url, scraped_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("mock_001", "leboncoin", "Fake", 790, "Paris", "X", "",
+             "https://www.leboncoin.fr/annonces/mock_001.htm", "2026-05-02"),
+        )
+        conn.execute(
+            "INSERT INTO listings (lbc_id, source, title, price, location, "
+            "seller_name, seller_type, url, scraped_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("real_42", "leboncoin", "Real", 900, "Paris", "X", "",
+             "https://www.leboncoin.fr/ad/locations/12345", "2026-05-02"),
+        )
+        conn.commit()
+
+    n = tmp_db.purge_mock_listings()
+    assert n == 1
+    assert tmp_db.get_listing_by_lbc_id("mock_001") is None
+    assert tmp_db.get_listing_by_lbc_id("real_42") is not None
+    # Idempotent: second call deletes nothing
+    assert tmp_db.purge_mock_listings() == 0
+
+
 def test_indexes_exist_after_init(tmp_db):
     import config
     con = sqlite3.connect(config.DB_PATH)
