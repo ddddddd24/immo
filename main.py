@@ -112,6 +112,38 @@ def _pop_ttl(data: dict, key: str) -> Any:
 # ─── Helper ───────────────────────────────────────────────────────────────────
 
 _MD_SPECIAL = re.compile(r"([_*\[\]`])")
+_TELEGRAM_MSG_LIMIT = 3800  # safety margin under Telegram's 4096-char hard limit
+
+# Hard pattern for any listing URL across the 11 supported sources.
+# When DeepSeek invents a `reply` containing one of these, it's HALLUCINATED —
+# the LLM has no DB access in the reply path. We strip them defensively.
+_HALLUCINATED_URL_RE = re.compile(
+    r"https?://(?:www\.|en[-_]us\.|fr[-_]fr\.)?"
+    r"(?:leboncoin\.fr|seloger\.com|pap\.fr|bienici\.com|logic-immo\.com|"
+    r"studapart\.com|parisattitude\.com|lodgis\.com|immojeune\.com|"
+    r"locservice\.fr|roomlala\.com)\S+",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_reply_text(text: str) -> str:
+    """Strip listing URLs from a `reply` tool output.
+
+    The reply tool exists for conversational text — chitchat, explanations,
+    clarifications. It has NO access to the SQLite DB. Any URL the LLM puts
+    in a reply is fabricated from training data or conversation memory and
+    will likely 404. We replace such URLs with a pointer to /rapport_complet
+    or /pending so the user gets real data via a tool that queries the DB.
+    """
+    if not _HALLUCINATED_URL_RE.search(text):
+        return text
+    cleaned = _HALLUCINATED_URL_RE.sub("[URL invérifiée]", text)
+    cleaned += (
+        "\n\n⚠️ J'ai retiré des URLs que je ne peux pas vérifier — "
+        "elles auraient été inventées. Pour les vraies URLs, tape "
+        "`/rapport_complet` (groupé+trié) ou `/pending` (annonces préparées)."
+    )
+    return cleaned
 
 
 def _escape_md(text: str | None) -> str:
@@ -122,23 +154,50 @@ def _escape_md(text: str | None) -> str:
     return _MD_SPECIAL.sub(r"\\\1", str(text))
 
 
+def _chunk_for_telegram(text: str, max_len: int = _TELEGRAM_MSG_LIMIT) -> list[str]:
+    """Split a long message at line boundaries so each piece fits Telegram's
+    4096-char limit. Without this, /rapport_complet on 100+ listings used to
+    silently fail to send and the user got nothing.
+    """
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = (current + "\n" + line) if current else line
+        if len(candidate) > max_len:
+            if current:
+                chunks.append(current)
+                current = line if len(line) <= max_len else line[:max_len]
+            else:
+                # Single line too long — hard-cut
+                chunks.append(line[:max_len])
+                current = line[max_len:]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def _reply(update: Update, text: str, **kwargs) -> None:
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is not None:
         _TURN_REPLIES.setdefault(chat_id, []).append(text)
-    try:
-        await update.effective_message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN, **kwargs
-        )
-    except Exception as exc:
-        # If MARKDOWN parsing fails (unbalanced *, _, [ in dynamic content
-        # despite escaping), retry as plain text so the user sees something
-        # rather than nothing.
-        logger.warning("Markdown reply failed (%s) — retrying as plain text", exc)
+    for part in _chunk_for_telegram(text):
         try:
-            await update.effective_message.reply_text(text, **kwargs)
-        except Exception as exc2:
-            logger.error("Plain-text reply also failed: %s", exc2)
+            await update.effective_message.reply_text(
+                part, parse_mode=ParseMode.MARKDOWN, **kwargs
+            )
+        except Exception as exc:
+            # If MARKDOWN parsing fails (unbalanced *, _, [ in dynamic content
+            # despite escaping), retry as plain text so the user sees something
+            # rather than nothing.
+            logger.warning("Markdown reply failed (%s) — retrying as plain text", exc)
+            try:
+                await update.effective_message.reply_text(part, **kwargs)
+            except Exception as exc2:
+                logger.error("Plain-text reply also failed: %s", exc2)
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -1329,7 +1388,8 @@ async def _cmd_chat_inner(
         await cmd_boite(update, ctx)
 
     elif tool == "reply":
-        await _reply(update, intent.get("text", "Je n'ai pas compris, peux-tu reformuler ?"))
+        raw = intent.get("text", "Je n'ai pas compris, peux-tu reformuler ?")
+        await _reply(update, _sanitize_reply_text(raw))
 
     else:
         await _reply(update, "Je n'ai pas compris. Envoie-moi une URL d'annonce ou décris ce que tu veux faire.")

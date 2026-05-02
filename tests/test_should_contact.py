@@ -115,3 +115,65 @@ def test_campaign_sources_only_filters():
 def test_campaign_sources_only_disabled_returns_empty():
     import main
     assert main._campaign_sources(only="roomlala") == []
+
+
+# ─── Anti-hallucination: URL stripping in reply ──────────────────────────────
+
+def test_sanitize_reply_strips_lbc_url():
+    """Regression: DeepSeek invented LBC URLs in a 'continue' reply."""
+    import main
+    fake = (
+        "Voici la suite des annonces:\n"
+        "1. Studio Paris 11 — 850€\n"
+        "   https://www.leboncoin.fr/ad/locations/3189431190\n"
+    )
+    out = main._sanitize_reply_text(fake)
+    assert "leboncoin.fr/ad/locations/3189431190" not in out
+    assert "URL invérifiée" in out
+    assert "rapport_complet" in out  # pointer to the real-data tool
+
+
+def test_sanitize_reply_strips_multiple_sites():
+    import main
+    fake = (
+        "https://www.studapart.com/fr/colocation/uxco-saint-ouen-71176\n"
+        "https://www.seloger.com/annonces/locations/immeuble/montreuil-93/studio/230521529.htm\n"
+        "https://en-us.roomlala.com/rent/FR-France/paris\n"
+    )
+    out = main._sanitize_reply_text(fake)
+    for bad in ["studapart.com/fr/colocation", "seloger.com/annonces", "roomlala.com/rent"]:
+        assert bad not in out
+
+
+def test_sanitize_reply_passes_through_clean_text():
+    """Non-listing URLs and plain text should not be touched."""
+    import main
+    clean = "Salut Illan ! 😊 Comment ça va ? Tape /rapport_complet pour la liste."
+    assert main._sanitize_reply_text(clean) == clean
+
+
+# ─── Telegram message chunking ────────────────────────────────────────────────
+
+def test_chunk_short_text_stays_single():
+    import main
+    out = main._chunk_for_telegram("hello")
+    assert out == ["hello"]
+
+
+def test_chunk_long_text_splits_at_newlines():
+    import main
+    long_text = "\n".join([f"line {i:04d}" for i in range(2000)])
+    parts = main._chunk_for_telegram(long_text, max_len=500)
+    assert len(parts) > 1
+    for p in parts:
+        assert len(p) <= 500
+    assert "\n".join(parts).replace("\n", "") == long_text.replace("\n", "")  # no data loss
+
+
+def test_chunk_respects_default_telegram_limit():
+    import main
+    listing = "  • Studio Paris (Paris, 75011) — *850€* · 28m²\n    https://www.leboncoin.fr/ad/locations/3189431190\n"
+    big = "📋 *Rapport*\n" + listing * 200
+    parts = main._chunk_for_telegram(big)
+    for p in parts:
+        assert len(p) <= 3800
