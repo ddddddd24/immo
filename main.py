@@ -576,6 +576,34 @@ async def _run_campaign_body(
 
     from scraper import detect_housing_type
 
+    async def _score_listings_parallel(items: list, concurrency: int = 8) -> None:
+        """Score every listing in parallel, semaphore-bounded to avoid rate limits.
+
+        Mutates each Listing in-place (sets .score and .score_reason) and
+        persists to DB via set_listing_score so dashboard/Sheets see it.
+        Failures are logged and skipped — don't block the campaign.
+        """
+        sem = asyncio.Semaphore(concurrency)
+        n_done = [0]
+        n_total = len(items)
+
+        async def _one(lst):
+            async with sem:
+                try:
+                    result = await score_listing(lst)
+                    lst.score = result["score"]
+                    lst.score_reason = result["reason"]
+                    database.set_listing_score(
+                        lst.lbc_id, result["score"], result["reason"],
+                    )
+                except Exception as exc:
+                    logger.warning("Score failed for %s: %s", lst.lbc_id, exc)
+                finally:
+                    n_done[0] += 1
+
+        await asyncio.gather(*(_one(l) for l in items))
+        logger.info("Scored %d/%d listings", n_done[0], n_total)
+
     def _persist_batch(batch: list) -> int:
         """Upsert a batch of just-scraped listings to DB. Called per-source so
         partial campaigns (timeout / abort mid-flight) don't lose data."""
@@ -676,6 +704,13 @@ async def _run_campaign_body(
         return
 
     # Listings already persisted per-source above (see _persist_batch).
+    # Now score EVERY listing in parallel (not just contact-eligible ones), so
+    # the dashboard / Sheets / /rapport_complet show scores on all rows
+    # including over-budget ones the user wants to browse.
+    if config.ENABLE_SCORING:
+        await _reply(update, f"🎯 Scoring de *{len(listings)}* annonces en parallèle…")
+        await _score_listings_parallel(listings)
+
     await _reply(update, f"🧠 Analyse de *{len(listings)}* annonces en cours…")
 
     sent = 0  # count of messages PREPARED in this run
@@ -714,16 +749,23 @@ async def _run_campaign_body(
                 continue
 
         try:
-            # Optional scoring gate
+            # Score was computed upfront by _score_listings_parallel — read
+            # from the listing in-memory (no extra LLM call here).
             score_result = None
             if config.ENABLE_SCORING:
-                score_result = await score_listing(listing)
-                if score_result["score"] < config.MIN_SCORE:
+                score_value = getattr(listing, "score", None)
+                score_reason = getattr(listing, "score_reason", "") or ""
+                if score_value is None:
+                    # Defensive fallback — shouldn't normally happen
+                    s = await score_listing(listing)
+                    score_value = s["score"]
+                    score_reason = s["reason"]
+                score_result = {"score": score_value, "reason": score_reason}
+                if score_value < config.MIN_SCORE:
                     skipped["score_bas"] += 1
                     logger.info(
                         "Listing %s skipped: score %d < %d (%s)",
-                        listing.lbc_id, score_result["score"], config.MIN_SCORE,
-                        score_result["reason"],
+                        listing.lbc_id, score_value, config.MIN_SCORE, score_reason,
                     )
                     continue
 
