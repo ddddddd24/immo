@@ -759,6 +759,41 @@ async def _drain_pending_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+# ─── /pending (list pending contacts) + /recent (list recent listings) ───────
+
+async def cmd_list_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Surface the REAL pending-contact list from DB. Anti-hallucination tool."""
+    pending = database.get_pending_contacts()
+    if not pending:
+        await _reply(update, "📭 Aucun message en attente d'envoi. Lance /campagne d'abord.")
+        return
+    lines = [f"📤 *{len(pending)} annonce(s) prête(s) à envoyer :*\n"]
+    for i, c in enumerate(pending[:20], 1):
+        title = _escape_md(c["title"] or "")[:60]
+        location = _escape_md(c["location"] or "")[:35]
+        lines.append(f"*{i}.* _{title}_ ({location})\n   {c['url']}")
+    if len(pending) > 20:
+        lines.append(f"\n_… et {len(pending) - 20} autres._")
+    await _reply(update, "\n".join(lines))
+
+
+async def cmd_list_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE, limit: int = 10) -> None:
+    """Surface the most-recently-scraped listings from DB. Anti-hallucination tool."""
+    limit = max(1, min(int(limit or 10), 30))
+    listings = database.get_recent_listings(limit)
+    if not listings:
+        await _reply(update, "📭 Aucune annonce dans la base. Lance /campagne ou /search d'abord.")
+        return
+    lines = [f"📋 *{len(listings)} annonce(s) récente(s) en base :*\n"]
+    for i, l in enumerate(listings, 1):
+        title = _escape_md(l["title"] or "")[:60]
+        location = _escape_md(l["location"] or "")[:30]
+        price = f"{l['price']}€" if l["price"] else "?€"
+        score = f" ⭐{l['score']}/10" if l.get("score") else ""
+        lines.append(f"*{i}.* _{title}_ ({location}) — *{price}*{score}\n   {l['url']}")
+    await _reply(update, "\n".join(lines))
+
+
 # ─── /rapport ─────────────────────────────────────────────────────────────────
 
 async def cmd_rapport(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1085,6 +1120,13 @@ async def _cmd_chat_inner(
     elif tool == "run_envoyer":
         await cmd_envoyer(update, ctx)
 
+    elif tool == "list_pending":
+        await cmd_list_pending(update, ctx)
+
+    elif tool == "list_recent":
+        limit = intent.get("limit") or 10
+        await cmd_list_recent(update, ctx, limit=int(limit))
+
     elif tool == "run_rapport":
         await cmd_rapport(update, ctx)
 
@@ -1164,6 +1206,8 @@ def main() -> None:
     app.add_handler(CommandHandler("campagne", cmd_campagne))
     app.add_handler(CommandHandler("envoyer", cmd_envoyer))
     app.add_handler(CommandHandler("confirmer", cmd_confirmer))
+    app.add_handler(CommandHandler("pending", cmd_list_pending))
+    app.add_handler(CommandHandler("recent", cmd_list_recent))
     app.add_handler(CommandHandler("rapport", cmd_rapport))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("autostart", cmd_autostart))

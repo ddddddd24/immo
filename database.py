@@ -191,6 +191,24 @@ def count_pending_contacts() -> int:
         ).fetchone()["n"]
 
 
+def get_recent_listings(limit: int = 10) -> list[dict]:
+    """Return the most recently scraped listings (insertion order desc).
+
+    Used by the NL `list_recent` tool to give the user a real, grounded
+    answer when they ask 'qu'as-tu trouvé ?' — bypasses the LLM's tendency
+    to hallucinate URLs from memory.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT lbc_id, source, title, price, location, url, scraped_at, score
+               FROM listings
+               ORDER BY id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_listing_by_lbc_id(lbc_id: str) -> Optional[sqlite3.Row]:
     with _conn() as conn:
         return conn.execute(

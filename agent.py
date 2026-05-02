@@ -466,6 +466,25 @@ _INTENT_TOOLS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "list_pending",
+        "description": "Lister les VRAIES annonces actuellement en attente d'envoi (avec leurs URLs réelles depuis la base de données). À UTILISER OBLIGATOIREMENT quand l'utilisateur demande des URLs, des prix, des noms d'annonces préparées, ou 'donne-moi la liste', 'qu'as-tu préparé', 'montre-moi les URLs', 'liste des annonces prêtes', 'envoie-moi les liens'. NE JAMAIS répondre via reply avec des URLs ou détails inventés — utilise CET outil.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "list_recent",
+        "description": "Lister les VRAIES annonces récemment scrapées en base (toutes sources, qu'elles soient préparées ou non). À UTILISER OBLIGATOIREMENT pour 'qu'as-tu trouvé en dernier', 'donne-moi les annonces récentes', 'montre-moi les dernières annonces', 'liste tout ce que t'as scrapé'. Toujours préférer cet outil à reply quand l'utilisateur veut voir des annonces concrètes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "number",
+                    "description": "Nombre d'annonces à afficher (défaut 10, max 30).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "run_rapport",
         "description": "Afficher les statistiques du jour : annonces scrapées, messages envoyés, réponses reçues. Utiliser pour 'rapport', 'stats', 'bilan', 'comment ça avance', etc.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
@@ -578,12 +597,19 @@ l'outil approprié. Tu DOIS appeler exactement un outil par message.
 
 RÈGLES CRITIQUES — à respecter absolument :
 
-1. URLs : N'INVENTE JAMAIS d'URL. Pour cibler un site précis avec run_search,
-   utilise le paramètre `source` (ex: 'parisattitude', 'studapart'). Utilise
-   `url` UNIQUEMENT si l'utilisateur a collé une URL textuelle dans son
-   message.
+1. ANTI-HALLUCINATION : Si l'utilisateur demande des URLs, des prix exacts,
+   des noms d'annonces, ou n'importe quel détail factuel sur les annonces
+   en base, tu DOIS utiliser list_pending (annonces préparées) ou
+   list_recent (annonces scrapées). N'invente JAMAIS d'URL ou de détail
+   d'annonce dans le tool reply — tu n'as PAS accès à la base sans ces
+   outils, donc toute URL inventée serait fausse.
 
-2. Filtres NON supportés — utilise reply pour expliquer poliment :
+2. URLs de recherche : N'INVENTE JAMAIS d'URL. Pour cibler un site précis
+   avec run_search, utilise le paramètre `source` (ex: 'parisattitude',
+   'studapart'). Utilise `url` UNIQUEMENT si l'utilisateur a collé une URL
+   textuelle dans son message.
+
+3. Filtres NON supportés — utilise reply pour expliquer poliment :
    - Filtrer par date ("du jour", "aujourd'hui", "dernières 24h", "cette
      semaine", "dernière heure") — aucune source ne supporte ce filtre côté
      bot.
@@ -598,20 +624,20 @@ RÈGLES CRITIQUES — à respecter absolument :
    Dans tous ces cas, dis clairement à Illan que la fonctionnalité n'est pas
    supportée, propose ce que le bot PEUT faire à la place.
 
-3. Si le message contient une URL d'annonce individuelle (depuis n'importe
+4. Si le message contient une URL d'annonce individuelle (depuis n'importe
    quel site supporté), utilise run_simulate avec cette URL.
 
-4. Si Illan dit bonjour, te remercie, plaisante, ou pose une question
-   conversationnelle (sans demander d'action), utilise reply avec une
-   réponse chaleureuse et naturelle en français.
+5. Si Illan dit bonjour, te remercie, plaisante, ou pose une question
+   conversationnelle SANS demander de données factuelles ni d'action,
+   utilise reply avec une réponse chaleureuse et naturelle en français.
 
-5. Distinctions à respecter :
+6. Distinctions à respecter :
    - run_stop = arrêter la campagne en cours d'exécution
    - run_autostop = désactiver la campagne automatique récurrente
    - run_watch = mode veille rapide (intervalles en minutes)
    - run_autostart = campagne complète récurrente (intervalles en heures)
 
-6. Si l'intention est ambiguë, choisis reply et demande une clarification.
+7. Si l'intention est ambiguë, choisis reply et demande une clarification.
 
 Réponds TOUJOURS en français.
 """.strip()
