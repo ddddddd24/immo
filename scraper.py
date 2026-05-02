@@ -1407,6 +1407,12 @@ async def _search_via_generic(
 # Run /search <url> against each platform after first launch and tune the
 # `card_selectors` list (and source-specific JSON paths) against live HTML.
 
+# Module-level shared Camoufox browser. When set by the campaign loop,
+# _fetch_html_with_camoufox reuses it instead of cold-starting Firefox
+# for every source. Saves ~30s per source on a 5-source Camoufox burst.
+_SHARED_CAMOUFOX_BROWSER = None  # type: ignore[assignment]
+
+
 async def _fetch_html_with_camoufox(
     url: str,
     post_delay: tuple[float, float] = (5.0, 8.0),
@@ -1415,13 +1421,35 @@ async def _fetch_html_with_camoufox(
 ) -> Optional[str]:
     """Fetch a page with Camoufox (anti-detect Firefox) — bypasses stealth-Playwright fingerprinting.
 
+    If _SHARED_CAMOUFOX_BROWSER is set (by _run_campaign_body), reuses that
+    browser across calls — saves Firefox cold-start time (15-30s each) when
+    the campaign hits multiple Camoufox sources in a row. Otherwise spins
+    up its own browser.
+
     Studapart/Lodgis/ImmoJeune/LocService work fine with the default
     `wait_until="domcontentloaded"`. Bien'ici has aggressive bot detection
     that holds the document open for 5+ minutes during the DataDome
-    challenge — for that site, callers should pass `wait_until="commit"`
-    (fires the moment navigation starts) plus a longer post_delay so the
-    SPA has time to hydrate and inject listings client-side.
+    challenge — for that site, callers should pass `wait_until="commit"`.
     """
+    if _SHARED_CAMOUFOX_BROWSER is not None:
+        # Reuse the campaign's shared browser — just open a new page on it
+        page = await _SHARED_CAMOUFOX_BROWSER.new_page()
+        try:
+            await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
+            await _handle_cookie_banner(page)
+            await asyncio.sleep(random.uniform(*post_delay))
+            return await page.content()
+        except Exception as exc:
+            logger.warning("Camoufox fetch failed for %s: %s", url, exc)
+            return None
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        return None  # unreachable
+
+    # Fallback: standalone browser (used by one-off probes / tests)
     from camoufox.async_api import AsyncCamoufox
     async with AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows") as browser:
         page = await browser.new_page()

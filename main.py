@@ -594,6 +594,24 @@ async def _run_campaign_body(
                 logger.warning("Failed to persist listing %s: %s", lst.lbc_id, exc)
         return n
 
+    # Open ONE Camoufox browser shared across all Camoufox-using sources.
+    # Without this, Studapart + Lodgis + ImmoJeune + LocService + Bien'ici +
+    # SeLoger all cold-start Firefox separately (5-6 × 30s = ~3 min just on
+    # cold-starts). Shared browser cuts that to a single 30s cold-start.
+    _CAMOUFOX_LABELS = {"Studapart", "Lodgis", "ImmoJeune", "LocService", "Bien'ici", "SeLoger"}
+    needs_camoufox = any(label in _CAMOUFOX_LABELS for _, label in sources)
+    camoufox_cm = None
+    if needs_camoufox:
+        try:
+            from camoufox.async_api import AsyncCamoufox
+            import scraper as _scraper_mod
+            camoufox_cm = AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows")
+            _scraper_mod._SHARED_CAMOUFOX_BROWSER = await camoufox_cm.__aenter__()
+            logger.info("Shared Camoufox browser opened for the campaign")
+        except Exception as exc:
+            logger.warning("Could not open shared Camoufox (%s) — sources will cold-start", exc)
+            camoufox_cm = None
+
     per_source: list[tuple[str, int, list]] = []
     listings: list = []
     for i, (url, label) in enumerate(sources):
@@ -629,6 +647,16 @@ async def _run_campaign_body(
         await _refresh_board()
         per_source.append((label, len(results), results))
         listings.extend(results)
+
+    # Close the shared Camoufox browser once all sources have run
+    if camoufox_cm is not None:
+        try:
+            import scraper as _scraper_mod
+            _scraper_mod._SHARED_CAMOUFOX_BROWSER = None
+            await camoufox_cm.__aexit__(None, None, None)
+            logger.info("Shared Camoufox browser closed")
+        except Exception as exc:
+            logger.warning("Failed to close shared Camoufox: %s", exc)
 
     listings = _deduplicate(listings)
 
