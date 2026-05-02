@@ -562,8 +562,8 @@ async def _run_campaign_body(
         "ImmoJeune": 180.0,
         "LocService": 180.0,
         "Paris Attitude": 120.0,  # Playwright-only but heavy page
-        # Multi-stage fallback chain
-        "Bien'ici": 240.0,
+        # Bien'ici: now uses Camoufox + commit-strategy, ~17s typical
+        "Bien'ici": 90.0,
         "SeLoger": 180.0,  # Camoufox + LZString decode
     }
     DEFAULT_TIMEOUT = 90.0

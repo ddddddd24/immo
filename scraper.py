@@ -837,71 +837,119 @@ def _bienici_ad_to_listing(ad: dict) -> Optional[Listing]:
     )
 
 
-async def _search_bienici_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    logger.info("[BIENICI] Scraping search page: %s", search_url)
+def _bienici_card_to_listing(card) -> Optional[Listing]:
+    """Parse a Bien'ici `<article class="ad-overview">` card.
 
-    # Try __NEXT_DATA__ first (Bien'ici uses Next.js)
-    data = await _pw_get_next_data(search_url, site="bienici")
-    if data:
-        props = data.get("props", {}).get("pageProps", {})
-        ads = (
-            (props.get("searchResults") or {}).get("ads")
-            or props.get("ads")
-            or props.get("realEstateAds")
-            or props.get("listings")
-            or []
-        )
-        if ads:
-            listings = [l for l in (_bienici_ad_to_listing(a) for a in ads[:max_results]) if l]
-            logger.info("[BIENICI] Found %d listings via __NEXT_DATA__", len(listings))
-            return listings
-        logger.warning("[BIENICI] No ads in __NEXT_DATA__. pageProps keys: %s", list(props.keys())[:10])
+    Card layout (verified 2026-05-02 via Camoufox + commit-strategy):
+      <article class="ad-overview" data-id="century-21-202_3862_1458">
+        <a href="/annonce/location/epinay-sur-orge/appartement/3pieces/...">
+        Visible text:
+          "{seller} | {photo_count} | {type} {N} m² | {zip} {city} | {price} € | par mois ..."
+    """
+    import re as _re2
 
-    # Fallback: intercept the JSON API response (realEstateAds.json endpoint)
-    captured: list[dict] = []
+    raw_id = card.get("data-id") or ""
+    if not raw_id:
+        # Fallback: try to extract id from href
+        link = card.find("a", href=True)
+        if link:
+            m = _re2.search(r"/([\w-]+_[\d_]+)(?:\?|$)", link["href"])
+            if m:
+                raw_id = m.group(1)
+    if not raw_id:
+        return None
+    listing_id = f"bi_{raw_id}"
 
-    async with async_playwright() as pw:
-        ctx = await pw.chromium.launch_persistent_context(
-            user_data_dir=_user_data_dir("bienici"),
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            locale="fr-FR",
-        )
-        page = await ctx.new_page()
-        await Stealth().apply_stealth_async(page)
+    link = card.find("a", href=True)
+    if not link:
+        return None
+    href = link["href"]
+    if href.startswith("/"):
+        href = "https://www.bienici.com" + href
 
-        async def _on_bienici_response(r):
-            if ("realEstateAds" in r.url or "/search" in r.url) and r.status == 200:
-                ct = r.headers.get("content-type", "")
-                if "json" in ct:
-                    try:
-                        body = await r.json()
-                        ads = body.get("realEstateAds") or body.get("ads") or []
-                        captured.extend(ads)
-                    except Exception:
-                        pass
+    text = _re2.sub(r"\s+", " ", card.get_text(" ", strip=True))
 
-        page.on("response", _on_bienici_response)
+    # Price: "860 €" or "1 234 €"
+    price = None
+    pm = _re2.search(r"([\d\s\xa0]{3,})\s*€", text)
+    if pm:
+        digits = _re2.sub(r"\D", "", pm.group(1))
         try:
-            await page.goto(search_url, wait_until="networkidle", timeout=35_000)
-            await _handle_cookie_banner(page)
-            await asyncio.sleep(random.uniform(2.0, 3.0))
-        finally:
-            await ctx.close()
+            price = int(digits)
+        except ValueError:
+            pass
 
-    if not captured:
-        logger.warning("[BIENICI] Could not capture any listings")
+    # Surface: "61 m²"
+    sm = _re2.search(r"(\d+)\s*m²", text)
+    surface = _to_int_safe(sm.group(1)) if sm else None
+
+    # Location: "{5-digit zip} {city}"
+    loc_m = _re2.search(r"(\d{5})\s+([\wÀ-ÿ\-' ]+?)(?:\s*\|)", text)
+    if loc_m:
+        location = f"{loc_m.group(2).strip()}, {loc_m.group(1)}"
+    else:
+        location = ""
+
+    # Title: type + surface portion (e.g. "Appartement meublé 3 pièces 61 m²")
+    title_m = _re2.search(r"((?:Appartement|Studio|Maison|F\d|T\d)[^|]*?\d+\s*m²)", text)
+    title = (title_m.group(1).strip() if title_m else text[:80]).strip()
+
+    # Seller: first segment before first "|"
+    seller = text.split("|", 1)[0].strip() if "|" in text else "Bien'ici"
+
+    images = [
+        src for img in card.find_all("img")
+        if (src := (img.get("src") or img.get("data-src") or "")).startswith("http")
+    ]
+
+    return Listing(
+        lbc_id=listing_id,
+        title=title,
+        description="",
+        price=_parse_price(price),
+        location=location,
+        seller_name=seller[:60] or "Bien'ici",
+        url=href,
+        seller_type_hint="pro",
+        source="bienici",
+        images=images,
+        surface=surface,
+    )
+
+
+async def _search_bienici_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """Bien'ici scraper using Camoufox with wait_until='commit'.
+
+    The previous __NEXT_DATA__ + XHR-intercept approach hung 5+ min on
+    DataDome challenges. Bien'ici no longer ships __NEXT_DATA__ in HTML
+    anyway. The fix: navigate with `commit` (fires immediately when document
+    starts arriving), sleep long enough for the SPA to hydrate and render
+    cards, then parse `<article class="ad-overview">` from the HTML.
+    Real-world timing: ~17s end-to-end vs 358s before.
+    """
+    logger.info("[BIENICI] Scraping search page: %s", search_url)
+    try:
+        html = await _fetch_html_with_camoufox(
+            search_url,
+            post_delay=(10.0, 13.0),  # SPA needs time to hydrate + render cards
+            wait_until="commit",       # don't wait for full document — DataDome holds it
+            goto_timeout=20_000,
+        )
+        if not html:
+            logger.warning("[BIENICI] Camoufox returned no HTML")
+            return []
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.find_all("article", class_="ad-overview")
+        logger.info("[BIENICI] Found %d card elements", len(cards))
+        listings = [
+            l for l in (_bienici_card_to_listing(c) for c in cards[:max_results]) if l
+        ]
+        logger.info("[BIENICI] Parsed %d listings", len(listings))
+        return listings
+    except Exception as exc:
+        logger.warning("[BIENICI] Scraping failed: %s", exc)
         return []
-
-    listings = [l for l in (_bienici_ad_to_listing(a) for a in captured[:max_results]) if l]
-    logger.info("[BIENICI] Found %d listings via XHR intercept", len(listings))
-    return listings
 
 
 # ─── Logic-Immo listing normalisation ────────────────────────────────────────
@@ -1303,21 +1351,26 @@ async def _search_via_generic(
 # Run /search <url> against each platform after first launch and tune the
 # `card_selectors` list (and source-specific JSON paths) against live HTML.
 
-async def _fetch_html_with_camoufox(url: str, post_delay: tuple[float, float] = (5.0, 8.0)) -> Optional[str]:
+async def _fetch_html_with_camoufox(
+    url: str,
+    post_delay: tuple[float, float] = (5.0, 8.0),
+    wait_until: str = "domcontentloaded",
+    goto_timeout: int = 60_000,
+) -> Optional[str]:
     """Fetch a page with Camoufox (anti-detect Firefox) — bypasses stealth-Playwright fingerprinting.
 
-    Studapart serves an SEO landing page (no listings) to detected automation
-    on the same URL where real browsers see ~48 listings. Camoufox masks the
-    fingerprint enough to get the real content. Same approach we use for
-    SeLoger (DataDome).
+    Studapart/Lodgis/ImmoJeune/LocService work fine with the default
+    `wait_until="domcontentloaded"`. Bien'ici has aggressive bot detection
+    that holds the document open for 5+ minutes during the DataDome
+    challenge — for that site, callers should pass `wait_until="commit"`
+    (fires the moment navigation starts) plus a longer post_delay so the
+    SPA has time to hydrate and inject listings client-side.
     """
     from camoufox.async_api import AsyncCamoufox
     async with AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows") as browser:
         page = await browser.new_page()
         try:
-            # 60s goto timeout: Camoufox cold-start + page load + DOM ready
-            # easily takes 30-45s on heavy sites (Lodgis, ImmoJeune).
-            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
             await _handle_cookie_banner(page)
             await asyncio.sleep(random.uniform(*post_delay))
             return await page.content()
