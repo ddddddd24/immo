@@ -453,36 +453,85 @@ async def _run_campaign_body(
             await _reply(update, "⚠️ Aucune source configurée.")
         return
 
-    if source:
-        await _reply(
-            update,
-            f"🚀 Campagne *{sources[0][1]}* lancée ! Scraping en cours…",
+    # ─── Live progress board ────────────────────────────────────────────────
+    # Edit one Telegram message in place as each source completes, so the user
+    # has visibility on progress instead of 5+ min of silence during scraping.
+    title = (
+        f"🚀 *Campagne {sources[0][1]} lancée*"
+        if source else
+        "🚀 *Campagne lancée*"
+    )
+
+    def _board(states: list[str]) -> str:
+        return f"{title} — scraping en cours…\n\n" + "\n".join(states)
+
+    states = [f"⏳ {label} : en attente" for _u, label in sources]
+    try:
+        status_msg = await update.effective_message.reply_text(
+            _board(states), parse_mode=ParseMode.MARKDOWN,
         )
-    else:
-        await _reply(update, "🚀 Campagne lancée ! Scraping en cours…")
+        chat_id = update.effective_chat.id
+        if chat_id is not None:
+            _TURN_REPLIES.setdefault(chat_id, []).append(_board(states))
+    except Exception as exc:
+        logger.warning("Could not send progress board (%s) — falling back", exc)
+        status_msg = None
+
+    async def _refresh_board() -> None:
+        if status_msg is None:
+            return
+        try:
+            await status_msg.edit_text(_board(states), parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass  # Telegram rate-limits edits; ignore non-critical failures
 
     per_source: list[tuple[str, int, list]] = []
     listings: list = []
-    for url, label in sources:
+    PER_SOURCE_TIMEOUT = 90.0  # seconds — kill any source that hangs past this
+    for i, (url, label) in enumerate(sources):
+        states[i] = f"🔄 *{label}* : en cours…"
+        await _refresh_board()
         try:
-            results = await search_listings(url, max_results=25)
+            results = await asyncio.wait_for(
+                search_listings(url, max_results=25),
+                timeout=PER_SOURCE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("%s scrape timed out (>%.0fs)", label, PER_SOURCE_TIMEOUT)
+            results = []
+            states[i] = f"⏱ {label} : timeout (>{PER_SOURCE_TIMEOUT:.0f}s)"
         except Exception as exc:
             logger.error("%s scrape failed: %s", label, exc)
             results = []
+            states[i] = f"❌ {label} : échec ({type(exc).__name__})"
+        else:
+            n = len(results)
+            if n == 0:
+                states[i] = f"⚪ {label} : 0 annonce"
+            else:
+                states[i] = f"✅ {label} : *{n}* annonce{'s' if n > 1 else ''}"
+        await _refresh_board()
         per_source.append((label, len(results), results))
         listings.extend(results)
 
     listings = _deduplicate(listings)
 
+    # Final scrape-phase update on the same message
+    if status_msg is not None:
+        final_board = (
+            f"{title} — scraping terminé.\n\n" + "\n".join(states)
+            + f"\n\n📋 *{len(listings)} annonces uniques* après dédup."
+        )
+        try:
+            await status_msg.edit_text(final_board, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
     if not listings:
-        await _reply(update, "😕 Aucune annonce trouvée.")
+        await _reply(update, "😕 Aucune annonce à analyser.")
         return
 
-    breakdown = " + ".join(f"{n} {label}" for label, n, _ in per_source if n)
-    await _reply(
-        update,
-        f"📋 {breakdown}\n→ *{len(listings)} uniques* — analyse en cours…"
-    )
+    await _reply(update, f"🧠 Analyse de *{len(listings)}* annonces en cours…")
 
     sent = 0  # count of messages PREPARED in this run
     skipped = {
