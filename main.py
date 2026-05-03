@@ -539,6 +539,11 @@ def _campaign_sources(only: str | None = None) -> list[tuple[str, str]]:
 
     sources: list[tuple[str, str]] = [
         (config.DEFAULT_SEARCH_URL, "LBC"),
+        # SeLoger: scraping doesn't need creds (Camoufox parses the public
+        # SERP). Sending DOES need SELOGER_EMAIL + PASSWORD — that gate is
+        # in messenger.py:send_message which returns False with a warning
+        # if creds are missing. So scrape unconditionally for browsing.
+        (config.DEFAULT_SEARCH_SELOGER_URL, "SeLoger"),
         (config.DEFAULT_SEARCH_PAP_URL, "PAP"),
         (config.DEFAULT_SEARCH_BIENICI_URL, "Bien'ici"),
         (config.DEFAULT_SEARCH_LOGICIMMO_URL, "Logic-Immo"),
@@ -549,8 +554,6 @@ def _campaign_sources(only: str | None = None) -> list[tuple[str, str]]:
         (config.DEFAULT_SEARCH_LOCSERVICE_URL, "LocService"),
         (config.DEFAULT_SEARCH_ROOMLALA_URL, "Roomlala"),
     ]
-    if config.SELOGER_EMAIL:
-        sources.insert(1, (config.DEFAULT_SEARCH_SELOGER_URL, "SeLoger"))
     return [(url, label) for url, label in sources if url]
 
 
