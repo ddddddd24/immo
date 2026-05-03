@@ -1138,6 +1138,68 @@ async def cmd_query(
     await _reply(update, "\n".join(lines))
 
 
+# ─── /score_all — backfill scores for any un-scored listing ──────────────────
+
+async def cmd_score_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Score every listing in DB that doesn't have a score yet.
+
+    Useful after preferences.py changes (re-score with the new prompt)
+    or to backfill listings persisted before scoring was enabled.
+    """
+    if not config.ENABLE_SCORING:
+        await _reply(
+            update,
+            "⚠️ ENABLE_SCORING=false dans .env — active le scoring puis relance.",
+        )
+        return
+
+    unscored = database.get_unscored_listings()
+    if not unscored:
+        await _reply(update, "✅ Toutes les annonces ont déjà un score.")
+        return
+
+    await _reply(
+        update,
+        f"🎯 Scoring de *{len(unscored)}* annonce(s) sans score (parallèle, semaphore=8)…\n"
+        f"Coût estimé : ~{len(unscored) * 0.005:.2f}$ via DeepSeek.",
+    )
+
+    # Build minimal Listing-like objects for score_listing
+    from agent import Listing
+    items = []
+    for r in unscored:
+        items.append(Listing(
+            lbc_id=r["lbc_id"], title=r["title"] or "", description="",
+            price=r["price"] or 0, location=r["location"] or "",
+            seller_name="", url=r["url"] or "",
+            source=r["source"] or "", surface=r.get("surface"),
+            housing_type=r.get("housing_type") or "",
+            roommate_count=r.get("roommate_count"),
+        ))
+
+    sem = asyncio.Semaphore(8)
+    n_done = [0]
+    n_total = len(items)
+
+    async def _one(lst):
+        async with sem:
+            try:
+                result = await score_listing(lst)
+                database.set_listing_score(
+                    lst.lbc_id, result["score"], result["reason"],
+                )
+            except Exception as exc:
+                logger.warning("Backfill score failed for %s: %s", lst.lbc_id, exc)
+            finally:
+                n_done[0] += 1
+
+    await asyncio.gather(*(_one(l) for l in items))
+    await _reply(
+        update,
+        f"✅ Backfill terminé : *{n_done[0]}/{n_total}* annonces scorées.",
+    )
+
+
 # ─── /sync — Google Sheets sync ──────────────────────────────────────────────
 
 async def cmd_sync_sheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1507,6 +1569,9 @@ async def _cmd_chat_inner(
     elif tool == "sync_sheet":
         await cmd_sync_sheet(update, ctx)
 
+    elif tool == "score_all":
+        await cmd_score_all(update, ctx)
+
     elif tool == "query_listings":
         await cmd_query(
             update, ctx,
@@ -1606,6 +1671,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pending", cmd_list_pending))
     app.add_handler(CommandHandler("recent", cmd_list_recent))
     app.add_handler(CommandHandler("sync", cmd_sync_sheet))
+    app.add_handler(CommandHandler("score_all", cmd_score_all))
 
     async def _cmd_rapport_complet(update, ctx):
         """Default /rapport_complet: groups by source, sorts by surface."""

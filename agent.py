@@ -504,6 +504,11 @@ _INTENT_TOOLS = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "score_all",
+        "description": "Calculer (ou recalculer) le score 1-10 pour toutes les annonces qui n'en ont pas encore. À utiliser pour 'score tout', 'recalcule les scores', 'note toutes les annonces', 'fais un backfill des scores'. Coût ~$0.005/annonce.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "list_recent",
         "description": "Lister les VRAIES annonces récemment scrapées en base (toutes sources, qu'elles soient préparées ou non). À UTILISER OBLIGATOIREMENT pour 'qu'as-tu trouvé en dernier', 'donne-moi les annonces récentes', 'montre-moi les dernières annonces', 'liste tout ce que t'as scrapé'. Toujours préférer cet outil à reply quand l'utilisateur veut voir des annonces concrètes.",
         "input_schema": {

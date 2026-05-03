@@ -347,6 +347,23 @@ def set_listing_score(lbc_id: str, score: int, reason: str) -> None:
         )
 
 
+def get_unscored_listings(limit: Optional[int] = None) -> list[dict]:
+    """Return listings whose score is NULL — for the backfill / score_all flow."""
+    sql = """SELECT lbc_id, source, title, price, location, url, surface,
+                    housing_type, roommate_count
+             FROM listings
+             WHERE score IS NULL
+             ORDER BY id DESC"""
+    if limit is not None:
+        sql += " LIMIT ?"
+        params: tuple = (limit,)
+    else:
+        params = ()
+    with _conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ─── Contacts ─────────────────────────────────────────────────────────────────
 
 def create_contact(listing_id: int, message: str) -> int:
