@@ -340,6 +340,53 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await query.answer()
 
     action, lbc_id = query.data.split(":", 1)
+
+    # ── /watch alert callbacks ──────────────────────────────────────────────
+    if action == "watch_ignore":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"❌ Ignorée.",
+        )
+        return
+
+    if action == "watch_prep":
+        # User wants to prepare the message (analyse + create_contact in pending).
+        # No actual send — that's still /envoyer + /confirmer.
+        row = database.get_listing_by_lbc_id(lbc_id)
+        if not row:
+            await query.message.reply_text("❌ Annonce introuvable en base.")
+            return
+        if database.already_contacted(lbc_id):
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("ℹ️ Déjà préparée — tape /pending pour la voir.")
+            return
+        # Build a minimal Listing object to pass to analyse_listing
+        from agent import Listing
+        lst = Listing(
+            lbc_id=row["lbc_id"], title=row["title"] or "", description="",
+            price=row["price"] or 0, location=row["location"] or "",
+            seller_name=row["seller_name"] or "", url=row["url"] or "",
+            source=row["source"] or "", surface=row["surface"],
+        )
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("🧠 Génération du message…")
+        try:
+            result = await analyse_listing(lst)
+            listing_id = database.upsert_listing(
+                lbc_id=lst.lbc_id, title=lst.title, price=lst.price,
+                location=lst.location, seller_name=lst.seller_name,
+                seller_type=result.seller_type, url=lst.url, source=lst.source,
+                surface=lst.surface,
+            )
+            database.create_contact(listing_id, result.message)
+            await query.message.reply_text(
+                f"📝 Message préparé. Tape /envoyer puis /confirmer pour l'envoyer pour de vrai."
+            )
+        except Exception as exc:
+            await query.message.reply_text(f"❌ Erreur génération : `{exc}`")
+        return
+
+    # ── /simulate callbacks ──────────────────────────────────────────────────
     result = _get_ttl(ctx.bot_data, f"sim:{lbc_id}")
 
     if action == "ignore":
@@ -1356,89 +1403,222 @@ async def cmd_visites(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── /watch + /unwatch ────────────────────────────────────────────────────────
 
-async def _fast_poll_loop(update: Update, ctx: ContextTypes.DEFAULT_TYPE, interval_min: int) -> None:
-    """
-    Lightweight background poller.
-    Scrapes all sources every `interval_min` minutes and immediately contacts
-    any listings that are new (not yet in DB and not already contacted).
-    """
+# ─── /watch — two-pool poller with score-filtered notifications ──────────────
+#
+# Replaces the previous auto-contact behaviour. New listings are scored,
+# filtered by INTEREST_THRESHOLD, and surfaced as Telegram messages with
+# inline buttons "📤 Préparer" / "❌ Ignorer". Nothing is sent without
+# user click. Two pools run in parallel:
+#   - Playwright sources (LBC, PAP, Logic-Immo, Paris Attitude): every 5 min
+#   - Camoufox sources (Studapart, Lodgis, ImmoJeune, LocService, Bien'ici,
+#     SeLoger): every 15 min (cold-start tax = ~30s)
+
+_PLAYWRIGHT_WATCH_LABELS = {"LBC", "PAP", "Logic-Immo", "Paris Attitude"}
+_CAMOUFOX_WATCH_LABELS = {
+    "Studapart", "Lodgis", "ImmoJeune", "LocService", "Bien'ici", "SeLoger",
+}
+_watch_tasks: list[asyncio.Task] = []
+_watch_seen: set[str] = set()  # lbc_ids already alerted on (in-memory)
+
+
+async def _watch_pool_loop(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    labels: set[str],
+    interval_min: int,
+    pool_name: str,
+) -> None:
+    """One pool: poll a subset of sources every `interval_min`, score new
+    listings, alert on score >= INTEREST_THRESHOLD."""
+    import scraper as _scraper_mod
+    import random as _random
     while True:
-        logger.info("[WATCH] Fast poll starting…")
-        all_listings: list = []
+        try:
+            logger.info("[WATCH %s] poll starting", pool_name)
+            sources = [(u, l) for u, l in _campaign_sources() if l in labels]
+            if not sources:
+                logger.info("[WATCH %s] no sources active in this pool", pool_name)
+                await asyncio.sleep(interval_min * 60)
+                continue
 
-        sources = _campaign_sources()
+            # Open shared Camoufox if this pool needs it
+            cm_handle = None
+            if any(l in _CAMOUFOX_WATCH_LABELS for _u, l in sources):
+                try:
+                    from camoufox.async_api import AsyncCamoufox
+                    cm_handle = AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows")
+                    _scraper_mod._SHARED_CAMOUFOX_BROWSER = await cm_handle.__aenter__()
+                except Exception as exc:
+                    logger.warning("[WATCH %s] could not open shared Camoufox: %s", pool_name, exc)
+                    cm_handle = None
 
-        for source_url, source_name in sources:
-            try:
-                results = await search_listings(source_url, max_results=20)
-                all_listings.extend(results)
-            except Exception as exc:
-                logger.warning("[WATCH] %s scrape failed: %s", source_name, exc)
+            all_listings: list = []
+            for url, label in sources:
+                try:
+                    timeout = _TIMEOUT_BY_LABEL.get(label, DEFAULT_TIMEOUT)
+                    results = await asyncio.wait_for(
+                        search_listings(url, max_results=20), timeout=timeout,
+                    )
+                    all_listings.extend(results)
+                except asyncio.TimeoutError:
+                    logger.warning("[WATCH %s] %s timed out", pool_name, label)
+                except Exception as exc:
+                    logger.warning("[WATCH %s] %s failed: %s", pool_name, label, exc)
 
-        all_listings = _deduplicate(all_listings)
-        new = []
-        for lst in all_listings:
-            eligible, _cat, _reason = _should_contact(lst)
-            if eligible:
+            # Close shared Camoufox
+            if cm_handle is not None:
+                try:
+                    _scraper_mod._SHARED_CAMOUFOX_BROWSER = None
+                    await cm_handle.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+            all_listings = _deduplicate(all_listings)
+
+            # Persist all (browsing visibility) — same as campaign
+            from scraper import detect_housing_type
+            for lst in all_listings:
+                try:
+                    htype, n_room = detect_housing_type(lst.title or "", lst.description or "")
+                    database.upsert_listing(
+                        lbc_id=lst.lbc_id, title=lst.title, price=lst.price,
+                        location=lst.location, seller_name=lst.seller_name,
+                        seller_type="", url=lst.url, source=lst.source,
+                        surface=lst.surface, housing_type=htype, roommate_count=n_room,
+                    )
+                except Exception:
+                    pass
+
+            # New = not yet alerted on AND passes _should_contact
+            new = []
+            for lst in all_listings:
+                if lst.lbc_id in _watch_seen:
+                    continue
+                eligible, _cat, _reason = _should_contact(lst)
+                if not eligible:
+                    _watch_seen.add(lst.lbc_id)  # don't re-eval next poll
+                    continue
                 new.append(lst)
 
-        if new:
-            await _reply(update, f"🆕 *{len(new)} nouvelle(s) annonce(s)* détectée(s) — contact en cours…")
-            sent = 0
-            for listing in new:
-                if database.messages_sent_last_hour() >= config.MAX_MESSAGES_PER_HOUR:
-                    await _reply(update, f"⏸ Limite horaire atteinte ({config.MAX_MESSAGES_PER_HOUR}/h).")
-                    break
-                try:
-                    result = await analyse_listing(listing)
-                    listing_id = database.upsert_listing(
-                        lbc_id=listing.lbc_id, title=listing.title, price=listing.price,
-                        location=listing.location, seller_name=listing.seller_name,
-                        seller_type=result.seller_type, url=listing.url, source=listing.source,
-                        surface=listing.surface,
-                    )
-                    contact_id = database.create_contact(listing_id, result.message)
-                    success = await send_message_safe(listing.url, result.message, contact_id)
-                    if success:
-                        sent += 1
-                        await _reply(update, f"✉️ → _{_escape_md(listing.title)}_ ({_escape_md(listing.location)})")
-                except Exception as exc:
-                    logger.error("[WATCH] Error on %s: %s", listing.lbc_id, exc)
-                await asyncio.sleep(2)
+            if new and config.ENABLE_SCORING:
+                # Score the new ones in parallel
+                sem = asyncio.Semaphore(8)
+                async def _score_one(lst):
+                    async with sem:
+                        try:
+                            result = await score_listing(lst)
+                            lst.score = result["score"]
+                            lst.score_reason = result["reason"]
+                            database.set_listing_score(
+                                lst.lbc_id, result["score"], result["reason"],
+                            )
+                        except Exception as exc:
+                            logger.warning("[WATCH %s] score failed for %s: %s", pool_name, lst.lbc_id, exc)
+                await asyncio.gather(*(_score_one(l) for l in new))
 
-            if sent:
-                await _reply(update, f"✅ {sent} message(s) envoyé(s).")
+            # Surface high-score listings
+            alerted = 0
+            for lst in new:
+                _watch_seen.add(lst.lbc_id)
+                score = getattr(lst, "score", None) or 0
+                if score >= config.INTEREST_THRESHOLD:
+                    await _send_watch_alert(update, lst)
+                    alerted += 1
 
-        logger.info("[WATCH] Done — next poll in %d min", interval_min)
-        await asyncio.sleep(interval_min * 60)
+            if alerted:
+                logger.info("[WATCH %s] alerted on %d/%d new", pool_name, alerted, len(new))
+            elif new:
+                logger.info("[WATCH %s] %d new but none above threshold %d", pool_name, len(new), config.INTEREST_THRESHOLD)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[WATCH %s] pool iteration crashed: %s", pool_name, exc)
+
+        # Jittered sleep ±20% to avoid robotic regularity (DataDome detection)
+        jitter = _random.uniform(0.8, 1.2)
+        await asyncio.sleep(interval_min * 60 * jitter)
+
+
+async def _send_watch_alert(update: Update, listing) -> None:
+    """Build the inline-keyboard alert and ship it to Telegram."""
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📤 Préparer", callback_data=f"watch_prep:{listing.lbc_id}"),
+        InlineKeyboardButton("❌ Ignorer", callback_data=f"watch_ignore:{listing.lbc_id}"),
+    ]])
+    htype = getattr(listing, "housing_type", "") or "?"
+    surface = getattr(listing, "surface", None)
+    surface_str = f"{surface}m²" if surface else "?m²"
+    score = getattr(listing, "score", None) or "?"
+    reason = (getattr(listing, "score_reason", "") or "")[:200]
+    msg = (
+        f"🔥 *NOUVELLE ANNONCE* ⭐{score}/10\n\n"
+        f"📍 _{_escape_md(listing.title)}_\n"
+        f"🏷 {htype} · {surface_str} · *{listing.price}€/mois*\n"
+        f"📍 {_escape_md(listing.location)}\n"
+        f"💡 _{_escape_md(reason)}_\n\n"
+        f"🔗 {listing.url}"
+    )
+    try:
+        await update.effective_message.reply_text(
+            msg, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard, disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.warning("Watch alert send failed: %s", exc)
 
 
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global _watch_task
-    if _watch_task and not _watch_task.done():
-        await _reply(update, "⚠️ Mode veille déjà actif. Utilise /unwatch pour l'arrêter.")
+    """Start the two-pool watcher. Notifications, no auto-send."""
+    global _watch_tasks
+    if any(t and not t.done() for t in _watch_tasks):
+        await _reply(update, "⚠️ Mode veille déjà actif. /unwatch pour l'arrêter.")
         return
-    try:
-        interval = int(ctx.args[0]) if ctx.args else config.FAST_POLL_INTERVAL_MIN
-    except (ValueError, IndexError):
-        interval = config.FAST_POLL_INTERVAL_MIN
+
+    # Optional CLI args: /watch [fast_min] [slow_min]
+    fast_min = 5
+    slow_min = 15
+    if ctx.args:
+        try:
+            fast_min = int(ctx.args[0])
+            if len(ctx.args) > 1:
+                slow_min = int(ctx.args[1])
+        except (ValueError, TypeError):
+            pass
+
+    _watch_seen.clear()  # fresh start each /watch session
     await _reply(
         update,
-        f"👁 *Mode veille activé* — scraping toutes les {interval} min\n"
-        "Nouvelles annonces contactées automatiquement.\n"
-        "Utilise /unwatch pour désactiver."
+        f"👁 *Mode veille activé*\n\n"
+        f"🟢 Sources rapides (LBC, PAP, Logic-Immo, Paris Attitude) : "
+        f"toutes les *{fast_min} min*\n"
+        f"🟣 Sources Camoufox (Studapart, Lodgis, ImmoJeune, LocService, "
+        f"Bien'ici, SeLoger) : toutes les *{slow_min} min*\n\n"
+        f"🔔 Notification dès qu'une annonce a un score ≥ "
+        f"*{config.INTEREST_THRESHOLD}/10*\n"
+        f"📤 Tu confirmes la préparation via le bouton inline\n\n"
+        f"`/unwatch` pour arrêter.",
     )
-    _watch_task = asyncio.create_task(_fast_poll_loop(update, ctx, interval))
+
+    _watch_tasks = [
+        asyncio.create_task(_watch_pool_loop(
+            update, ctx, _PLAYWRIGHT_WATCH_LABELS, fast_min, "fast",
+        )),
+        asyncio.create_task(_watch_pool_loop(
+            update, ctx, _CAMOUFOX_WATCH_LABELS, slow_min, "slow",
+        )),
+    ]
 
 
 async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global _watch_task
-    if _watch_task and not _watch_task.done():
-        _watch_task.cancel()
-        _watch_task = None
-        await _reply(update, "👁 Mode veille désactivé.")
-    else:
+    global _watch_tasks
+    alive = [t for t in _watch_tasks if t and not t.done()]
+    if not alive:
         await _reply(update, "ℹ️ Aucun mode veille actif.")
+        return
+    for t in alive:
+        t.cancel()
+    _watch_tasks = []
+    await _reply(update, "👁 Mode veille désactivé.")
 
 
 # ─── /boite ───────────────────────────────────────────────────────────────────

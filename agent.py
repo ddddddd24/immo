@@ -259,31 +259,45 @@ async def score_listing(listing: Listing) -> dict:
         logger.info("Dealbreaker on %s: %s", listing.lbc_id, reason)
         return {"score": 0, "reason": f"dealbreaker: {reason}"}
 
+    # Split the prompt: STABLE prefix (preferences + rules ~1000 tokens) goes
+    # first with cache_control. DeepSeek auto-caches this prefix so repeated
+    # scoring calls hit cache pricing ($0.014/M instead of $0.14/M = -90%).
     prefs_block = preferences.build_prompt_block()
-    prompt = (
-        f"Tu notes une annonce immobilière pour Illan de 1 à 10 selon SES préférences.\n\n"
+    stable_prefix = (
+        "Tu notes une annonce immobilière pour Illan de 1 à 10 selon SES préférences.\n\n"
         f"{prefs_block}\n\n"
-        f"Règles de notation :\n"
-        f"  • 9-10 = match excellent (zone préférée + plusieurs caractéristiques préférées)\n"
-        f"  • 7-8  = bon match (zone OK + au moins une caractéristique préférée)\n"
-        f"  • 5-6  = correct (rien de bloquant mais rien d'enthousiasmant)\n"
-        f"  • 3-4  = signaux négatifs (zone à éviter, ou caractéristiques manquantes)\n"
-        f"  • 1-2  = mauvais match (zone à éviter ET commute long ET 0 caractéristique préférée)\n\n"
-        f"Annonce à évaluer :\n"
+        "Règles de notation :\n"
+        "  • 9-10 = match excellent (zone préférée + plusieurs caractéristiques préférées)\n"
+        "  • 7-8  = bon match (zone OK + au moins une caractéristique préférée)\n"
+        "  • 5-6  = correct (rien de bloquant mais rien d'enthousiasmant)\n"
+        "  • 3-4  = signaux négatifs (zone à éviter, ou caractéristiques manquantes)\n"
+        "  • 1-2  = mauvais match (zone à éviter ET commute long ET 0 caractéristique préférée)\n\n"
+        "Réponds STRICTEMENT sous cette forme (2 lignes max) :\n"
+        "SCORE: <chiffre 1-10>\n"
+        "RAISON: <une phrase concise mentionnant 2-3 facteurs concrets de l'annonce>"
+    )
+    listing_block = (
+        "\n\nAnnonce à évaluer :\n"
         f"- Titre : {listing.title}\n"
         f"- Type : {getattr(listing, 'housing_type', '') or 'inconnu'}\n"
         f"- Prix : {listing.price}€\n"
         f"- Surface : {getattr(listing, 'surface', '') or '?'}m²\n"
         f"- Localisation : {listing.location}\n"
-        f"- Description : {(listing.description or '')[:400]}\n\n"
-        f"Réponds STRICTEMENT sous cette forme (2 lignes max) :\n"
-        f"SCORE: <chiffre 1-10>\n"
-        f"RAISON: <une phrase concise mentionnant 2-3 facteurs concrets de l'annonce>"
+        f"- Description : {(listing.description or '')[:400]}"
     )
     resp = _call_claude(
         model=config.CLAUDE_MODEL,
-        max_tokens=200,  # bumped from 60 — richer reasoning needs more room
-        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": [
+                # Stable prefix — cache_control hint for Anthropic-compat backends.
+                # DeepSeek's auto-cache also picks up the identical prefix even
+                # without this marker; the marker is belt-and-suspenders.
+                {"type": "text", "text": stable_prefix, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": listing_block},
+            ],
+        }],
     )
     text = _first_text(resp).strip()
     score = 5
