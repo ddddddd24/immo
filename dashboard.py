@@ -19,17 +19,23 @@ _DB = config.DB_PATH
 
 
 SOURCE_EMOJI = {
-    "leboncoin":     "🟠",
-    "seloger":       "🔵",
-    "pap":           "🟢",
-    "bienici":       "🟣",
-    "logicimmo":     "🟡",
-    "studapart":     "🎓",
-    "parisattitude": "🗼",
-    "lodgis":        "🏛",
-    "immojeune":     "🧑‍🎓",
-    "locservice":    "🏠",
-    "roomlala":      "🛏",
+    "leboncoin":         "🟠",
+    "seloger":           "🔵",
+    "pap":               "🟢",
+    "bienici":           "🟣",
+    "logicimmo":         "🟡",
+    "studapart":         "🎓",
+    "parisattitude":     "🗼",
+    "lodgis":            "🏛",
+    "immojeune":         "🧑‍🎓",
+    "locservice":        "🏠",
+    "roomlala":          "🛏",
+    "entreparticuliers": "🤝",
+    "ladresse":          "🏢",
+    "century21":         "21",
+    "wizi":              "🔑",
+    "laforet":           "🌳",
+    "guyhoquet":         "🎩",
 }
 STATUS_COLOR = {
     "sent":      "#3b82f6",
@@ -71,15 +77,47 @@ def _stats() -> dict:
 # ─── /  — listings browser ────────────────────────────────────────────────────
 
 def _render_listings() -> str:
-    listings = _query("""
+    # Filtres adaptés au profil Illan + Iqleema (couple, max 1100€) :
+    #  - prix ≤ 1100€
+    #  - exclure coloc/coliving avec >2 occupants
+    #  - exclure résidence étudiante / chambre / coliving (type)
+    raw_listings = _query("""
         SELECT l.lbc_id, l.source, l.title, l.price, l.surface, l.location,
-               l.url, l.scraped_at, l.score, l.score_reason,
-               l.housing_type, l.roommate_count,
+               l.url, l.scraped_at, l.published_at, l.phone, l.score, l.score_reason,
+               l.housing_type, l.roommate_count, l.available_from,
                (SELECT c.status FROM contacts c WHERE c.listing_id = l.id ORDER BY c.id DESC LIMIT 1) as status
         FROM listings l
-        ORDER BY l.id DESC
-        LIMIT 500
+        WHERE l.price IS NOT NULL AND l.price <= 1100
+          AND l.housing_type NOT IN ('coliving', 'chambre', 'residence')
+          AND (
+            l.housing_type != 'coloc'
+            OR (l.roommate_count IS NOT NULL AND l.roommate_count <= 2)
+          )
+          -- Hide dealbreakers (score=0). NULL = not yet scored, keep visible.
+          AND (l.score IS NULL OR l.score > 0)
+          -- Stale filter: hide listings not seen in last 3 days (probably gone)
+          AND datetime(l.scraped_at) > datetime('now', '-3 days')
+        ORDER BY l.id ASC
+        LIMIT 10000
     """)
+
+    # Cross-site dedup: same (price, surface, zip-or-city) across sites
+    # (LBC + SeLoger + Bien'ici listing the same property) → keep oldest only.
+    import re as _re
+    seen_keys: set = set()
+    listings = []
+    for l in raw_listings:
+        # Fingerprint: (price, surface, zip code OR first 8 chars city)
+        zm = _re.search(r"\b(\d{5})\b", l["location"] or "")
+        zip_or_city = zm.group(1) if zm else (l["location"] or "")[:8].lower()
+        key = (l["price"], l["surface"], zip_or_city) if l["surface"] else None
+        if key and key in seen_keys:
+            continue
+        if key:
+            seen_keys.add(key)
+        listings.append(l)
+    # Reverse to newest-first for display
+    listings = listings[::-1]
     s = _stats()
     sources = sorted({l["source"] for l in listings if l["source"]})
     housing_types = sorted({l["housing_type"] for l in listings if l["housing_type"]})
@@ -103,7 +141,10 @@ def _render_listings() -> str:
             "score": l["score"],
             "score_reason": l["score_reason"] or "",
             "status": l["status"] or "",
-            "scraped": (l["scraped_at"] or "")[:10],
+            "published": ((l["published_at"] or "")[7:17] if (l["published_at"] or "").startswith("scrape:") else (l["published_at"] or "")[:10]),
+            "published_is_scrape": (l["published_at"] or "").startswith("scrape:"),
+            "phone": l["phone"],  # None=unknown, ""=no phone, "#blocked"=site policy, else number
+            "available_from": l["available_from"] or "",  # YYYY-MM, "" if unknown
             "housing_type": ht,
             "housing_display": ht_display,
         })
@@ -121,7 +162,6 @@ def _render_listings() -> str:
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="refresh" content="120">
 <title>🏠 Annonces — Dashboard Immo</title>
 <style>
   * {{ box-sizing: border-box; }}
@@ -162,8 +202,8 @@ def _render_listings() -> str:
 <div class="header">
   <h1>🏠 Annonces — {len(row_data)} en base</h1>
   <div class="nav">
-    <a href="/" class="active">📋 Annonces</a>
-    <a href="/contacts">✉️ Contacts</a>
+    <a href="index.html" class="active">📋 Annonces</a>
+    <a href="contacts.html">✉️ Contacts</a>
   </div>
 </div>
 <div class="content">
@@ -196,7 +236,9 @@ def _render_listings() -> str:
         <th data-sort="surface" class="num">m² <span class="sort-arrow"></span></th>
         <th data-sort="score" class="num">Score <span class="sort-arrow"></span></th>
         <th data-sort="status">Statut <span class="sort-arrow"></span></th>
-        <th data-sort="scraped">Scrapé <span class="sort-arrow"></span></th>
+        <th data-sort="published">Publié <span class="sort-arrow"></span></th>
+        <th data-sort="available_from">🗝 Libre <span class="sort-arrow"></span></th>
+        <th data-sort="phone">📞 <span class="sort-arrow"></span></th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
@@ -208,7 +250,7 @@ def _render_listings() -> str:
   const SOURCE_EMOJI = {json.dumps(SOURCE_EMOJI)};
   const STATUS_COLOR = {json.dumps(STATUS_COLOR)};
 
-  let sortKey = "scraped";
+  let sortKey = "published";
   let sortDir = -1;  // -1 desc, 1 asc
 
   function render() {{
@@ -242,6 +284,15 @@ def _render_listings() -> str:
     document.getElementById('count').textContent = rows.length + ' annonces';
 
     const escape = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    // YYYY-MM-DD → DD/MM/YYYY ; YYYY-MM → MM/YYYY
+    const formatAvail = s => {{
+      if (!s) return '';
+      const m1 = /^(\d{{4}})-(\d{{2}})-(\d{{2}})$/.exec(s);
+      if (m1) return `${{m1[3]}}/${{m1[2]}}/${{m1[1]}}`;
+      const m2 = /^(\d{{4}})-(\d{{2}})$/.exec(s);
+      if (m2) return `${{m2[2]}}/${{m2[1]}}`;
+      return s;
+    }};
 
     const tbody = document.getElementById('tbody');
     tbody.innerHTML = rows.map(r => {{
@@ -266,9 +317,11 @@ def _render_listings() -> str:
         <td class="num">${{surface}}</td>
         <td class="num">${{score}}</td>
         <td>${{statusBadge}}</td>
-        <td style="color:#64748b;font-size:0.75rem">${{escape(r.scraped)}}</td>
+        <td style="color:#64748b;font-size:0.75rem" title="${{r.published_is_scrape ? 'Date de scraping (ce site ne partage pas la date de publication)' : 'Date de publication réelle'}}">${{r.published ? (r.published_is_scrape ? '⏱ ' : '📅 ') + escape(r.published) : ''}}</td>
+        <td style="font-size:0.75rem" title="${{r.available_from ? 'Disponible à partir de ' + escape(formatAvail(r.available_from)) : 'Date de disponibilité non précisée dans l\\'annonce'}}">${{r.available_from ? '🗝 ' + escape(formatAvail(r.available_from)) : '<span style=\"color:#475569\">—</span>'}}</td>
+        <td title="${{r.phone === '#blocked' ? 'Site ne partage pas le téléphone' : (r.phone === '' || r.phone === null ? 'Pas de téléphone dans l\\'annonce' : escape(r.phone))}}">${{r.phone === '#blocked' ? '🚫' : (r.phone === '' || r.phone === null ? '⚪' : '📞 ' + escape(r.phone))}}</td>
       </tr>`;
-    }}).join('') || '<tr><td colspan="9" class="empty">Aucune annonce ne matche les filtres.</td></tr>';
+    }}).join('') || '<tr><td colspan="11" class="empty">Aucune annonce ne matche les filtres.</td></tr>';
 
     document.querySelectorAll('th').forEach(th => {{
       th.classList.remove('asc', 'desc');
@@ -335,7 +388,6 @@ def _render_contacts() -> str:
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="refresh" content="60">
 <title>✉️ Contacts — Dashboard Immo</title>
 <style>
   body {{ font-family: -apple-system, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }}
@@ -362,8 +414,8 @@ def _render_contacts() -> str:
 <div class="header">
   <h1>✉️ Contacts ({len(contacts)})</h1>
   <div class="nav">
-    <a href="/">📋 Annonces</a>
-    <a href="/contacts" class="active">✉️ Contacts</a>
+    <a href="index.html">📋 Annonces</a>
+    <a href="contacts.html" class="active">✉️ Contacts</a>
   </div>
 </div>
 <div class="content">
@@ -391,9 +443,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if path in ("/", "/dashboard"):
+        if path in ("/", "/dashboard", "/index.html"):
             self._send_html(_render_listings())
-        elif path == "/contacts":
+        elif path in ("/contacts", "/contacts.html"):
             self._send_html(_render_contacts())
         elif path == "/api/stats":
             self._send_json(_stats())

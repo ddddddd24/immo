@@ -99,17 +99,17 @@ DEFAULT_SEARCH_BIENICI_URL: str = os.getenv(
     "?prix-max=1000&surface-min=25&meuble=true",
 )
 
-# Default Logic-Immo search URL (Paris IDF, meublé, 25m²+, max 1000€)
-# ⚠️ Copy the URL from your browser after filtering on logic-immo.com with your criteria
+# Default Logic-Immo search URL (Paris, max 1100€).
+# Re-enabled 2026-05-03: scraper now uses Camoufox + the React testid scheme
+# (data-base attribute holds the URL-encoded detail URL). The classified-search
+# endpoint with Aviv geo id (AD08FR31096 = Paris) returns ~25 listings.
 DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
     "LOGICIMMO_SEARCH_URL",
-    # Disabled 2026-05-03: Logic-Immo migrated to a CSS-in-JS React app where
-    # listing cards have NO <a href> — clicks are handled in JS. We can't
-    # extract a clickable URL per listing without running their JS. Even the
-    # 27 data-testid attributes per card don't expose the listing ID.
-    # Listings would land in DB with the search-results URL → useless for the
-    # user. Re-enable manually if Logic-Immo restores anchor-based URLs.
-    "",
+    "https://www.logic-immo.com/classified-search"
+    "?distributionTypes=Rent"
+    "&estateTypes=House,Apartment"
+    "&locations=AD08FR31096"
+    "&priceMax=1100",
 )
 
 # ── Phase 2: student / young-pro platforms ────────────────────────────────────
@@ -149,6 +149,46 @@ DEFAULT_SEARCH_LOCSERVICE_URL: str = os.getenv(
     "https://www.locservice.fr/paris-75/location-appartement.html",
 )
 
+# EntreParticuliers — particulier-à-particulier. 12 listings per arrondissement
+# page, the scraper iterates Paris 75001-75020 in parallel.
+DEFAULT_SEARCH_ENTREPARTICULIERS_URL: str = os.getenv(
+    "ENTREPARTICULIERS_SEARCH_URL",
+    "https://www.entreparticuliers.com/annonces-immobilieres/appartement/location/paris-75",
+)
+
+# L'Adresse (agency network) — 40 listings/page on IDF search.
+DEFAULT_SEARCH_LADRESSE_URL: str = os.getenv(
+    "LADRESSE_SEARCH_URL",
+    "https://www.ladresse.com/recherche/location/appartement/ile-de-france",
+)
+
+# Century 21 (agency network) — paginates 9 pages on Paris search.
+DEFAULT_SEARCH_CENTURY21_URL: str = os.getenv(
+    "CENTURY21_SEARCH_URL",
+    "https://www.century21.fr/annonces/f/location/v-paris/",
+)
+
+# Wizi.io — managed-rental aggregator. Public API at app.wizi.eu/api/public,
+# small inventory (~15-30 listings Paris).
+DEFAULT_SEARCH_WIZI_URL: str = os.getenv(
+    "WIZI_SEARCH_URL",
+    "https://desk.wizi.eu/#/app/search?city=Paris&lat=48.856614&long=2.3522219",
+)
+
+# Laforêt (agency network) — server-rendered, GTM data attrs embedded.
+DEFAULT_SEARCH_LAFORET_URL: str = os.getenv(
+    "LAFORET_SEARCH_URL",
+    "https://www.laforet.com/ville/location-appartement-paris-75000",
+)
+
+# Guy Hoquet (agency network) — XHR endpoint with Laravel session filters.
+# Search URL is just the parent page; the scraper hits /biens/result with
+# the city slug paris-75056_c4 and price_max parsed from priceMax query.
+DEFAULT_SEARCH_GUYHOQUET_URL: str = os.getenv(
+    "GUYHOQUET_SEARCH_URL",
+    "https://www.guy-hoquet.com/annonces/location/paris/?priceMax=1100",
+)
+
 # Roomlala disabled — site redirects geo-aware and 404s on every URL pattern
 # tried with Camoufox; site may be restructured or geo-blocked. Set the env
 # var manually if you find a working URL.
@@ -175,3 +215,10 @@ GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv(
     "GOOGLE_SERVICE_ACCOUNT_JSON", "data/google_service_account.json"
 )
 SYNC_AFTER_CAMPAIGN: bool = os.getenv("SYNC_AFTER_CAMPAIGN", "true").lower() in ("true", "1", "yes")
+
+# ── Contact-message preparation ───────────────────────────────────────────────
+# When false, /campagne stops after scoring and persisting; no per-listing
+# DeepSeek call to generate a contact message. Saves ~3s + $0.0002 per
+# eligible listing. Set ENABLE_CONTACT_PREP=false in .env to disable while
+# keeping default true here for tests + dispatcher safety.
+ENABLE_CONTACT_PREP: bool = os.getenv("ENABLE_CONTACT_PREP", "true").lower() in ("true", "1", "yes")

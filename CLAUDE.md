@@ -40,6 +40,8 @@
   - What was done
   - What's left to do
   - Any important decisions made
+  - Then run: git add . && git commit -m "session summary" && git push
+
 
 ---
 

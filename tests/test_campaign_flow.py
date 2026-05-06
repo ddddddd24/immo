@@ -49,6 +49,10 @@ def campaign_env(tmp_db, monkeypatch, make_listing):
     main._HISTORY.clear()
     main._TURN_REPLIES.clear()
 
+    # Tests assume contact prep is enabled (the .env has it disabled in user
+    # production for cost reasons, but tests cover that path).
+    monkeypatch.setattr(main.config, "ENABLE_CONTACT_PREP", True)
+
     # Default scrape result: empty list. Tests override via env["listings"]
     env: dict = {"listings": []}
 
@@ -197,7 +201,11 @@ def test_campaign_with_scoring_skips_low_score(
     async def fake_score(listing):
         return {"score": 3, "reason": "trop loin du métro"}
 
+    async def fake_score_batch(listings, batch_size=5):
+        return [{"score": 3, "reason": "trop loin du métro"} for _ in listings]
+
     monkeypatch.setattr(main, "score_listing", fake_score)
+    monkeypatch.setattr(main, "score_listings_batch", fake_score_batch)
 
     campaign_env["listings"] = [make_listing(lbc_id="lo1", price=850)]
     update = _FakeUpdate()

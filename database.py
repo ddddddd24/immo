@@ -109,6 +109,18 @@ def init_db() -> None:
         if "roommate_count" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN roommate_count INTEGER")
             logger.info("Migrated listings table: added roommate_count column")
+        if "published_at" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN published_at TEXT")
+            logger.info("Migrated listings table: added published_at column (date listing was posted on the source site)")
+        if "phone" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN phone TEXT")
+            logger.info("Migrated listings table: added phone column (#blocked=site policy, ''=listing has none, ...=number)")
+        if "available_from" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN available_from TEXT")
+            logger.info("Migrated listings table: added available_from column (YYYY-MM date listing becomes available)")
+        if "description" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN description TEXT")
+            logger.info("Migrated listings table: added description column (used by /score_all to backfill LLM extraction)")
 
     logger.info("Database initialised at %s", config.DB_PATH)
 
@@ -158,6 +170,7 @@ def upsert_listing(
     surface: Optional[int] = None,
     housing_type: str = "",
     roommate_count: Optional[int] = None,
+    published_at: Optional[str] = None,
 ) -> int:
     """Insert listing or update in place. Tracks downward price changes. Returns row id.
 
@@ -176,9 +189,10 @@ def upsert_listing(
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO listings
-               (lbc_id, source, title, price, location, seller_name, seller_type, url, scraped_at, surface, housing_type, roommate_count)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               (lbc_id, source, title, price, location, seller_name, seller_type, url, scraped_at, surface, housing_type, roommate_count, published_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(lbc_id) DO UPDATE SET
+                 source         = excluded.source,
                  title          = excluded.title,
                  location       = excluded.location,
                  seller_name    = excluded.seller_name,
@@ -187,6 +201,7 @@ def upsert_listing(
                  surface        = COALESCE(excluded.surface, listings.surface),
                  housing_type   = COALESCE(NULLIF(excluded.housing_type, ''), listings.housing_type),
                  roommate_count = COALESCE(excluded.roommate_count, listings.roommate_count),
+                 published_at   = COALESCE(excluded.published_at, listings.published_at),
                  price_prev  = CASE
                      WHEN excluded.price IS NOT NULL
                           AND listings.price IS NOT NULL
@@ -203,9 +218,71 @@ def upsert_listing(
                  END
                RETURNING id""",
             (lbc_id, source, title, price, location, seller_name, seller_type, url,
-             datetime.utcnow().isoformat(), surface, housing_type or "", roommate_count),
+             datetime.utcnow().isoformat(), surface, housing_type or "", roommate_count, published_at),
         )
         return cur.fetchone()[0]
+
+
+def upsert_listings_batch(rows: list) -> int:
+    """Bulk upsert. `rows` is a list of dicts with the same keys as
+    upsert_listing kwargs. Wraps N upserts in a single transaction —
+    ~50× faster than calling upsert_listing in a loop for large batches.
+    Skips mock listings silently. Returns number of rows persisted.
+    """
+    if not rows:
+        return 0
+    payload = []
+    now = datetime.utcnow().isoformat()
+    for r in rows:
+        if _is_mock_listing(r["lbc_id"], r.get("url", "")):
+            continue
+        payload.append((
+            r["lbc_id"], r.get("source", "leboncoin"), r.get("title", ""),
+            r.get("price"), r.get("location", ""), r.get("seller_name", ""),
+            r.get("seller_type", ""), r.get("url", ""), now,
+            r.get("surface"), r.get("housing_type") or "", r.get("roommate_count"),
+            r.get("published_at"), r.get("phone"),
+            (r.get("description") or "")[:1000],  # truncate to avoid DB bloat
+            r.get("available_from"),
+        ))
+    if not payload:
+        return 0
+    with _conn() as conn:
+        conn.executemany(
+            """INSERT INTO listings
+               (lbc_id, source, title, price, location, seller_name, seller_type, url, scraped_at, surface, housing_type, roommate_count, published_at, phone, description, available_from)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(lbc_id) DO UPDATE SET
+                 source         = excluded.source,
+                 title          = excluded.title,
+                 location       = excluded.location,
+                 seller_name    = excluded.seller_name,
+                 seller_type    = excluded.seller_type,
+                 url            = excluded.url,
+                 surface        = COALESCE(excluded.surface, listings.surface),
+                 housing_type   = COALESCE(NULLIF(excluded.housing_type, ''), listings.housing_type),
+                 roommate_count = COALESCE(excluded.roommate_count, listings.roommate_count),
+                 published_at   = COALESCE(excluded.published_at, listings.published_at),
+                 phone          = COALESCE(excluded.phone, listings.phone),
+                 description    = COALESCE(NULLIF(excluded.description, ''), listings.description),
+                 available_from = COALESCE(excluded.available_from, listings.available_from),
+                 price_prev     = CASE
+                     WHEN excluded.price IS NOT NULL
+                          AND listings.price IS NOT NULL
+                          AND excluded.price < listings.price
+                     THEN listings.price
+                     ELSE listings.price_prev
+                 END,
+                 price          = CASE
+                     WHEN excluded.price IS NOT NULL
+                          AND listings.price IS NOT NULL
+                          AND excluded.price < listings.price
+                     THEN excluded.price
+                     ELSE listings.price
+                 END""",
+            payload,
+        )
+    return len(payload)
 
 
 def already_contacted(lbc_id: str) -> bool:
@@ -338,21 +415,38 @@ def get_listing_by_lbc_id(lbc_id: str) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
-def set_listing_score(lbc_id: str, score: int, reason: str) -> None:
-    """Record Claude's score (1–10) and short reason for a listing."""
+def set_listing_score(lbc_id: str, score: int, reason: str,
+                      available_from: Optional[str] = None) -> None:
+    """Record Claude's score (1–10), short reason, and optional availability date.
+
+    `available_from` is the LLM-extracted YYYY-MM date when the listing
+    becomes free (None if not mentioned). COALESCE preserves any prior
+    non-null value to avoid clobbering structured-source data with a
+    later silent LLM pass.
+    """
     with _conn() as conn:
         conn.execute(
-            "UPDATE listings SET score = ?, score_reason = ? WHERE lbc_id = ?",
-            (score, reason, lbc_id),
+            """UPDATE listings
+               SET score = ?,
+                   score_reason = ?,
+                   available_from = COALESCE(?, available_from)
+               WHERE lbc_id = ?""",
+            (score, reason, available_from, lbc_id),
         )
 
 
 def get_unscored_listings(limit: Optional[int] = None) -> list[dict]:
-    """Return listings whose score is NULL — for the backfill / score_all flow."""
+    """Return listings needing LLM extraction — either no score, or scored but
+    missing available_from AND have a stored description (so re-running the
+    LLM can actually extract the date). Used by the /score_all backfill flow.
+    """
     sql = """SELECT lbc_id, source, title, price, location, url, surface,
-                    housing_type, roommate_count
+                    housing_type, roommate_count, description
              FROM listings
              WHERE score IS NULL
+                OR (available_from IS NULL
+                    AND description IS NOT NULL
+                    AND description != '')
              ORDER BY id DESC"""
     if limit is not None:
         sql += " LIMIT ?"

@@ -4,7 +4,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import config
 from profile import PROFILE, PARTICULIER_CONTEXT, AGENCE_CONTEXT
@@ -95,6 +95,9 @@ class Listing:
     surface: int | None = None        # square meters (m²), parsed from title/description
     housing_type: str = ""            # 'studio'|'T1'..'T5+'|'coloc'|'residence'|'coliving'|'chambre'
     roommate_count: int | None = None # only set for coloc/coliving when count is parseable
+    published_at: str | None = None   # ISO-8601 date when listing was first posted on source site
+    phone: str | None = None          # phone number, or "#blocked" if site policy hides it, or "" if listing has none
+    available_from: str | None = None # YYYY-MM availability date extracted by LLM (None if not mentioned)
 
 
 @dataclass
@@ -312,6 +315,224 @@ async def score_listing(listing: Listing) -> dict:
             reason = line.split(":", 1)[-1].strip()
     score = max(1, min(score, 10))  # clamp into [1, 10]
     return {"score": score, "reason": reason}
+
+
+async def score_listings_batch(listings: list[Listing], batch_size: int = 5) -> list[dict]:
+    """Score listings using v2 algo: 4 sub-scores (price/value, zone, commute,
+    features) combined into 0-10 final, plus hard dealbreakers (price>1050€,
+    critical zones, étage>3 sans ascenseur, dispo après sept 2026).
+
+    Hybrid: price/value + zone match + zip-based commute computed by rules
+    (free, deterministic). LLM extracts floor/elevator/available date/features
+    from description in a single batched call.
+
+    Returns list[{score, reason}] in input order. Reason includes subscore
+    breakdown for debugging.
+    """
+    if config.MOCK_MODE or not config.ENABLE_SCORING:
+        return [{"score": 7, "reason": "mock score"} for _ in listings]
+
+    import preferences
+    import json as _json
+    import datetime as _dt
+
+    results: list[Optional[dict]] = [None] * len(listings)
+
+    def _zero(idx: int, reason: str) -> None:
+        results[idx] = {"score": 0, "reason": f"❌ {reason}"}
+
+    # ── Phase 1: Rule-based pre-filter (no LLM) ─────────────────────────────
+    pending: list[tuple[int, Listing]] = []
+    for i, lst in enumerate(listings):
+        # Hard price cap
+        if lst.price is not None and lst.price > preferences.HARD_PRICE_CAP:
+            _zero(i, f"prix {lst.price}€ > {preferences.HARD_PRICE_CAP}€")
+            continue
+        # Original dealbreakers (housing_type, roommate_count, keywords)
+        blocked, reason = preferences.is_dealbreaker(
+            housing_type=getattr(lst, "housing_type", ""),
+            roommate_count=getattr(lst, "roommate_count", None),
+            title=lst.title or "",
+            description=(lst.description or "")[:500],
+        )
+        if blocked:
+            _zero(i, reason)
+            continue
+        # Critical avoid zones
+        crit, kw = preferences.is_critical_zone(
+            location=lst.location or "",
+            title=lst.title or "",
+            description=(lst.description or "")[:500],
+        )
+        if crit:
+            _zero(i, f"zone critique: {kw}")
+            continue
+        pending.append((i, lst))
+
+    if not pending:
+        return [r or {"score": 5, "reason": ""} for r in results]
+
+    # ── Phase 2: LLM batch — extract floor/lift/available_date/features/commute ──
+    today_str = _dt.date.today().strftime("%Y-%m-%d")
+    stable_prefix = (
+        f"Tu analyses des annonces immo pour Illan (couple, emménagement cible "
+        f"sept 2026, travail à Saint-Denis). Aujourd'hui : {today_str}.\n"
+        "Extrais en JSON STRICT pour chaque annonce.\n"
+        "Pour 'features', utilise UNIQUEMENT : balcon, terrasse, lave-linge, lumineux, "
+        "rénové, calme, ascenseur, proche métro, cuisine équipée, meublé, fibre.\n"
+        "Pour 'commute_min' : minutes vers Saint-Denis en transports publics (estimation honnête).\n"
+        "\n"
+        "Pour 'available' (date à laquelle l'appartement devient libre) :\n"
+        "  Format : YYYY-MM-DD si le jour est mentionné, sinon YYYY-MM.\n"
+        "Réfléchis comme un agent immo qui relit l'annonce ligne par ligne. La date "
+        "n'est pas toujours formulée \"libre le XX\" — elle peut être DÉDUITE :\n"
+        "  • \"Le locataire actuel part fin août\" → l'appart est libre dès septembre.\n"
+        "  • \"Bail en cours jusqu'au 30/06/2026\" → libre 2026-07.\n"
+        "  • \"Préavis de 3 mois déposé le 1er mai\" → libre 2026-08.\n"
+        "  • \"Rentrée 2026\" / \"pour l'année universitaire 2026-2027\" → 2026-09.\n"
+        "  • \"À partir de l'été\" sans année + on est en mai 2026 → 2026-07.\n"
+        "  • \"libre de suite\" + annonce active → mois en cours.\n"
+        "Pour les mois sans année explicite : choisis la PROCHAINE occurrence ≥ aujourd'hui "
+        "(\"avril\" en 2026-05 = 2027-04, pas 2026-04).\n"
+        "À NE PAS confondre avec la dispo : date d'ouverture d'une résidence neuve, "
+        "date de rénovation/construction, date de fin de bail SANS info sur la suite, "
+        "date de mise en ligne de l'annonce, date de visite.\n"
+        "Si l'annonce ne donne aucun signal direct ou indirect sur la dispo → null. "
+        "Mieux vaut null qu'une devinette.\n"
+        f"Contrainte dure : jamais de date avant {today_str}.\n"
+        "Pour 'floor' : numéro étage entier (null si non précisé). RDC = 0.\n"
+        "Pour 'elevator' : true/false (null si non précisé).\n"
+        "Pour 'apl_eligible' : true SI explicitement éligible (APL/ALS/aides), "
+        "false SI explicitement NON-éligible (\"non éligible aux aides\", \"hors APL\", "
+        "\"pas d'APL\", \"non conventionné\"), null SI silencieux.\n"
+        "Pour 'unfurnished' : true SI explicitement non-meublé/loué vide, false SI meublé, "
+        "null SI silencieux.\n"
+        "Format réponse :\n"
+        '{"items":[{"i":0,"floor":null|N,"elevator":null|true|false,'
+        '"available":null|"YYYY-MM","apl_eligible":null|true|false,'
+        '"unfurnished":null|true|false,'
+        '"commute_min":N,"features":["..."],"summary":"..."}]}'
+    )
+
+    async def _llm_batch(batch: list[tuple[int, Listing]]) -> dict:
+        rows = []
+        for idx, lst in batch:
+            rows.append(
+                f"i={idx}: Titre={(lst.title or '')[:100]}; "
+                f"Prix={lst.price}€; Surface={getattr(lst, 'surface', None) or '?'}m²; "
+                f"Loc={(lst.location or '')[:60]}; "
+                f"Desc={(lst.description or '')[:1500]}"
+            )
+        try:
+            # asyncio.to_thread → DeepSeek client is sync; without this the
+            # event loop blocks per call and asyncio.gather serialises batches.
+            resp = await asyncio.to_thread(
+                _call_claude,
+                model=config.CLAUDE_MODEL,
+                max_tokens=300 * len(batch),
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": stable_prefix, "cache_control": {"type": "ephemeral"}},
+                        {"type": "text", "text": "Annonces:\n" + "\n".join(rows)},
+                    ],
+                }],
+            )
+            text = _first_text(resp).strip()
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE)
+            data = _json.loads(text)
+            return {item["i"]: item for item in data.get("items", []) if "i" in item}
+        except Exception as exc:
+            logger.warning("LLM batch extract failed: %s", exc)
+            return {}
+
+    # Process batches in parallel (each = 1 LLM call for ~batch_size listings)
+    batches = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
+    llm_outputs = await asyncio.gather(*(_llm_batch(b) for b in batches))
+    llm_data: dict = {}
+    for d in llm_outputs:
+        llm_data.update(d)
+
+    # ── Phase 3: Combine rules + LLM data → final score ─────────────────────
+    move_in_latest = preferences.MOVE_IN_DATE_LATEST.strftime("%Y-%m")
+    # Discard any extracted date earlier than this — LLM hallucinations
+    # ("fin avril" → 2025-04, "ouverture résidence 2025" etc.). One-month
+    # grace before today to allow listings genuinely available now.
+    today = _dt.date.today()
+    earliest_avail = (today.replace(day=1) - _dt.timedelta(days=1)).strftime("%Y-%m")
+    for idx, lst in pending:
+        item = llm_data.get(idx, {}) or {}
+
+        # Capture availability for ALL listings (even dealbroken ones) so the
+        # dashboard can show "Libre" across the full table, not just scored rows.
+        # Accept both YYYY-MM (10 chars) and YYYY-MM-DD (10 chars) formats.
+        avail = item.get("available")
+        avail_str = None
+        if isinstance(avail, str):
+            if len(avail) >= 10 and avail[4] == '-' and avail[7] == '-':
+                avail_str = avail[:10]  # YYYY-MM-DD
+            elif len(avail) >= 7 and avail[4] == '-':
+                avail_str = avail[:7]   # YYYY-MM
+        # Drop past-dated extractions — almost always year hallucinations.
+        if avail_str and avail_str[:7] < earliest_avail:
+            avail_str = None
+        lst.available_from = avail_str
+
+        # Late availability dealbreaker
+        if avail_str is not None and avail_str[:7] > move_in_latest:
+            _zero(idx, f"dispo {avail_str} > sept 2026")
+            results[idx]["available_from"] = avail_str
+            continue
+
+        # Étage > 3 sans ascenseur dealbreaker
+        floor = item.get("floor")
+        elev = item.get("elevator")
+        if isinstance(floor, int) and floor > 3 and elev is False:
+            _zero(idx, f"étage {floor} sans ascenseur")
+            continue
+
+        # APL/aides eligibility dealbreaker — only if explicitly NOT eligible
+        if item.get("apl_eligible") is False:
+            _zero(idx, "non éligible aux aides (APL/ALS)")
+            continue
+
+        # Unfurnished dealbreaker — only if explicitly non-meublé
+        if item.get("unfurnished") is True:
+            _zero(idx, "non meublé (loué vide)")
+            continue
+
+        # Sub-scores
+        pv = preferences.price_value_score(lst.price, getattr(lst, "surface", None))
+        zs, zone_label = preferences.zone_match_score(lst.location or "")
+        cs, mins_known = preferences.commute_score_from_zip(lst.location or "")
+        if mins_known is None:
+            llm_min = item.get("commute_min")
+            if isinstance(llm_min, (int, float)) and 0 < llm_min < 200:
+                cs, mins_known = (
+                    (10.0 if llm_min < 30 else
+                     8.5 if llm_min < 40 else
+                     7.0 if llm_min < 50 else
+                     5.0 if llm_min < 60 else
+                     3.5 if llm_min < 70 else
+                     1.5),
+                    int(llm_min),
+                )
+        fs = preferences.features_score_from_list(item.get("features") or [])
+
+        final = preferences.combine_subscores(pv, zs, cs, fs)
+        commute_str = f"{mins_known}min" if mins_known else "?"
+        summary = (item.get("summary") or "")[:80].strip()
+        results[idx] = {
+            "score": final,
+            "reason": (
+                f"PV={pv:.1f} Z={zs:.1f}({zone_label[:18]}) "
+                f"C={cs:.1f}({commute_str}) F={fs:.1f}"
+                + (f" — {summary}" if summary else "")
+            ),
+            "available_from": avail_str,
+        }
+
+    return [r or {"score": 5, "reason": "score manquant"} for r in results]
 
 
 # ─── Photo analysis (optional, ENABLE_PHOTO_ANALYSIS=true) ───────────────────

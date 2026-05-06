@@ -179,7 +179,6 @@ def detect_housing_type(title: str, description: str = "") -> tuple[str, Optiona
         return "coliving", _to_int_safe(m.group(1)) if m else None
 
     if _re.search(r"\bcoloc(?:ation|ataire)?", blob):
-        # Try to extract roommate count: 'coloc 4 chambres', 'colocation à 3', '4 colocataires'
         for pat in (
             r"coloc\w*\s+(?:à|de|à\s+\d+|pour)?\s*(\d+)\s*(?:chambres?|pers|colocataires?)",
             r"(\d+)\s*colocataires?",
@@ -193,9 +192,26 @@ def detect_housing_type(title: str, description: str = "") -> tuple[str, Optiona
                     return "coloc", n
         return "coloc", None
 
+    # Per-person pricing OR explicit X-person occupancy = coloc disguised
+    # Patterns: "700 / pers", "700€/pers", "par personne", "pour 3 personnes",
+    # "X chambres pour X personnes" (where X > 1)
+    if _re.search(r"/\s*pers\b|par\s+personne|/\s*personne", blob):
+        # Try to extract the # of persons
+        m = _re.search(r"(\d+)\s*(?:chambres?|personnes?|colocataires?)", blob)
+        n = _to_int_safe(m.group(1)) if m else None
+        return "coloc", n if (n and 2 <= n <= 10) else None
+    if _re.search(r"(?:pour|à|de|avec)\s+(\d+)\s+personnes?\b", blob):
+        m = _re.search(r"(?:pour|à|de|avec)\s+(\d+)\s+personnes?\b", blob)
+        n = _to_int_safe(m.group(1)) if m else None
+        if n and n > 2:  # 1-2 personnes = couple, OK
+            return "coloc", n
+
     if _re.search(r"r[ée]sidence\s+(?:[ée]tudiante|jeune|service)", blob):
         return "residence", None
 
+    # Chambre — anywhere in first 30 chars of title (more permissive than before)
+    if _re.search(r"^\s*chambre\b", title.lower()):
+        return "chambre", None
     if _re.search(r"\bchambre\s+(?:à\s+lou|chez|libre|dispo|meubl|priv)", blob):
         return "chambre", None
 
@@ -276,21 +292,40 @@ def _ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
     if not url:
         url = f"https://www.leboncoin.fr/ad/locations/{lbc_id}"
 
-    # Price + Surface — both live in the attributes array. Walk it once.
+    # Price + Surface + dealbreaker fields — all in attributes array.
     price_raw = None
     surface = None
+    floor = None
+    elevator = None
+    furnished = None
+    heating_type = None
+    charges_included = None
     for attr in _ensure_list(ad.get("attributes")):
         if not isinstance(attr, dict):
             continue
         key = attr.get("key")
+        values = attr.get("values")
+        first_val = values[0] if isinstance(values, list) and values else None
+        v = attr.get("value") or first_val
         if key == "price" and price_raw is None:
-            values = attr.get("values")
-            first_val = values[0] if isinstance(values, list) and values else None
             price_raw = attr.get("value_label") or first_val
         elif key in ("square", "surface") and surface is None:
-            values = attr.get("values")
-            first_val = values[0] if isinstance(values, list) and values else None
             surface = _to_int_safe(first_val or attr.get("value_label"))
+        elif key == "floor_number":
+            floor = _to_int_safe(v)
+        elif key == "elevator":
+            elevator = (str(v) == "1")
+        elif key == "furnished":
+            furnished = (str(v) in ("1", "furnished", "meublé", "true"))
+        elif key == "heating_type":
+            heating_type = str(v) if v else None
+        elif key == "charges_included":
+            charges_included = (str(v) == "1")
+    # Apply dealbreakers
+    if furnished is False:
+        return None  # explicitly non-meublé
+    if isinstance(floor, int) and floor > 3 and elevator is False:
+        return None  # étage>3 sans ascenseur
     if price_raw is None:
         p = ad.get("price")
         if isinstance(p, list):
@@ -326,10 +361,27 @@ def _ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
         if u:
             images.append(u)
 
+    # Append structured tags to description so the scoring LLM picks up
+    # floor / elevator / furnished / heating without having to re-parse.
+    description = ad.get("body") or ""
+    tags = []
+    if floor is not None: tags.append(f"[ÉTAGE: {floor}]")
+    if elevator is True: tags.append("[ASCENSEUR: oui]")
+    elif elevator is False: tags.append("[ASCENSEUR: non]")
+    if furnished is True: tags.append("[MEUBLÉ: oui]")
+    if heating_type: tags.append(f"[CHAUFFAGE: {heating_type}]")
+    if charges_included is True: tags.append("[CHARGES: comprises]")
+    elif charges_included is False: tags.append("[CHARGES: en sus]")
+    if tags:
+        description = (description + "\n" + " ".join(tags)).strip()
+
+    # Publication date: LBC's `first_publication_date` (ISO 8601 timestamp)
+    pub_at = ad.get("first_publication_date") or ad.get("index_date")
+
     return Listing(
         lbc_id=lbc_id,
         title=ad.get("subject") or ad.get("title") or "",
-        description=ad.get("body") or "",
+        description=description,
         price=_parse_price(price_raw),
         location=location,
         seller_name=seller_name,
@@ -337,6 +389,7 @@ def _ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
         seller_type_hint=seller_type_hint,
         images=images,
         surface=surface,
+        published_at=pub_at if isinstance(pub_at, str) else None,
     )
 
 
@@ -361,17 +414,78 @@ def _item_to_listing(item: dict) -> Optional[Listing]:
 
 # ─── SeLoger listing normalisation ───────────────────────────────────────────
 
+def _seloger_extract_price(ad: dict) -> Optional[int]:
+    """Extract the monthly rent from a SeLoger ad. The default `hardFacts.price.value`
+    sometimes shows charges-only (e.g. 200€) for coloc-style listings; fall back to
+    the formatted strings that include /mois or the monthlyRent field if available."""
+    hf = ad.get("hardFacts") or {}
+    pd = hf.get("price") or {}
+    # Try multiple sources in order of reliability
+    candidates = [
+        ad.get("monthlyRent"),
+        ad.get("rent"),
+        pd.get("value"),
+        pd.get("formatted"),
+        pd.get("ariaLabel"),
+    ]
+    for c in candidates:
+        p = _parse_price(c)
+        if p and 200 <= p <= 50000:
+            return p
+    return None
+
+
+def _seloger_walk_facts(ad: dict) -> dict:
+    """Walk a SeLoger ad dict recursively and pull all {type, value} pairs
+    into a flat lookup. Useful for extracting numberOfFloors, availability,
+    livingSpace etc. without depending on path."""
+    out: dict = {}
+    def _walk(o):
+        if isinstance(o, dict):
+            t = o.get("type")
+            v = o.get("value")
+            if isinstance(t, str) and v is not None and t not in out:
+                out[t] = v
+            for vv in o.values():
+                _walk(vv)
+        elif isinstance(o, list):
+            for vv in o:
+                _walk(vv)
+    _walk(ad)
+    return out
+
+
 def _seloger_ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
     """Convert a SeLoger classifiedsData entry to a Listing.
+
+    Applies dealbreakers from search-API data:
+      - availability after Sept 2026 → return None
+      - floor > 3 (no elevator info available here, would need detail page)
 
     Structure (from classifiedsData in pageProps):
       id, url, location.address.{city, zipCode}, hardFacts.price.value,
       hardFacts.{title, keyfacts}, cardProvider.title (seller name),
-      legacyTracking.id (numeric legacy id)
+      legacyTracking.id (numeric legacy id), and nested {type, value}
+      items for numberOfFloors / availability / livingSpace.
     """
     sl_id = str(ad.get("id") or ad.get("classifiedId") or "")
     if not sl_id:
         return None
+
+    # Pull facts (numberOfFloors, availability, etc.)
+    facts = _seloger_walk_facts(ad)
+
+    # Availability: parse "dès le DD/MM/YYYY" or "à partir du …".
+    # > 2026-09 = dealbreaker. Otherwise persist as available_from (YYYY-MM-DD).
+    avail_raw = facts.get("availability", "")
+    avail_from = None
+    if isinstance(avail_raw, str):
+        m = _re.search(r"(\d{2})/(\d{2})/(\d{4})", avail_raw)
+        if m:
+            yyyy_mm_dd = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+            if yyyy_mm_dd[:7] > "2026-09":
+                return None  # available too late
+            avail_from = yyyy_mm_dd
 
     # Prefix to avoid ID collision with LBC IDs in the DB
     listing_id = f"sl_{sl_id}"
@@ -403,13 +517,28 @@ def _seloger_ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
     # Surface: extract from keyfacts (entries like '37 m²')
     surface = None
     for kf in keyfacts if isinstance(keyfacts, list) else []:
-        m = _re.search(r"(\d+)\s*m²", str(kf))
+        m = _re.search(r"(\d+)(?:[,.]\d+)?\s*m²", str(kf))
         if m:
             surface = _to_int_safe(m.group(1))
             break
 
-    # Description: not available in search results (only on listing detail page)
+    # Description: not available in search results (only on listing detail page).
+    # We append structured tags from the search-API facts so the scoring LLM
+    # picks up floor / availability without an extra detail-page fetch.
     description = ad.get("description") or ad.get("descriptif") or ""
+    tags = []
+    floors_raw = facts.get("numberOfFloors", "")
+    if isinstance(floors_raw, str) and floors_raw:
+        if floors_raw.upper().startswith("RDC"):
+            tags.append("[ÉTAGE: RDC]")
+        else:
+            fm = _re.search(r"(\d+)", floors_raw)
+            if fm:
+                tags.append(f"[ÉTAGE: {fm.group(1)}]")
+    if isinstance(avail_raw, str) and avail_raw:
+        tags.append(f"[DISPO: {avail_raw}]")
+    if tags:
+        description = (description + "\n" + " ".join(tags)).strip()
 
     # Extract photo URLs from gallery.images[].url
     gallery = ad.get("gallery") or {}
@@ -419,11 +548,22 @@ def _seloger_ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
         if img.get("url")
     ]
 
+    parsed_price = _parse_price(price_raw)
+    if parsed_price and surface and parsed_price / surface < 10:
+        logger.warning(
+            "[SELOGER] %s: anomalous price %d€/%dm² (%.1f€/m²) — likely per-room",
+            listing_id, parsed_price, surface, parsed_price / surface,
+        )
+        parsed_price = None
+
+    # Publication date from metadata.creationDate (when listing first posted)
+    pub_at = _dig(ad, "metadata", "creationDate") or _dig(ad, "metadata", "updateDate")
+
     return Listing(
         lbc_id=listing_id,
         title=title,
         description=description,
-        price=_parse_price(price_raw),
+        price=parsed_price,
         location=location,
         seller_name=seller_name,
         url=url,
@@ -431,52 +571,101 @@ def _seloger_ad_to_listing(ad: dict, url: str = "") -> Optional[Listing]:
         source="seloger",
         images=images,
         surface=surface,
+        published_at=pub_at if isinstance(pub_at, str) else None,
+        available_from=avail_from,
     )
 
 
 # ─── Playwright scrapers (free) ───────────────────────────────────────────────
 
 async def _search_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """LBC scraper — paginates via &page=N. The first page warms the
+    DataDome challenge (~30s); subsequent pages reuse the persistent profile
+    and load in 5-10s each. Cap at 5 pages × ~25 listings = ~125 max."""
     logger.info("[PLAYWRIGHT] Scraping search page: %s", search_url)
-    data = await _pw_get_next_data(search_url)
-    if not data:
-        raise RuntimeError(
-            "Playwright could not fetch search page — DataDome blocked or page structure changed"
-        )
 
-    props = _ensure_dict(_dig(data, "props", "pageProps"))
-    # LBC stores results under searchData.ads or directly ads. Either may be
-    # missing or have a different shape; ensure list before iterating.
-    ads = (
-        _dig(props, "searchData", "ads")
-        or props.get("ads")
-        or []
-    )
-    ads = _ensure_list(ads)
+    listings: list[Listing] = []
+    seen_ids: set[str] = set()
+    sep = "&" if "?" in search_url else "?"
+    MAX_PAGES = 5
 
-    if not ads:
-        logger.warning("No ads found in __NEXT_DATA__. pageProps keys: %s", list(props.keys()))
-
-    listings = []
-    for ad in ads[:max_results]:
-        if not isinstance(ad, dict):
-            logger.debug("Skipping non-dict ad entry: %r", type(ad).__name__)
-            continue
+    for page_num in range(1, MAX_PAGES + 1):
+        page_url = search_url if page_num == 1 else f"{search_url}{sep}page={page_num}"
         try:
-            lbc_id = str(ad.get("list_id") or ad.get("id") or "")
-            url = f"https://www.leboncoin.fr/ad/locations/{lbc_id}" if lbc_id else search_url
-            listing = _ad_to_listing(ad, url)
-            if listing:
-                listings.append(listing)
+            data = await _pw_get_next_data(page_url)
         except Exception as exc:
-            # One malformed listing must not kill the whole batch.
-            logger.warning(
-                "Skipping malformed LBC ad (%s): %s",
-                ad.get("list_id") or ad.get("id") or "?",
-                exc,
-            )
+            logger.warning("[PLAYWRIGHT] page %d fetch error: %s", page_num, exc)
+            break
+        if not data:
+            if page_num == 1:
+                raise RuntimeError(
+                    "Playwright could not fetch search page — DataDome blocked or page structure changed"
+                )
+            break
 
-    logger.info("[PLAYWRIGHT] Found %d listings", len(listings))
+        props = _ensure_dict(_dig(data, "props", "pageProps"))
+        ads = (
+            _dig(props, "searchData", "ads")
+            or props.get("ads")
+            or []
+        )
+        ads = _ensure_list(ads)
+        if not ads:
+            if page_num == 1:
+                logger.warning("No ads found in __NEXT_DATA__. pageProps keys: %s", list(props.keys()))
+            break
+
+        new_count = 0
+        for ad in ads:
+            if not isinstance(ad, dict):
+                continue
+            try:
+                lbc_id = str(ad.get("list_id") or ad.get("id") or "")
+                if not lbc_id or lbc_id in seen_ids:
+                    continue
+                seen_ids.add(lbc_id)
+                url = f"https://www.leboncoin.fr/ad/locations/{lbc_id}"
+                listing = _ad_to_listing(ad, url)
+                if listing:
+                    listings.append(listing)
+                    new_count += 1
+                    if len(listings) >= max_results:
+                        return listings
+            except Exception as exc:
+                logger.warning("Skipping malformed LBC ad: %s", exc)
+        logger.info("[PLAYWRIGHT] page %d: +%d new listings (total %d)", page_num, new_count, len(listings))
+        if new_count == 0:  # pagination exhausted
+            break
+
+    logger.info("[PLAYWRIGHT] Found %d listings (paginated %d pages)", len(listings), page_num)
+
+    # Phase 2: enrich listings whose API body is empty by fetching the detail
+    # page. The LBC search API often returns body='' for new/recent listings;
+    # the detail page reliably has the full description in its __NEXT_DATA__.
+    # Cap at 30 to avoid runaway cost; concurrent via Camoufox pool.
+    empty_body = [l for l in listings if not (l.description or "").strip() or
+                  len((l.description or "").strip()) < 80][:30]
+    if empty_body:
+        logger.info("[LBC] enriching %d listings with empty body via detail page", len(empty_body))
+        sem = asyncio.Semaphore(4)  # Camoufox is heavy
+        async def _enrich(lst):
+            async with sem:
+                try:
+                    data = await _pw_get_next_data(lst.url, site="leboncoin")
+                except Exception:
+                    return
+                if not data:
+                    return
+                ad = _dig(data, "props", "pageProps", "ad") or \
+                     _dig(data, "props", "pageProps", "adView", "ad") or {}
+                body = ad.get("body") if isinstance(ad, dict) else None
+                if isinstance(body, str) and len(body) > 50:
+                    # Prepend the real body, preserving any [ÉTAGE/MEUBLÉ] tags
+                    existing_tags = lst.description or ""
+                    lst.description = (body + "\n" + existing_tags).strip()[:1500]
+        await asyncio.gather(*(_enrich(l) for l in empty_body), return_exceptions=True)
+        n_filled = sum(1 for l in empty_body if len((l.description or "").strip()) >= 80)
+        logger.info("[LBC] body enrichment done: %d/%d filled", n_filled, len(empty_body))
     return listings
 
 
@@ -498,37 +687,21 @@ async def _fetch_single_with_playwright(lbc_url: str) -> Optional[Listing]:
 # ─── SeLoger Playwright scrapers ─────────────────────────────────────────────
 
 async def _pw_get_seloger_data(url: str) -> Optional[dict]:
-    """
-    Fetch SeLoger page using Camoufox (anti-detect Firefox) to bypass Datadome.
+    """Fetch SeLoger page via curl_cffi (Chrome TLS fingerprint) to bypass
+    DataDome — ~5× faster than Camoufox and no browser overhead.
     Extracts listing data from window["__UFRN_FETCHER__"] in the SSR HTML.
     """
-    from camoufox.async_api import AsyncCamoufox
+    from curl_cffi.requests import AsyncSession
 
-    ssr_html: Optional[str] = None
-
-    async with AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows") as browser:
-        page = await browser.new_page()
-
-        async def on_response(r):
-            nonlocal ssr_html
-            ct = r.headers.get("content-type", "")
-            if r.status == 200 and "text/html" in ct and "classified-search" in r.url:
-                try:
-                    ssr_html = await r.text()
-                except Exception:
-                    pass
-
-        page.on("response", on_response)
-
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            await _handle_cookie_banner(page)
-            await asyncio.sleep(random.uniform(1.5, 2.5))
-        finally:
-            await page.close()
-
-    if not ssr_html:
-        logger.warning("[SELOGER] No HTML captured — Camoufox may have been blocked")
+    try:
+        async with AsyncSession(impersonate="chrome120", timeout=30) as session:
+            r = await session.get(url, allow_redirects=True)
+            if r.status_code != 200:
+                logger.warning("[SELOGER] HTTP %s on %s", r.status_code, url[:80])
+                return None
+            ssr_html = r.text
+    except Exception as exc:
+        logger.warning("[SELOGER] curl_cffi fetch failed: %s", exc)
         return None
 
     # Extract window["__UFRN_FETCHER__"] — SeLoger's SSR data container
@@ -537,7 +710,7 @@ async def _pw_get_seloger_data(url: str) -> Optional[dict]:
         ssr_html, _re.DOTALL
     )
     if not m:
-        logger.warning("[SELOGER] __UFRN_FETCHER__ not found in page HTML")
+        logger.warning("[SELOGER] __UFRN_FETCHER__ not found")
         return None
 
     try:
@@ -549,10 +722,9 @@ async def _pw_get_seloger_data(url: str) -> Optional[dict]:
 
     serp_raw = fetcher.get("data", {}).get("classified-serp-init-data")
     if not serp_raw or not isinstance(serp_raw, str) or not serp_raw.strip():
-        logger.warning("[SELOGER] classified-serp-init-data is empty — still blocked")
+        logger.warning("[SELOGER] classified-serp-init-data is empty")
         return None
 
-    # SeLoger compresses the SERP data with LZString.compressToBase64
     try:
         import lzstring as _lzs
         decompressed = _lzs.LZString().decompressFromBase64(serp_raw)
@@ -564,39 +736,152 @@ async def _pw_get_seloger_data(url: str) -> Optional[dict]:
         return None
 
 
-async def _search_seloger_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    logger.info("[SELOGER] Scraping search page: %s", search_url)
+def _seloger_enrich_detail(html: str) -> dict:
+    """Extract dealbreaker info from a SeLoger detail page HTML.
+    The site uses plain text labels: "Non meublé", "Pas d'ascenseur", etc.,
+    plus structured "label / Oui|Non" pairs near `font-toroka` spans."""
+    out: dict = {}
+    if "Non meublé" in html:
+        out["furnished"] = False
+    elif "Pas d'ascenseur" in html:
+        out["elevator"] = False
+    # Combined check (both patterns can coexist)
+    if out.get("elevator") is None and "Pas d'ascenseur" in html:
+        out["elevator"] = False
+    if "Avec ascenseur" in html:
+        out["elevator"] = True
+    if (m := _re.search(r"Étage\s+(\d+)\s*/\s*\d+", html)):
+        try: out["floor"] = int(m.group(1))
+        except Exception: pass
+    return out
+
+
+def _seloger_extract_description(html: str) -> Optional[str]:
+    """Extract the full SeLoger detail-page description from the SSR JSON.
+
+    The text lives inside the `__UFRN_LIFECYCLE_SERVERREQUEST__` script tag
+    at JSON path `*.mainDescription.description`. The HTML data-testid attribute
+    truncates at ~10 visible lines — only the JSON path has the full text.
+    Typically returns 500-2500 chars of clean French.
+    """
+    import json as _json
+    m = _re.search(
+        r'<script id="__UFRN_LIFECYCLE_SERVERREQUEST__"[^>]*>'
+        r'window\["__UFRN_LIFECYCLE_SERVERREQUEST__"\]=JSON\.parse\("(.*?)"\);\s*</script>',
+        html, _re.DOTALL,
+    )
+    if not m:
+        return None
     try:
-        data = await _pw_get_seloger_data(search_url)
-    except Exception as exc:
-        logger.warning("[SELOGER] Scraping failed: %s", exc)
-        return []
-    if not data:
-        logger.warning("[SELOGER] Could not retrieve data — blocked or URL format incorrect")
-        logger.warning("[SELOGER] Tip: copy the search URL manually from your browser after filtering on seloger.com")
-        return []
+        json_str = _json.loads('"' + m.group(1) + '"')
+        data = _json.loads(json_str)
+    except (_json.JSONDecodeError, ValueError):
+        return None
 
-    raw = data.get("_raw") or data
-    page_props = raw.get("pageProps") or {}
+    found: list[str] = []
+    def _walk(o):
+        if isinstance(o, dict):
+            md = o.get("mainDescription")
+            if isinstance(md, dict) and isinstance(md.get("description"), str):
+                found.append(md["description"])
+                return
+            for v in o.values():
+                if found: return
+                _walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                if found: return
+                _walk(v)
+    _walk(data)
+    return found[0] if found else None
 
-    # classifieds = ordered list of CPS IDs; classifiedsData = dict keyed by CPS ID
-    cps_ids: list = page_props.get("classifieds") or []
-    classified_map: dict = page_props.get("classifiedsData") or {}
 
-    if not classified_map:
-        logger.warning("[SELOGER] No classifiedsData found. pageProps keys: %s", list(page_props.keys())[:10])
-        return []
+async def _search_seloger_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """SeLoger scraper — paginates via &page=N (default cap = 50 pages × ~30
+    listings ≈ 1500 listings, covers IDF inventory). Uses curl_cffi instead of
+    Camoufox for 5× speedup."""
+    logger.info("[SELOGER] Scraping search page: %s", search_url)
+    sep = "&" if "?" in search_url else "?"
 
-    listings = []
-    for cps_id in cps_ids[:max_results]:
-        ad = classified_map.get(cps_id)
-        if not ad or not isinstance(ad, dict):
-            continue
-        listing = _seloger_ad_to_listing(ad)
-        if listing:
-            listings.append(listing)
+    listings: list[Listing] = []
+    seen_ids: set[str] = set()
+    MAX_PAGES = 50
 
-    logger.info("[SELOGER] Found %d listings (total available: %d)", len(listings), page_props.get("totalCount", 0))
+    async def _fetch_page(page_num: int):
+        page_url = f"{search_url}{sep}page={page_num}" if page_num > 1 else search_url
+        try:
+            return await _pw_get_seloger_data(page_url)
+        except Exception as exc:
+            logger.warning("[SELOGER] page %d failed: %s", page_num, exc)
+            return None
+
+    # Fetch in waves of 5 to balance speed vs. SeLoger rate-limiting tolerance
+    page = 1
+    while page <= MAX_PAGES and len(listings) < max_results:
+        wave = list(range(page, min(page + 5, MAX_PAGES + 1)))
+        datas = await asyncio.gather(*(_fetch_page(p) for p in wave))
+        any_new = False
+        for data in datas:
+            if not data:
+                continue
+            raw = data.get("_raw") or data
+            page_props = raw.get("pageProps") or {}
+            cps_ids: list = page_props.get("classifieds") or []
+            classified_map: dict = page_props.get("classifiedsData") or {}
+            for cps_id in cps_ids:
+                ad = classified_map.get(cps_id)
+                if not ad or not isinstance(ad, dict):
+                    continue
+                lst = _seloger_ad_to_listing(ad)
+                if lst and lst.lbc_id not in seen_ids:
+                    seen_ids.add(lst.lbc_id)
+                    listings.append(lst)
+                    any_new = True
+                    if len(listings) >= max_results:
+                        break
+            if len(listings) >= max_results:
+                break
+        if not any_new:  # all 5 pages returned same listings → done
+            break
+        page += 5
+
+    # Phase 2: detail-page enrichment for non-meublé / no-ascenseur
+    if listings:
+        from curl_cffi.requests import AsyncSession
+        sem_d = asyncio.Semaphore(10)
+        async with AsyncSession(impersonate="chrome120", timeout=20) as session:
+            async def _enrich(lst):
+                async with sem_d:
+                    try:
+                        r = await session.get(lst.url, allow_redirects=True)
+                        if r.status_code != 200:
+                            return None
+                        html = r.text
+                        info = _seloger_enrich_detail(html)
+                        full_desc = _seloger_extract_description(html)
+                    except Exception:
+                        return None
+                    if info.get("furnished") is False:
+                        return lst.lbc_id  # drop: non-meublé
+                    floor = info.get("floor")
+                    if isinstance(floor, int) and floor > 3 and info.get("elevator") is False:
+                        return lst.lbc_id  # drop: étage>3 sans asc
+                    if full_desc and len(full_desc) > 50:
+                        lst.description = (full_desc + "\n" + (lst.description or "")).strip()
+                    tags = []
+                    if info.get("elevator") is True: tags.append("[ASCENSEUR: oui]")
+                    elif info.get("elevator") is False: tags.append("[ASCENSEUR: non]")
+                    if info.get("furnished") is True: tags.append("[MEUBLÉ: oui]")
+                    if tags:
+                        lst.description = (lst.description + "\n" + " ".join(tags)).strip()
+                    return None
+            drops = await asyncio.gather(*(_enrich(l) for l in listings))
+            drop_set = {d for d in drops if d}
+            if drop_set:
+                logger.info("[SELOGER] Dropped %d (non-meublé / étage>3 sans asc)", len(drop_set))
+                listings = [l for l in listings if l.lbc_id not in drop_set]
+
+    logger.info("[SELOGER] Parsed %d listings (with detail enrichment)", len(listings))
     return listings
 
 
@@ -668,7 +953,7 @@ def _parse_pap_listing(item, base_url: str = "https://www.pap.fr") -> Optional[L
         description = desc_m.group(1).strip()
 
     # Title: build from location + surface like PAP displays it
-    title_m = _re2.search(r"(\d+)\s*m²", text)
+    title_m = _re2.search(r"(\d+)(?:[,.]\d+)?\s*m²", text)
     surface = title_m.group(1) if title_m else ""
     title = f"Appartement {surface}m² — {location}" if surface and location else text[:80]
 
@@ -702,56 +987,121 @@ def _parse_pap_listing(item, base_url: str = "https://www.pap.fr") -> Optional[L
     )
 
 
+async def _pap_enrich_detail(html: str) -> dict:
+    """Extract dealbreaker info from a PAP detail page HTML."""
+    out: dict = {}
+    # Phone — French phone format anywhere in HTML text (PAP shows it directly)
+    if (m := _re.search(r"(?:0[1-9]|\+33[1-9])[\s.\-]?(?:\d{2}[\s.\-]?){4}", _re.sub(r"<[^>]+>", " ", html))):
+        # Normalize: strip spaces/dots/dashes
+        out["phone"] = _re.sub(r"[\s.\-]", "", m.group(0))
+    # JSON-LD additionalProperty
+    import json as _json
+    for block in _re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL):
+        try:
+            data = _json.loads(block)
+        except Exception:
+            continue
+        for prop in data.get("additionalProperty", []) if isinstance(data, dict) else []:
+            if not isinstance(prop, dict): continue
+            name = (prop.get("name") or "").lower()
+            val = prop.get("value")
+            if name == "meublé":
+                out["furnished"] = (str(val).lower() == "oui")
+            elif name == "surface":
+                try: out["surface"] = int(float(val))
+                except Exception: pass
+    # Regex
+    if (m := _re.search(r"(\d+)(?:er|ème|e|ᵉ|ᵈ)?\s*[éE]tage", html)):
+        try: out["floor"] = int(m.group(1))
+        except Exception: pass
+    if "sans ascenseur" in html.lower():
+        out["elevator"] = False
+    elif _re.search(r"avec ascenseur|\(ascenseur\)", html, _re.I):
+        out["elevator"] = True
+    if (m := _re.search(r"(\d+)\s*mois\s*minimum", html, _re.I)):
+        try: out["min_lease_months"] = int(m.group(1))
+        except Exception: pass
+    if (m := _re.search(r"Disponible le (\d{1,2})\s+(\w+)\s+(\d{4})", html)):
+        # Convert French month name to digit
+        months = {"janvier":1,"février":2,"mars":3,"avril":4,"mai":5,"juin":6,
+                  "juillet":7,"août":8,"septembre":9,"octobre":10,"novembre":11,"décembre":12}
+        mn = months.get(m.group(2).lower())
+        if mn: out["available_yyyy_mm"] = f"{m.group(3)}-{mn:02d}-{int(m.group(1)):02d}"
+    return out
+
+
 async def _search_pap_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    logger.info("[PAP] Scraping search page: %s", search_url)
-    try:
-        from bs4 import BeautifulSoup
-        import re as _re2
+    """PAP scraper — curl_cffi search + parallel detail enrichment.
+    Search page gives basic info; detail page (JSON-LD + regex) gives
+    Meublé / floor / elevator / min lease / available date."""
+    from bs4 import BeautifulSoup
+    from curl_cffi.requests import AsyncSession
+    import re as _re2
 
-        html: Optional[str] = None
+    url_no_query, _, query = search_url.partition("?")
+    pages = [search_url] + [
+        f"{url_no_query}-{n}{('?' + query) if query else ''}"
+        for n in range(2, 16)
+    ]
+    logger.info("[PAP] Fetching %d pages via curl_cffi", len(pages))
+    htmls = await _fetch_pages_curl_cffi(pages)
 
-        async with async_playwright() as pw:
-            ctx = await pw.chromium.launch_persistent_context(
-                user_data_dir=_user_data_dir("pap"),
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 800},
-                locale="fr-FR",
-            )
-            page = await ctx.new_page()
-            await Stealth().apply_stealth_async(page)
-            try:
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-                await _handle_cookie_banner(page)
-                await asyncio.sleep(random.uniform(1.5, 2.5))
-                html = await page.content()
-            finally:
-                await ctx.close()
-
+    listings: list[Listing] = []
+    for html in htmls:
         if not html:
-            return []
-
+            continue
         soup = BeautifulSoup(html, "html.parser")
         items = soup.find_all(class_=_re2.compile("search-list-item"))
-        logger.info("[PAP] Found %d item elements", len(items))
+        for item in items:
+            if (l := _parse_pap_listing(item)):
+                listings.append(l)
+                if len(listings) >= max_results:
+                    break
+        if len(listings) >= max_results:
+            break
 
-        listings = []
-        for item in items[:max_results]:
-            listing = _parse_pap_listing(item)
-            if listing:
-                listings.append(listing)
+    # Phase 2: detail-page enrichment (Meublé/floor/elevator/min_lease)
+    if listings:
+        sem = asyncio.Semaphore(10)
+        async with AsyncSession(impersonate="chrome120", timeout=20) as session:
+            async def _enrich(lst):
+                async with sem:
+                    try:
+                        r = await session.get(lst.url, allow_redirects=True)
+                        if r.status_code != 200:
+                            return None
+                        info = await _pap_enrich_detail(r.text)
+                    except Exception:
+                        return None
+                    # Hard dealbreakers
+                    if info.get("furnished") is False:
+                        return lst.lbc_id  # drop: non-meublé
+                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"] > "2026-09":
+                        return lst.lbc_id  # drop: dispo trop tard
+                    floor = info.get("floor")
+                    if isinstance(floor, int) and floor > 3 and info.get("elevator") is False:
+                        return lst.lbc_id  # drop: étage>3 sans asc
+                    if (ph := info.get("phone")):
+                        lst.phone = ph
+                    if (av := info.get("available_yyyy_mm")):
+                        lst.available_from = av
+                    tags = []
+                    if floor is not None: tags.append(f"[ÉTAGE: {floor}]")
+                    if info.get("elevator") is True: tags.append("[ASCENSEUR: oui]")
+                    elif info.get("elevator") is False: tags.append("[ASCENSEUR: non]")
+                    if info.get("furnished") is True: tags.append("[MEUBLÉ: oui]")
+                    if (av := info.get("available_yyyy_mm")): tags.append(f"[DISPO: {av}]")
+                    if tags:
+                        lst.description = (lst.description + "\n" + " ".join(tags)).strip()
+                    return None
+            drops = await asyncio.gather(*(_enrich(l) for l in listings))
+            drop_set = {d for d in drops if d}
+            if drop_set:
+                logger.info("[PAP] Dropped %d (dealbreakers from detail page)", len(drop_set))
+                listings = [l for l in listings if l.lbc_id not in drop_set]
 
-        logger.info("[PAP] Parsed %d listings", len(listings))
-        return listings
-
-    except Exception as exc:
-        logger.warning("[PAP] Scraping failed: %s", exc)
-        return []
+    logger.info("[PAP] Parsed %d listings (with detail enrichment)", len(listings))
+    return listings
 
 
 # ─── Apify scrapers (paid, opt-in via USE_APIFY=true) ────────────────────────
@@ -936,7 +1286,7 @@ def _bienici_card_to_listing(card) -> Optional[Listing]:
             pass
 
     # Surface: "61 m²"
-    sm = _re2.search(r"(\d+)\s*m²", text)
+    sm = _re2.search(r"(\d+)(?:[,.]\d+)?\s*m²", text)
     surface = _to_int_safe(sm.group(1)) if sm else None
 
     # Location: "{5-digit zip} {city}"
@@ -973,38 +1323,189 @@ def _bienici_card_to_listing(card) -> Optional[Listing]:
     )
 
 
-async def _search_bienici_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    """Bien'ici scraper using Camoufox with wait_until='commit'.
+_BIENICI_API = "https://www.bienici.com/realEstateAds.json"
+_BIENICI_IDF_ZONE_ID = "-8649"  # Île-de-France region (covers all Paris arr.)
 
-    The previous __NEXT_DATA__ + XHR-intercept approach hung 5+ min on
-    DataDome challenges. Bien'ici no longer ships __NEXT_DATA__ in HTML
-    anyway. The fix: navigate with `commit` (fires immediately when document
-    starts arriving), sleep long enough for the SPA to hydrate and render
-    cards, then parse `<article class="ad-overview">` from the HTML.
-    Real-world timing: ~17s end-to-end vs 358s before.
-    """
-    logger.info("[BIENICI] Scraping search page: %s", search_url)
+
+def _bienici_ad_to_listing(ad: dict) -> Optional[Listing]:
+    """Convert a Bien'ici realEstateAds.json entry to a Listing."""
+    aid = ad.get("id")
+    if not aid:
+        return None
+
+    # Filter out short-term rentals masquerading as cheap (price = daily rate
+    # like 116€/day). Heuristic: any rental priced <300€/month is suspicious;
+    # those are typically per-day or per-week values mislabeled.
+    price = ad.get("price")
+    if not isinstance(price, (int, float)) or price < 300:
+        return None
+    price = int(price)
+
+    # Filter explicit non-furnished (we requested furnished=True but be safe)
+    if ad.get("isFurnished") is False:
+        return None
+
+    surface = ad.get("surfaceArea")
+    rooms = ad.get("roomsQuantity")
+    title = ad.get("title") or f"Appartement {int(surface)}m²" if surface else "Appartement"
+
+    city = ad.get("city") or ""
+    zip_c = ad.get("postalCode") or ""
+    location = f"{city}, {zip_c}".strip(", ") if zip_c else city
+
+    url = f"https://www.bienici.com/annonce/location/{aid}"
+
+    # Description + structured tags for scoring LLM
+    description = ad.get("description") or ""
+    tags = []
+    floor = ad.get("floor")
+    if isinstance(floor, int):
+        tags.append(f"[ÉTAGE: {floor}]" if floor > 0 else "[ÉTAGE: RDC]")
+    if ad.get("isFurnished") is True:
+        tags.append("[MEUBLÉ: oui]")
+    heating = ad.get("heating") or ""
+    if heating:
+        tags.append(f"[CHAUFFAGE: {heating}]")
+    if tags:
+        description = (description + "\n" + " ".join(tags)).strip()
+
+    photos = []
+    for ph in ad.get("photos") or []:
+        if isinstance(ph, dict) and (u := ph.get("url")):
+            photos.append(u)
+
+    pub = ad.get("publicationDate") or ad.get("modificationDate")
+
+    return Listing(
+        lbc_id=f"bi_{aid}",
+        title=str(title)[:200],
+        description=description,
+        price=price,
+        location=location,
+        seller_name="Bien'ici",
+        url=url,
+        seller_type_hint="pro" if ad.get("accountType") == "pro" else "",
+        source="bienici",
+        images=photos,
+        surface=int(surface) if isinstance(surface, (int, float)) else None,
+        published_at=pub if isinstance(pub, str) else None,
+    )
+
+
+_BIENICI_DETAIL_API = "https://www.bienici.com/realEstateAd.json"
+
+
+async def _bienici_fetch_detail(client, ad_id: str) -> dict:
+    """Fetch Bien'ici single-listing detail JSON. Has `hasElevator` (sometimes)
+    and richer fields (heating, agencyRentalFee, safetyDeposit, etc.)."""
     try:
-        html = await _fetch_html_with_camoufox(
-            search_url,
-            post_delay=(10.0, 13.0),  # SPA needs time to hydrate + render cards
-            wait_until="commit",       # don't wait for full document — DataDome holds it
-            goto_timeout=20_000,
+        r = await client.get(f"{_BIENICI_DETAIL_API}?id={ad_id}",
+                             headers={"User-Agent": _HTTPX_UA, "Referer": "https://www.bienici.com/"})
+        if r.status_code == 200:
+            return r.json()
+    except Exception as exc:
+        logger.debug("Bien'ici detail fetch %s failed: %s", ad_id, exc)
+    return {}
+
+
+async def _search_bienici_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """Bien'ici scraper via internal JSON API at `/realEstateAds.json`.
+
+    Two-phase:
+      1. Search API returns paginated frames with most data (price, floor,
+         isFurnished, etc.) — fast.
+      2. For listings with floor > 3, fetch detail API to check hasElevator.
+         If floor>3 AND hasElevator=False → drop (dealbreaker).
+
+    `search_url` is kept for dispatcher compat but ignored — we use the API
+    directly.
+    """
+    import httpx, json, urllib.parse
+
+    MAX_BUDGET = 1100  # match dashboard hard cap, no need to fetch above-budget
+    listings: list[Listing] = []
+    try:
+        async with httpx.AsyncClient(headers={"User-Agent": _HTTPX_UA}, timeout=20) as client:
+            page = 1
+            while True:
+                filters = {
+                    "size": 50,
+                    "from": (page - 1) * 50,
+                    "page": page,
+                    "filterType": "rent",
+                    "propertyType": ["flat", "house"],
+                    "maxPrice": MAX_BUDGET,
+                    "minArea": 20,
+                    "isFurnished": True,
+                    "onTheMarket": [True],
+                    "zoneIdsByTypes": {"zoneIds": [_BIENICI_IDF_ZONE_ID]},
+                }
+                qs = urllib.parse.urlencode({"filters": json.dumps(filters)})
+                r = await client.get(f"{_BIENICI_API}?{qs}")
+                if r.status_code != 200:
+                    logger.warning("[BIENICI] API page %d: HTTP %s", page, r.status_code)
+                    break
+                data = r.json()
+                ads = data.get("realEstateAds", [])
+                if not ads:
+                    break
+                for ad in ads:
+                    if (l := _bienici_ad_to_listing(ad)):
+                        listings.append(l)
+                        if len(listings) >= max_results:
+                            break
+                if len(listings) >= max_results:
+                    break
+                total = data.get("total", 0)
+                if page * 50 >= total:
+                    break
+                page += 1
+
+            # Phase 2: detail fetch for ALL listings to grab elevator (high-floor
+            # only) + phone (everywhere). Bien'ici detail API returns
+            # contactRelativeData.phoneToDisplay for most agency listings.
+            def _floor_from_desc(desc: str) -> int:
+                m = _re.search(r"\[ÉTAGE:\s*(\d+)\]", desc or "")
+                return int(m.group(1)) if m else -1
+            if listings:
+                logger.info("[BIENICI] Fetching detail for %d listings (phone + elevator)", len(listings))
+                sem = asyncio.Semaphore(10)
+                async def _enrich(lst):
+                    async with sem:
+                        ad_id = lst.lbc_id.removeprefix("bi_")
+                        detail = await _bienici_fetch_detail(client, ad_id)
+                        if not detail:
+                            return None
+                        # Elevator dealbreaker for floor>3
+                        if _floor_from_desc(lst.description) > 3 and detail.get("hasElevator") is False:
+                            return lst.lbc_id  # drop
+                        # Phone extraction
+                        crd = detail.get("contactRelativeData") or {}
+                        ph = crd.get("phoneToDisplay")
+                        if isinstance(ph, str) and ph.strip():
+                            lst.phone = ph.strip()
+                        # Description backfill: Bien'ici search API sometimes
+                        # returns empty description; detail API always has it.
+                        if len((lst.description or "").strip()) < 80:
+                            full = detail.get("description") or ""
+                            if isinstance(full, str) and len(full) > 80:
+                                # Preserve any [ÉTAGE: ...] tags appended in card parser
+                                tags = _re.findall(r"\[[A-ZÉÈÊ]+:[^\]]+\]", lst.description or "")
+                                lst.description = (full + ("\n" + " ".join(tags) if tags else "")).strip()[:1500]
+                        return None
+                drops = await asyncio.gather(*(_enrich(l) for l in listings))
+                drop_set = {d for d in drops if d}
+                if drop_set:
+                    logger.info("[BIENICI] Dropping %d listings (étage>3 + no elevator)", len(drop_set))
+                    listings = [l for l in listings if l.lbc_id not in drop_set]
+
+        logger.info(
+            "[BIENICI] Parsed %d listings via API (≤%d€, IDF, furnished)",
+            len(listings), MAX_BUDGET,
         )
-        if not html:
-            logger.warning("[BIENICI] Camoufox returned no HTML")
-            return []
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        cards = soup.find_all("article", class_="ad-overview")
-        logger.info("[BIENICI] Found %d card elements", len(cards))
-        listings = [
-            l for l in (_bienici_card_to_listing(c) for c in cards[:max_results]) if l
-        ]
-        logger.info("[BIENICI] Parsed %d listings", len(listings))
         return listings
     except Exception as exc:
-        logger.warning("[BIENICI] Scraping failed: %s", exc)
+        logger.warning("[BIENICI] API scrape failed: %s", exc)
         return []
 
 
@@ -1052,7 +1553,7 @@ def _logicimmo_item_to_listing(item) -> Optional[Listing]:
         location = loc_el.get_text(strip=True)
 
     # Surface for title
-    sm = _re2.search(r"(\d+)\s*m²", text, _re2.IGNORECASE)
+    sm = _re2.search(r"(\d+)(?:[,.]\d+)?\s*m²", text, _re2.IGNORECASE)
     surface = sm.group(1) if sm else ""
 
     # Title
@@ -1090,55 +1591,148 @@ def _logicimmo_item_to_listing(item) -> Optional[Listing]:
     )
 
 
+_LI_PRICE_RE   = _re.compile(r"([\d][\d\s\xa0.,]*)\s*€")
+_LI_SURFACE_RE = _re.compile(r"(\d+(?:[.,]\d+)?)\s*m\s*²", _re.IGNORECASE)
+
+
+def _li_parse_int_money(raw: str | None) -> Optional[int]:
+    if not raw:
+        return None
+    m = _LI_PRICE_RE.search(raw)
+    if not m:
+        return None
+    digits = _re.sub(r"[^\d]", "", m.group(1))
+    return int(digits) if digits else None
+
+
+def _li_parse_surface(raw: str | None) -> Optional[int]:
+    if not raw:
+        return None
+    m = _LI_SURFACE_RE.search(raw)
+    if not m:
+        return None
+    return int(float(m.group(1).replace(",", ".")))
+
+
 async def _search_logicimmo_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    logger.info("[LOGICIMMO] Scraping search page: %s", search_url)
+    """Scrape Logic-Immo /classified-search via Camoufox.
+
+    Stealth Playwright is reliably DataDome-blocked here (captcha-delivery iframe).
+    Camoufox walks straight in. ~10–15s typical wall-clock time.
+    """
+    from camoufox.async_api import AsyncCamoufox
+
+    t0 = time.time()
+    raw_cards: list = []
+
     try:
-        from bs4 import BeautifulSoup
-        import re as _re2
-
-        html: Optional[str] = None
-
-        async with async_playwright() as pw:
-            ctx = await pw.chromium.launch_persistent_context(
-                user_data_dir=_user_data_dir("logicimmo"),
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 800},
-                locale="fr-FR",
-            )
-            page = await ctx.new_page()
-            await Stealth().apply_stealth_async(page)
+        async with AsyncCamoufox(headless=True, locale=["fr-FR"], os="windows") as browser:
+            page = await browser.new_page()
             try:
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-                await _handle_cookie_banner(page)
-                await asyncio.sleep(random.uniform(2.0, 3.5))
-                html = await page.content()
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
+                try:
+                    await page.evaluate(
+                        "() => { const r = document.querySelector('#usercentrics-root');"
+                        "        if (r) r.remove(); return true; }"
+                    )
+                except Exception:
+                    pass
+                try:
+                    await page.wait_for_selector(
+                        '[data-testid="serp-core-classified-card-testid"]',
+                        timeout=20_000,
+                    )
+                except Exception as exc:
+                    logger.warning("[LOGICIMMO] cards never rendered: %s", exc)
+                    return []
+                raw_cards = await page.evaluate(
+                    """(maxN) => {
+                      const cards = Array.from(document.querySelectorAll(
+                        '[data-testid="serp-core-classified-card-testid"]'
+                      )).slice(0, maxN);
+                      const text = (el, sel) => {
+                        const x = el.querySelector(sel);
+                        return x ? (x.innerText || x.textContent || '').trim() : '';
+                      };
+                      return cards.map(c => {
+                        const link  = c.querySelector('[data-testid="card-mfe-covering-link-testid"]');
+                        let href = '';
+                        let summary = '';
+                        if (link) {
+                          href = link.getAttribute('href') || '';
+                          const dataBase = link.getAttribute('data-base') || '';
+                          if (!href && dataBase) {
+                            try { href = decodeURIComponent(dataBase); } catch (e) { href = dataBase; }
+                          }
+                          summary = link.getAttribute('title') || '';
+                        }
+                        const imgs = Array.from(c.querySelectorAll('img'))
+                          .map(i => i.src || i.getAttribute('data-src') || '')
+                          .filter(s => s.startsWith('http'));
+                        const agency = (
+                          text(c, '[data-testid*="agency-publisher"]') ||
+                          text(c, '[data-testid*="publisher"]')
+                        );
+                        return {
+                          href, summary, imgs, agency,
+                          price:    text(c, '[data-testid="cardmfe-price-testid"]'),
+                          address:  text(c, '[data-testid="cardmfe-description-box-address"]'),
+                          keyfacts: text(c, '[data-testid="cardmfe-keyfacts-testid"]'),
+                          desc:     text(c, '[data-testid="cardmfe-description-text-test-id"]'),
+                        };
+                      });
+                    }""",
+                    max_results,
+                )
             finally:
-                await ctx.close()
-
-        if not html:
-            return []
-
-        soup = BeautifulSoup(html, "html.parser")
-        items = (
-            soup.find_all("article", class_=_re2.compile(r"listing|ad-result|property", _re2.I))
-            or soup.find_all(attrs={"data-listing-id": True})
-            or soup.find_all(class_=_re2.compile(r"listing-item|search-result-item|offer-card", _re2.I))
-        )
-        logger.info("[LOGICIMMO] Found %d card elements", len(items))
-
-        listings = [l for l in (_logicimmo_item_to_listing(i) for i in items[:max_results]) if l]
-        logger.info("[LOGICIMMO] Parsed %d listings", len(listings))
-        return listings
-
+                await page.close()
     except Exception as exc:
-        logger.warning("[LOGICIMMO] Scraping failed: %s", exc)
+        logger.warning("[LOGICIMMO] Camoufox failed: %s", exc)
         return []
+
+    logger.info("[LOGICIMMO] extracted %d raw cards in %.1fs", len(raw_cards), time.time() - t0)
+
+    listings: list[Listing] = []
+    for raw in raw_cards:
+        href = (raw.get("href") or "").strip()
+        if not href:
+            continue
+        url = href.split("?", 1)[0] if href.startswith("http") else f"https://www.logic-immo.com{href}"
+
+        id_m = _re.search(r"detail-location-(\d+)", href) or _re.search(r"-(\d{5,})", href)
+        raw_id = id_m.group(1) if id_m else url.rstrip("/").rsplit("/", 1)[-1].split(".")[0][:32]
+        listing_id = f"li_{raw_id}"
+
+        summary = (raw.get("summary") or "").strip()
+        price    = _li_parse_int_money(raw.get("price")) or _li_parse_int_money(summary) or 0
+        surface  = _li_parse_surface(raw.get("keyfacts")) or _li_parse_surface(summary)
+        location = (raw.get("address") or "").strip() or (
+            (summary.split(" - ")[1].strip() if summary.count(" - ") >= 2 else "")
+        )
+        desc     = (raw.get("desc") or "").strip()
+        title    = (summary or desc.split("\n", 1)[0])[:140] or (
+            f"Appartement {surface}m² — {location}" if surface else (location or "Annonce Logic-Immo")
+        )
+
+        if not (50 <= price <= 50_000):
+            continue
+
+        listings.append(Listing(
+            lbc_id=listing_id,
+            title=title,
+            description=desc,
+            price=price,
+            location=location,
+            seller_name=(raw.get("agency") or "").strip() or "Annonceur",
+            url=url,
+            seller_type_hint="pro",
+            source="logicimmo",
+            images=raw.get("imgs") or [],
+            surface=surface,
+        ))
+
+    logger.info("[LOGICIMMO] returning %d listings (total %.1fs)", len(listings), time.time() - t0)
+    return listings
 
 
 # ─── Shared HTML fetcher + generic card parser (used by new scrapers) ───────
@@ -1217,7 +1811,7 @@ def _parse_generic_card(item, base_url: str, source: str, prefix: str) -> Option
         except ValueError:
             pass
 
-    sm = _re2.search(r"(\d+)\s*m²", text, _re2.IGNORECASE)
+    sm = _re2.search(r"(\d+)(?:[,.]\d+)?\s*m²", text, _re2.IGNORECASE)
     surface = sm.group(1) if sm else ""
 
     title_el = item.find(class_=_re2.compile(r"title|titre|heading|name", _re2.I))
@@ -1407,10 +2001,103 @@ async def _search_via_generic(
 # Run /search <url> against each platform after first launch and tune the
 # `card_selectors` list (and source-specific JSON paths) against live HTML.
 
-# Module-level shared Camoufox browser. When set by the campaign loop,
-# _fetch_html_with_camoufox reuses it instead of cold-starting Firefox
-# for every source. Saves ~30s per source on a 5-source Camoufox burst.
-_SHARED_CAMOUFOX_BROWSER = None  # type: ignore[assignment]
+# Camoufox browser pool — kept alive for the bot's lifetime to amortize the
+# ~30s cold-start across all campaigns and watches. Pool size = max concurrent
+# Camoufox-using sources (queue.get blocks past that, naturally serializing).
+_CAMOUFOX_POOL: Optional["asyncio.Queue"] = None
+_CAMOUFOX_CMS: list = []  # AsyncCamoufox context managers, kept open until shutdown
+
+
+# Generic browser-like UA for httpx fetches. Most French rental sites (PAP,
+# LocService, Lodgis, ImmoJeune) have NO bot protection — Camoufox/Playwright
+# was overkill. Plain httpx with this UA returns clean HTML in <1s/page.
+_HTTPX_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_HTTPX_HEADERS = {
+    "User-Agent": _HTTPX_UA,
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+async def _fetch_pages_httpx(urls: list[str], timeout: int = 15) -> list[Optional[str]]:
+    """Fetch a list of URLs in parallel via httpx. Returns HTML strings (or None
+    on failure) in the same order as input. Used by SSR sites with no bot block."""
+    import httpx
+    async with httpx.AsyncClient(headers=_HTTPX_HEADERS, timeout=timeout, follow_redirects=True) as client:
+        async def _one(url: str) -> Optional[str]:
+            try:
+                r = await client.get(url)
+                return r.text if r.status_code == 200 else None
+            except Exception as exc:
+                logger.warning("httpx fetch failed for %s: %s", url, exc)
+                return None
+        return await asyncio.gather(*(_one(u) for u in urls))
+
+
+async def _fetch_pages_curl_cffi(urls: list[str], timeout: int = 15, impersonate: str = "chrome120") -> list[Optional[str]]:
+    """Fetch URLs in parallel via curl_cffi with Chrome TLS fingerprint —
+    bypasses Cloudflare bot challenges that block plain httpx.
+
+    Heavier dependency than httpx (libcurl + BoringSSL) but ~10× lighter than
+    Playwright and bypasses Cloudflare without a real browser.
+    """
+    from curl_cffi.requests import AsyncSession
+    async with AsyncSession(impersonate=impersonate, timeout=timeout) as session:
+        async def _one(url: str) -> Optional[str]:
+            try:
+                r = await session.get(url, allow_redirects=True)
+                return r.text if r.status_code == 200 else None
+            except Exception as exc:
+                logger.warning("curl_cffi fetch failed for %s: %s", url, exc)
+                return None
+        return await asyncio.gather(*(_one(u) for u in urls))
+
+
+async def init_camoufox_pool(size: int = 2) -> int:
+    """Launch `size` long-lived Camoufox browsers. Idempotent — safe to call
+    multiple times; subsequent calls with a live pool are no-ops.
+
+    Returns the number of browsers actually launched.
+    """
+    global _CAMOUFOX_POOL
+    if _CAMOUFOX_POOL is not None:
+        return _CAMOUFOX_POOL.qsize()
+    from camoufox.async_api import AsyncCamoufox
+    pool: asyncio.Queue = asyncio.Queue()
+    for i in range(size):
+        try:
+            cm = AsyncCamoufox(headless=True, locale=["fr-FR"], os="windows")
+            t0 = time.time()
+            browser = await cm.__aenter__()
+            logger.info("Camoufox %d: __aenter__ done in %.1fs", i + 1, time.time() - t0)
+            t1 = time.time()
+            warmup_page = await asyncio.wait_for(browser.new_page(), timeout=30)
+            logger.info("Camoufox %d: warmup new_page in %.1fs", i + 1, time.time() - t1)
+            await warmup_page.close()
+            _CAMOUFOX_CMS.append(cm)
+            await pool.put(browser)
+        except Exception as exc:
+            logger.warning("Could not launch Camoufox browser %d/%d: %s", i + 1, size, exc)
+    n = pool.qsize()
+    _CAMOUFOX_POOL = pool if n > 0 else None
+    logger.info("Camoufox pool initialized: %d/%d browsers ready", n, size)
+    return n
+
+
+async def shutdown_camoufox_pool() -> None:
+    """Close all pooled Camoufox browsers. Called on bot shutdown."""
+    global _CAMOUFOX_POOL
+    _CAMOUFOX_POOL = None
+    for cm in _CAMOUFOX_CMS:
+        try:
+            await cm.__aexit__(None, None, None)
+        except Exception as exc:
+            logger.warning("Failed to close Camoufox browser: %s", exc)
+    _CAMOUFOX_CMS.clear()
+    logger.info("Camoufox pool shut down")
 
 
 async def _fetch_html_with_camoufox(
@@ -1421,48 +2108,53 @@ async def _fetch_html_with_camoufox(
 ) -> Optional[str]:
     """Fetch a page with Camoufox (anti-detect Firefox) — bypasses stealth-Playwright fingerprinting.
 
-    If _SHARED_CAMOUFOX_BROWSER is set (by _run_campaign_body), reuses that
-    browser across calls — saves Firefox cold-start time (15-30s each) when
-    the campaign hits multiple Camoufox sources in a row. Otherwise spins
-    up its own browser.
+    Acquires a browser from `_CAMOUFOX_POOL` if available (caller must have
+    called `init_camoufox_pool` at startup), otherwise cold-starts a one-off
+    browser. The pool path saves ~30s per source by avoiding cold-starts and
+    naturally bounds concurrency by pool size.
 
     Studapart/Lodgis/ImmoJeune/LocService work fine with the default
     `wait_until="domcontentloaded"`. Bien'ici has aggressive bot detection
     that holds the document open for 5+ minutes during the DataDome
     challenge — for that site, callers should pass `wait_until="commit"`.
     """
-    if _SHARED_CAMOUFOX_BROWSER is not None:
-        # Reuse the campaign's shared browser — just open a new page on it
-        page = await _SHARED_CAMOUFOX_BROWSER.new_page()
-        try:
-            await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
-            await _handle_cookie_banner(page)
-            await asyncio.sleep(random.uniform(*post_delay))
-            return await page.content()
-        except Exception as exc:
-            logger.warning("Camoufox fetch failed for %s: %s", url, exc)
-            return None
-        finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
-        return None  # unreachable
-
-    # Fallback: standalone browser (used by one-off probes / tests)
-    from camoufox.async_api import AsyncCamoufox
-    async with AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows") as browser:
+    async def _scrape_on(browser) -> Optional[str]:
+        t0 = time.time()
+        host = url.split("/")[2] if "://" in url else url[:30]
+        def _step(name: str) -> None:
+            logger.info("[CAMOUFOX %s] %s @ +%.1fs", host, name, time.time() - t0)
         page = await browser.new_page()
+        _step("new_page done")
         try:
+            _step(f"goto start (wait_until={wait_until}, timeout={goto_timeout/1000:.0f}s)")
             await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
+            _step("goto done")
             await _handle_cookie_banner(page)
+            _step("cookie banner done")
             await asyncio.sleep(random.uniform(*post_delay))
-            return await page.content()
+            _step("post_delay done")
+            html = await page.content()
+            _step(f"content done ({len(html)} chars)")
+            return html
         except Exception as exc:
+            _step(f"EXCEPTION: {type(exc).__name__}: {exc}")
             logger.warning("Camoufox fetch failed for %s: %s", url, exc)
             return None
         finally:
-            await page.close()
+            try: await page.close()
+            except Exception: pass
+
+    if _CAMOUFOX_POOL is not None:
+        browser = await _CAMOUFOX_POOL.get()
+        try:
+            return await _scrape_on(browser)
+        finally:
+            await _CAMOUFOX_POOL.put(browser)
+
+    # Fallback: standalone browser (tests, or pool init failed)
+    from camoufox.async_api import AsyncCamoufox
+    async with AsyncCamoufox(headless=True, locale=["fr-FR"], os="windows") as browser:
+        return await _scrape_on(browser)
 
 
 def _studapart_card_to_listing(card) -> Optional[Listing]:
@@ -1536,28 +2228,223 @@ def _studapart_card_to_listing(card) -> Optional[Listing]:
     )
 
 
-async def _search_studapart_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    """Studapart scraper — uses Camoufox (anti-detect Firefox) because stealth
-    Playwright gets fingerprinted and served an SEO landing page instead of
-    real listings. ~48 cards per page; 200+ across paginated index.
-    """
-    logger.info("[STUDAPART] Scraping: %s", search_url)
+_STUDAPART_TEMPLATE_PATH = "data/studapart_template.json"
+_STUDAPART_API_URL = "https://search-api.studapart.com/property"
+
+
+async def _capture_studapart_template() -> Optional[dict]:
+    """One-shot Playwright capture of the search-api POST template. Stores
+    to data/studapart_template.json for replay. Returns the captured dict."""
+    from playwright.async_api import async_playwright
+    captured = []
     try:
-        html = await _fetch_html_with_camoufox(search_url, post_delay=(5.0, 8.0))
-        if not html:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            ctx = await browser.new_context()
+            page = await ctx.new_page()
+
+            async def on_request(req):
+                if "search-api.studapart.com/property" in req.url and req.method == "POST":
+                    captured.append({
+                        "url": req.url,
+                        "post_data": req.post_data,
+                    })
+
+            page.on("request", on_request)
+            try:
+                await page.goto(
+                    "https://www.studapart.com/fr/logement-etudiant-paris",
+                    wait_until="networkidle", timeout=45_000,
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+            await browser.close()
+    except Exception as exc:
+        logger.warning("[STUDAPART] Template capture failed: %s", exc)
+        return None
+
+    if not captured:
+        return None
+    cap = captured[0]
+    try:
+        import os
+        os.makedirs("data", exist_ok=True)
+        with open(_STUDAPART_TEMPLATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cap, f)
+    except Exception as exc:
+        logger.warning("[STUDAPART] Template save failed: %s", exc)
+    return cap
+
+
+def _studapart_residence_to_listing(item: dict) -> Optional[Listing]:
+    """Convert a Studapart property API result to a Listing.
+
+    Dealbreakers applied at scrape time (skip → return None):
+      - housingAssistance is False : not APL-eligible (budget breaks)
+      - rentedByRoom is True : coloc/coliving (price shown is per-room, not full apt)
+      - maxTenantNumber > 2 : 5-person flat-share, not for couple
+      - announcementType in {flat_share, coliving, homestay} : shared housing
+    Missing field = keep (we treat absence as 'unclear, score normally').
+    """
+    if not isinstance(item, dict):
+        return None
+    if item.get("housingAssistance") is False:
+        return None
+    if item.get("rentedByRoom") is True:
+        return None
+    mt = item.get("maxTenantNumber")
+    if isinstance(mt, (int, float)) and mt > 2:
+        return None
+    atype = (item.get("announcementType") or "").lower()
+    if atype in ("flat_share", "coliving", "homestay"):
+        return None
+    aid = item.get("_id") or item.get("distinctId")
+    if not aid:
+        return None
+    rent = item.get("rentWithExpensesAmount") or item.get("rentAmount")
+    surface = item.get("propertySurface")
+    title = item.get("title") or f"Logement {item.get('city', '')}"
+    city = item.get("city") or ""
+    zip_c = item.get("zipcode") or ""
+    location = f"{city}, {zip_c}".strip(", ") if zip_c else city
+    canon = item.get("canonicalUrls")
+    rel = ""
+    if isinstance(canon, dict):
+        rel = canon.get("fr") or canon.get("en") or ""
+    url = ""
+    if isinstance(rel, str) and rel:
+        url = f"https://www.studapart.com{rel if rel.startswith('/') else '/' + rel}"
+    media = item.get("media") if isinstance(item.get("media"), list) else []
+    images = []
+    for m in media:
+        if isinstance(m, dict):
+            u = m.get("finalUrlResidenceSmall")
+            if isinstance(u, str):
+                images.append(u)
+    # onlineAt is a Unix timestamp in seconds
+    pub = None
+    online = item.get("onlineAt") or item.get("createdAt")
+    if isinstance(online, (int, float)):
+        from datetime import datetime as _dt
+        try: pub = _dt.utcfromtimestamp(online).isoformat()
+        except Exception: pass
+
+    # Description was hidden by a prior bug — actually already present in the
+    # Elasticsearch _source. Truncate to LLM context budget.
+    desc = item.get("description") or ""
+    if isinstance(desc, str) and desc:
+        desc = _re.sub(r"[ \t]+", " ", desc)
+        desc = _re.sub(r"\n{3,}", "\n\n", desc).strip()[:1500]
+    else:
+        desc = ""
+
+    return Listing(
+        lbc_id=f"sa_{aid}",
+        title=str(title)[:200],
+        description=desc,
+        price=int(rent) if isinstance(rent, (int, float)) else None,
+        location=location,
+        seller_name="Studapart",
+        url=url,
+        seller_type_hint="agency",
+        source="studapart",
+        images=images[:6],
+        surface=int(surface) if isinstance(surface, (int, float)) else None,
+        published_at=pub,
+    )
+
+
+async def _search_studapart_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """Studapart scraper via internal Elasticsearch API. Captures the request
+    template once with Playwright (stored in data/studapart_template.json),
+    then replays with httpx, paginating via `must_not.terms.distinctId` to
+    walk past the 201-bucket cap (returning ~48 unique per call).
+
+    `search_url` ignored — we use the API directly.
+    """
+    import os
+    import httpx as _httpx
+
+    # Load or capture template
+    template_data = None
+    if os.path.exists(_STUDAPART_TEMPLATE_PATH):
+        try:
+            with open(_STUDAPART_TEMPLATE_PATH, "r", encoding="utf-8") as f:
+                template_data = json.load(f)
+        except Exception:
+            template_data = None
+    if not template_data:
+        logger.info("[STUDAPART] Capturing API template (one-shot Playwright)…")
+        template_data = await _capture_studapart_template()
+        if not template_data:
+            logger.warning("[STUDAPART] Could not capture template — returning 0")
             return []
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        cards = soup.find_all("a", class_="AccomodationBlock")
-        logger.info("[STUDAPART] Found %d card elements", len(cards))
-        listings = [
-            l for l in (_studapart_card_to_listing(c) for c in cards[:max_results]) if l
-        ]
-        logger.info("[STUDAPART] Parsed %d listings", len(listings))
+
+    base_body = template_data.get("post_data")
+    if not base_body:
+        return []
+
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://www.studapart.com",
+        "Referer": "https://www.studapart.com/",
+        "User-Agent": _HTTPX_UA,
+        "Accept": "application/json",
+    }
+
+    listings: list[Listing] = []
+    seen_ids: set[str] = set()
+
+    try:
+        async with _httpx.AsyncClient(headers=headers, timeout=30) as client:
+            for attempt in range(8):  # cap pagination loops
+                # Inject must_not.terms.distinctId on every Elasticsearch body in 'data'
+                body_obj = json.loads(base_body)
+                if seen_ids:
+                    for d in body_obj.get("data", []):
+                        if isinstance(d, dict) and "body" in d:
+                            q = d["body"].get("query", {}).get("function_score", {}).get("query", {})
+                            if "bool" in q:
+                                q["bool"].setdefault("must_not", []).append(
+                                    {"terms": {"distinctId": list(seen_ids)}}
+                                )
+
+                r = await client.post(_STUDAPART_API_URL, content=json.dumps(body_obj))
+                if r.status_code != 200:
+                    logger.warning("[STUDAPART] API attempt %d: HTTP %s", attempt + 1, r.status_code)
+                    break
+                results = r.json().get("results", [])
+                new_count = 0
+                for item in results:
+                    did = item.get("distinctId")
+                    if did and did not in seen_ids:
+                        seen_ids.add(did)
+                        if (l := _studapart_residence_to_listing(item)):
+                            listings.append(l)
+                            new_count += 1
+                            if len(listings) >= max_results:
+                                break
+                if len(listings) >= max_results or new_count == 0:
+                    break
+        logger.info("[STUDAPART] Parsed %d listings via API (paginated)", len(listings))
         return listings
     except Exception as exc:
-        logger.warning("[STUDAPART] Scraping failed: %s", exc)
-        return []
+        logger.warning("[STUDAPART] API scrape failed: %s — falling back to HTML", exc)
+        # Fallback: old HTML path
+        try:
+            html = await _fetch_html_with_camoufox(search_url, post_delay=(5.0, 8.0))
+            if not html:
+                return listings
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            cards = soup.find_all("a", class_="AccomodationBlock")
+            for card in cards[:max_results]:
+                if (l := _studapart_card_to_listing(card)):
+                    listings.append(l)
+        except Exception:
+            pass
+        return listings
 
 
 def _parisattitude_card_to_listing(card) -> Optional[Listing]:
@@ -1613,7 +2500,7 @@ def _parisattitude_card_to_listing(card) -> Optional[Listing]:
         title = f"{type_part} — {location}"
 
     # Surface: type_part is e.g. "1 bedroom 28m²" or "Studio 24m²"
-    surface_m = _re.search(r"(\d+)\s*m²", type_part)
+    surface_m = _re.search(r"(\d+)(?:[,.]\d+)?\s*m²", type_part)
     surface = _to_int_safe(surface_m.group(1)) if surface_m else None
 
     images = [
@@ -1636,24 +2523,140 @@ def _parisattitude_card_to_listing(card) -> Optional[Listing]:
     )
 
 
+_PA_SEARCH_API = "https://prod-api-hanok.parisattitude.com/api/Accommodation/Search"
+_PA_PARIS_ZONES = list(range(1, 21))  # arrondissements 1-20
+
+
+def _frame_to_listing(frame: dict) -> Optional[Listing]:
+    """Convert a PA Search API frame to a Listing.
+
+    Filters out listings whose `nextAvailability` is after Sept 30 2026 —
+    Illan needs the apt for Aug/Sept 2026 move-in, owners typically don't
+    hold for 6+ months. Anything available 2026-10 onwards = dealbreaker."""
+    aid = frame.get("accommodationID")
+    if not aid:
+        return None
+
+    # Pass through ALL listings with their actual nextAvailability — the
+    # score-time dealbreaker (agent.py: avail > 2026-09 → score=0) will hide
+    # late-availability listings from the dashboard. Filtering at scrape
+    # time leaves stale data for listings whose date moves past 2026-09
+    # between scrapes.
+    avail = frame.get("nextAvailability") or ""
+
+    rent = frame.get("monthlyRent") or frame.get("applicableRent")
+    surface = frame.get("carrezSurfaceArea")
+    type_label = frame.get("accommodationTypeLabel") or "Studio"
+    borough = (frame.get("boroughLabel") or "").strip()
+    zip_code = frame.get("zipCode") or ""
+
+    arr_label = "Paris"
+    if zip_code.startswith("75") and len(zip_code) == 5:
+        try: arr_label = f"Paris {int(zip_code[3:])}"
+        except ValueError: pass
+
+    location = f"{borough}, {arr_label}" if borough else arr_label
+    title = f"{type_label} {int(surface)}m² {borough}".strip() if surface else f"{type_label} {borough}".strip()
+    # PA listing URLs auto-redirect from a stub slug — saves us from constructing
+    # the canonical slug from boroughLabel.
+    url = f"https://www.parisattitude.com/fr/louer-appartement/x,x,x,{aid}.aspx"
+
+    # nextAvailability is structured ISO datetime — extract YYYY-MM-DD directly,
+    # no LLM needed. Format: "2026-09-15T00:00:00+02:00" → "2026-09-15".
+    avail_from = avail[:10] if isinstance(avail, str) and len(avail) >= 10 else None
+
+    return Listing(
+        lbc_id=f"pa_{aid}",
+        title=title[:200],
+        description="",
+        price=int(rent) if rent else None,
+        location=location,
+        seller_name="Paris Attitude",
+        url=url,
+        seller_type_hint="pro",
+        source="parisattitude",
+        surface=int(surface) if surface else None,
+        published_at=frame.get("publishedOn") if isinstance(frame.get("publishedOn"), str) else None,
+        available_from=avail_from,
+    )
+
+
 async def _search_parisattitude_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    """Site-specific parser — bypasses the generic Next.js path (PA is .NET/Quasar)."""
-    logger.info("[PARISATTITUDE] Scraping: %s", search_url)
+    """API-based scraper using Paris Attitude's internal Vue.js backend.
+
+    The HTML index page is capped at 40 cards. The sitemap exposes 7600 URLs
+    but each detail page is a 700KB SSR fetch. The Vue SPA's backend at
+    `prod-api-hanok.parisattitude.com/api/Accommodation/Search` is
+    unauthenticated and returns paginated JSON of ALL listings with full
+    summary fields (price, surface, type, borough, GPS, photos).
+
+    Strategy:
+      - POST /Search with `mode=1` (long-term), `maxBudget=1500`, `size=100`,
+        `geographicalZoneIDs=[1..20]` (Paris arrondissements).
+      - Paginate until exhausted. Typically ~7-10 pages, ~3-5s total.
+      - Parse JSON frames directly into Listings.
+
+    `search_url` is kept for dispatcher signature compatibility but ignored.
+    """
+    import httpx
+
+    MAX_BUDGET = 1500  # Cover Illan's 1000€ + margin for "almost in budget" listings
+    listings: list[Listing] = []
     try:
-        html = await _fetch_html_with_stealth(search_url, "parisattitude", post_delay=(3.0, 5.0))
-        if not html:
-            return []
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        cards = soup.find_all("div", class_="accommodation-search-card")
-        logger.info("[PARISATTITUDE] Found %d card elements", len(cards))
-        listings = [
-            l for l in (_parisattitude_card_to_listing(c) for c in cards[:max_results]) if l
-        ]
-        logger.info("[PARISATTITUDE] Parsed %d listings", len(listings))
+        async with httpx.AsyncClient(timeout=30) as client:
+            page = 1
+            while True:
+                body = {
+                    "geographicalZoneIDs": _PA_PARIS_ZONES,
+                    "page": page,
+                    "size": 100,
+                    "mode": 1,
+                    "maxBudget": MAX_BUDGET,
+                }
+                r = await client.post(_PA_SEARCH_API, json=body)
+                if r.status_code != 200:
+                    logger.warning("[PARISATTITUDE] API page %d: HTTP %s", page, r.status_code)
+                    break
+                data = r.json().get("content", {})
+                frames = data.get("accommodationFrames", [])
+                if not frames:
+                    break
+                for f in frames:
+                    if (l := _frame_to_listing(f)):
+                        listings.append(l)
+                pages = data.get("pages", 0)
+                if page >= pages:
+                    break
+                page += 1
+        logger.info(
+            "[PARISATTITUDE] Parsed %d listings via API (≤%d€, all 20 arr.)",
+            len(listings), MAX_BUDGET,
+        )
+        # Activity check: PA's Search API stops returning listings once the
+        # apartment is rented or removed from catalog. The DB keeps stale
+        # available_from values until they're refreshed. NULL them when an ID
+        # disappears so the dashboard shows blank instead of wrong dates.
+        try:
+            import database as _db
+            seen_ids = {l.lbc_id for l in listings}
+            with _db._conn() as conn:
+                rows = conn.execute(
+                    "SELECT lbc_id FROM listings WHERE source='parisattitude' "
+                    "AND available_from IS NOT NULL"
+                ).fetchall()
+                stale = [r[0] for r in rows if r[0] not in seen_ids]
+                if stale:
+                    placeholders = ",".join("?" * len(stale))
+                    conn.execute(
+                        f"UPDATE listings SET available_from=NULL WHERE lbc_id IN ({placeholders})",
+                        stale,
+                    )
+                    logger.info("[PARISATTITUDE] activity check: cleared %d stale dates", len(stale))
+        except Exception as exc:
+            logger.warning("[PARISATTITUDE] activity check failed: %s", exc)
         return listings
     except Exception as exc:
-        logger.warning("[PARISATTITUDE] Scraping failed: %s", exc)
+        logger.warning("[PARISATTITUDE] API scrape failed: %s", exc)
         return []
 
 
@@ -1700,7 +2703,7 @@ def _lodgis_card_to_listing(card) -> Optional[Listing]:
             pass
 
     # Surface: "X m²"
-    sm = _re2.search(r"(\d+)\s*m²", text)
+    sm = _re2.search(r"(\d+)(?:[,.]\d+)?\s*m²", text)
     surface = sm.group(1) if sm else ""
 
     # Location: "Paris X°" + neighborhood preceding €
@@ -1740,26 +2743,106 @@ def _lodgis_card_to_listing(card) -> Optional[Listing]:
     )
 
 
-async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    """Lodgis scraper — Paris medium/long-term furnished. Uses Camoufox.
-    Heads-up: typical inventory is 1000€+ so most results filter out."""
-    logger.info("[LODGIS] Scraping: %s", search_url)
+def _lodgis_enrich_detail(html: str) -> dict:
+    """Extract dealbreaker info + description from a Lodgis detail page (EN version)."""
+    import html as _htmllib
+    from bs4 import BeautifulSoup
+
+    out: dict = {}
+    # Floor + lift in same phrase: "on the 4 floor (no lift)"
+    if (m := _re.search(r"on the\s+(\d+)\s*(?:st|nd|rd|th)?\s+floor\s*\((no|with)\s+lift\)", html, _re.I)):
+        try: out["floor"] = int(m.group(1))
+        except Exception: pass
+        out["elevator"] = (m.group(2).lower() == "with")
+    elif (m := _re.search(r"(\d+)(?:st|nd|rd|th)?\s+floor", html, _re.I)):
+        try: out["floor"] = int(m.group(1))
+        except Exception: pass
+    if (m := _re.search(r"min(?:imum)?\s+(\d+)\s+months?", html, _re.I)):
+        try: out["min_lease_months"] = int(m.group(1))
+        except Exception: pass
+    if (m := _re.search(r"Available from\s*[:\s]*(\d{1,2})[-/](\d{1,2})[-/](\d{4})", html, _re.I)):
+        out["available_yyyy_mm"] = f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+
+    # Description: long English paragraph in <div class="appart__infos__description">.
+    # Verified live: 645–810 chars of real listing copy (location, surface, transit, nearby amenities).
     try:
-        html = await _fetch_html_with_camoufox(search_url, post_delay=(4.0, 6.0))
-        if not html:
-            return []
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
-        cards = soup.find_all("div", class_="card__appart")
-        logger.info("[LODGIS] Found %d card elements", len(cards))
-        listings = [
-            l for l in (_lodgis_card_to_listing(c) for c in cards[:max_results]) if l
-        ]
-        logger.info("[LODGIS] Parsed %d listings", len(listings))
-        return listings
-    except Exception as exc:
-        logger.warning("[LODGIS] Scraping failed: %s", exc)
-        return []
+        node = soup.find("div", class_="appart__infos__description")
+        if node:
+            txt = node.get_text(" ", strip=True)
+            txt = _htmllib.unescape(txt)
+            txt = _re.sub(r"\s+", " ", txt).strip()
+            if 50 <= len(txt) <= 5000:
+                out["description"] = txt
+    except Exception:
+        pass
+    return out
+
+
+async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """Lodgis scraper — plain httpx + parallel detail enrichment.
+    Search returns 51 listings/page; detail page gives floor+elevator+
+    available_date. All Lodgis listings are furnished by default."""
+    from bs4 import BeautifulSoup
+
+    sep = "&" if "?" in search_url else "?"
+    pages = [search_url] + [f"{search_url}{sep}p={n}" for n in range(2, 71)]
+    logger.info("[LODGIS] Fetching %d pages via httpx (parallel)", len(pages))
+    htmls = await _fetch_pages_httpx(pages)
+
+    listings: list[Listing] = []
+    for html in htmls:
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        for card in soup.find_all("div", class_="card__appart"):
+            if (l := _lodgis_card_to_listing(card)):
+                listings.append(l)
+                if len(listings) >= max_results:
+                    break
+        if len(listings) >= max_results:
+            break
+
+    # Phase 2: detail enrichment for floor+elevator+available_date
+    if listings:
+        sem = asyncio.Semaphore(10)
+        UA = {"User-Agent": _HTTPX_UA}
+        import httpx as _httpx
+        async with _httpx.AsyncClient(headers=UA, timeout=15, follow_redirects=True) as client:
+            async def _enrich(lst):
+                async with sem:
+                    try:
+                        r = await client.get(lst.url)
+                        if r.status_code != 200:
+                            return None
+                        info = _lodgis_enrich_detail(r.text)
+                    except Exception:
+                        return None
+                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"] > "2026-09":
+                        return lst.lbc_id
+                    floor = info.get("floor")
+                    if isinstance(floor, int) and floor > 3 and info.get("elevator") is False:
+                        return lst.lbc_id
+                    if (av := info.get("available_yyyy_mm")):
+                        lst.available_from = av
+                    if (desc := info.get("description")):
+                        lst.description = desc  # replace empty placeholder
+                    tags = []
+                    if floor is not None: tags.append(f"[ÉTAGE: {floor}]")
+                    if info.get("elevator") is True: tags.append("[ASCENSEUR: oui]")
+                    elif info.get("elevator") is False: tags.append("[ASCENSEUR: non]")
+                    if (av := info.get("available_yyyy_mm")): tags.append(f"[DISPO: {av}]")
+                    if tags:
+                        lst.description = (lst.description + "\n" + " ".join(tags)).strip()
+                    return None
+            drops = await asyncio.gather(*(_enrich(l) for l in listings))
+            drop_set = {d for d in drops if d}
+            if drop_set:
+                logger.info("[LODGIS] Dropped %d (dealbreakers from detail)", len(drop_set))
+                listings = [l for l in listings if l.lbc_id not in drop_set]
+
+    logger.info("[LODGIS] Parsed %d listings (with detail enrichment)", len(listings))
+    return listings
 
 
 def _immojeune_card_to_listing(card) -> Optional[Listing]:
@@ -1794,7 +2877,7 @@ def _immojeune_card_to_listing(card) -> Optional[Listing]:
     # "X m² - Y €" — Y is the actual rent
     price = None
     surface = ""
-    sm = _re2.search(r"(\d+)\s*m²\s*-\s*(\d+)\s*€", text)
+    sm = _re2.search(r"(\d+)(?:[,.]\d+)?\s*m²\s*-\s*(\d+)\s*€", text)
     if sm:
         surface = sm.group(1)
         try:
@@ -1812,6 +2895,17 @@ def _immojeune_card_to_listing(card) -> Optional[Listing]:
 
     desc_el = card.find(class_="description")
     description = desc_el.get_text(strip=True) if desc_el else ""
+
+    # ImmoJeune URL prefix encodes housing type — embed as a tag in description
+    # so detect_housing_type catches it (URL is more reliable than title for IJ).
+    if "/residence-etudiante/" in href:
+        description = (description + "\nrésidence étudiante").strip()
+    elif "/colocation/" in href:
+        description = (description + "\ncolocation").strip()
+    elif "/coliving/" in href:
+        description = (description + "\ncoliving").strip()
+    elif "/location-courte-duree/" in href:
+        description = (description + "\nlocation courte durée").strip()
 
     images = [
         src for img in card.find_all("img")
@@ -1833,27 +2927,93 @@ def _immojeune_card_to_listing(card) -> Optional[Listing]:
     )
 
 
+def _immojeune_enrich_detail(html: str) -> dict:
+    """Extract ImmoJeune feature flags from icon alt-text + publication date
+    from "Publiée il y a X jours/mois" relative phrasing."""
+    out: dict = {}
+    alts = set(_re.findall(r'alt="([^"]+)"', html))
+    if "Meublé" in alts: out["furnished"] = True
+    if "Ascenseur" in alts: out["elevator"] = True
+    if "Chauffage" in alts: out["has_heating"] = True
+    if (m := _re.search(r"Disponible(?:\s+immédiatement|\s+le|\s+à partir du)?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", html, _re.I)):
+        ds = m.group(1).replace("-", "/")
+        parts = ds.split("/")
+        if len(parts) == 3:
+            yyyy = parts[2] if len(parts[2]) == 4 else f"20{parts[2]}"
+            try:
+                out["available_yyyy_mm"] = f"{yyyy}-{int(parts[1]):02d}"
+            except Exception: pass
+    # Publication date: "Publiée il y a 2 mois", "Publiée il y a 5 jours"
+    if (m := _re.search(r"Publi[ée]e?\s+il y a\s+(\d+)\s+(jour|semaine|mois|an)", html, _re.I)):
+        from datetime import datetime as _dt, timedelta as _td
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        days = n * {"jour": 1, "semaine": 7, "mois": 30, "an": 365}[unit]
+        out["published_at"] = (_dt.utcnow() - _td(days=days)).isoformat()
+    return out
+
+
 async def _search_immojeune_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    """ImmoJeune scraper — uses Camoufox like Studapart since stealth Playwright
-    gets fingerprinted and served the SEO landing version of the page.
-    """
-    logger.info("[IMMOJEUNE] Scraping: %s", search_url)
-    try:
-        html = await _fetch_html_with_camoufox(search_url, post_delay=(4.0, 6.0))
+    """ImmoJeune — plain httpx + parallel detail enrichment via alt-img icons.
+    Detail page exposes feature presence as `<img alt="Meublé">` etc."""
+    from bs4 import BeautifulSoup
+
+    base_no_ext, _, ext = search_url.rpartition(".html")
+    pages = [search_url]
+    if ext == "" and base_no_ext:
+        pages += [f"{base_no_ext}/{n}" for n in range(2, 16)]
+    logger.info("[IMMOJEUNE] Fetching %d pages via httpx", len(pages))
+    htmls = await _fetch_pages_httpx(pages)
+
+    listings: list[Listing] = []
+    seen_ids: set[str] = set()
+    for html in htmls:
         if not html:
-            return []
-        from bs4 import BeautifulSoup
+            continue
         soup = BeautifulSoup(html, "html.parser")
-        cards = soup.find_all("div", class_="card")
-        logger.info("[IMMOJEUNE] Found %d card elements", len(cards))
-        listings = [
-            l for l in (_immojeune_card_to_listing(c) for c in cards[:max_results]) if l
-        ]
-        logger.info("[IMMOJEUNE] Parsed %d listings", len(listings))
-        return listings
-    except Exception as exc:
-        logger.warning("[IMMOJEUNE] Scraping failed: %s", exc)
-        return []
+        for card in soup.find_all("div", class_="card"):
+            l = _immojeune_card_to_listing(card)
+            if l and l.lbc_id not in seen_ids:
+                seen_ids.add(l.lbc_id)
+                listings.append(l)
+                if len(listings) >= max_results:
+                    break
+        if len(listings) >= max_results:
+            break
+
+    # Phase 2: detail-page enrichment for icon-based features
+    if listings:
+        sem = asyncio.Semaphore(10)
+        import httpx as _httpx
+        async with _httpx.AsyncClient(headers={"User-Agent": _HTTPX_UA}, timeout=15, follow_redirects=True) as client:
+            async def _enrich(lst):
+                async with sem:
+                    try:
+                        r = await client.get(lst.url)
+                        if r.status_code != 200:
+                            return None
+                        info = _immojeune_enrich_detail(r.text)
+                    except Exception:
+                        return None
+                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"] > "2026-09":
+                        return lst.lbc_id
+                    if (pub := info.get("published_at")):
+                        lst.published_at = pub
+                    tags = []
+                    if info.get("furnished") is True: tags.append("[MEUBLÉ: oui]")
+                    if info.get("elevator") is True: tags.append("[ASCENSEUR: oui]")
+                    if (av := info.get("available_yyyy_mm")): tags.append(f"[DISPO: {av}]")
+                    if tags:
+                        lst.description = (lst.description + "\n" + " ".join(tags)).strip()
+                    return None
+            drops = await asyncio.gather(*(_enrich(l) for l in listings))
+            drop_set = {d for d in drops if d}
+            if drop_set:
+                logger.info("[IMMOJEUNE] Dropped %d (dispo > sept 2026)", len(drop_set))
+                listings = [l for l in listings if l.lbc_id not in drop_set]
+
+    logger.info("[IMMOJEUNE] Parsed %d listings (with detail)", len(listings))
+    return listings
 
 
 def _locservice_card_to_listing(card) -> Optional[Listing]:
@@ -1911,7 +3071,7 @@ def _locservice_card_to_listing(card) -> Optional[Listing]:
     description = desc_m.group(1).strip()[:500] if desc_m else ""
 
     # Surface: "30 m²" pattern
-    surf_m = _re2.search(r"(\d+)\s*m²", text)
+    surf_m = _re2.search(r"(\d+)(?:[,.]\d+)?\s*m²", text)
     surface = _to_int_safe(surf_m.group(1)) if surf_m else None
 
     images = [
@@ -1934,27 +3094,370 @@ def _locservice_card_to_listing(card) -> Optional[Listing]:
     )
 
 
+def _locservice_enrich_detail(html: str) -> dict:
+    """LocService detail page — plain text contains 'non meublé' / floor / asc.
+    Also captures the marketing description from <div class='description-content'>."""
+    import html as _htmllib
+    out: dict = {}
+    if _re.search(r"non\s*-?\s*meubl[ée]?", html, _re.I):
+        out["furnished"] = False
+    if (m := _re.search(r"(\d+)(?:er|ème|e|ᵉ)?\s*[éE]tage", html)):
+        try: out["floor"] = int(m.group(1))
+        except Exception: pass
+    if _re.search(r"(?:pas|sans)\s+d.?ascenseur", html, _re.I):
+        out["elevator"] = False
+    elif _re.search(r"avec\s+ascenseur", html, _re.I):
+        out["elevator"] = True
+    # Description — typically 200-1500 chars in <div class="description-content">
+    m = _re.search(r'<div[^>]+class="[^"]*description-content[^"]*"[^>]*>(.+?)</div>',
+                   html, _re.S)
+    if m:
+        raw = m.group(1).replace("<br />", "\n").replace("<br/>", "\n").replace("<br>", "\n")
+        txt = _re.sub(r"<[^>]+>", "", raw)
+        txt = _htmllib.unescape(txt)
+        txt = _re.sub(r"[ \t]+", " ", txt)
+        txt = _re.sub(r"\n{3,}", "\n\n", txt).strip()
+        if 80 <= len(txt) <= 5000:
+            out["description"] = txt[:1500]
+    return out
+
+
 async def _search_locservice_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    """LocService scraper — owner-direct rentals, French market.
-    Uses Camoufox for consistency with the rest of the Phase 2 fix; stealth
-    Playwright also works on this site but Camoufox is more reliable."""
-    logger.info("[LOCSERVICE] Scraping: %s", search_url)
-    try:
-        html = await _fetch_html_with_camoufox(search_url, post_delay=(4.0, 6.0))
+    """LocService — plain httpx + parallel detail enrichment. Detail page
+    has 'non meublé' / 'Xème étage' / 'pas d'ascenseur' as plain text."""
+    from bs4 import BeautifulSoup
+
+    base, _, ext = search_url.rpartition(".html")
+    pages = [search_url] + [f"{base}-p{n}.html" for n in range(2, 11) if base]
+    logger.info("[LOCSERVICE] Fetching %d pages via httpx", len(pages))
+    htmls = await _fetch_pages_httpx(pages)
+
+    listings: list[Listing] = []
+    for html in htmls:
         if not html:
-            return []
-        from bs4 import BeautifulSoup
+            continue
         soup = BeautifulSoup(html, "html.parser")
-        cards = soup.find_all("li", class_="accommodation-ad")
-        logger.info("[LOCSERVICE] Found %d card elements", len(cards))
-        listings = [
-            l for l in (_locservice_card_to_listing(c) for c in cards[:max_results]) if l
-        ]
-        logger.info("[LOCSERVICE] Parsed %d listings", len(listings))
-        return listings
+        for card in soup.find_all("li", class_="accommodation-ad"):
+            if (l := _locservice_card_to_listing(card)):
+                listings.append(l)
+                if len(listings) >= max_results:
+                    break
+        if len(listings) >= max_results:
+            break
+
+    if listings:
+        sem = asyncio.Semaphore(10)
+        import httpx as _httpx
+        async with _httpx.AsyncClient(headers={"User-Agent": _HTTPX_UA}, timeout=15, follow_redirects=True) as client:
+            async def _enrich(lst):
+                async with sem:
+                    try:
+                        r = await client.get(lst.url)
+                        if r.status_code != 200: return None
+                        info = _locservice_enrich_detail(r.text)
+                    except Exception:
+                        return None
+                    if info.get("furnished") is False:
+                        return lst.lbc_id
+                    floor = info.get("floor")
+                    if isinstance(floor, int) and floor > 3 and info.get("elevator") is False:
+                        return lst.lbc_id
+                    if (desc := info.get("description")):
+                        lst.description = desc
+                    tags = []
+                    if floor is not None: tags.append(f"[ÉTAGE: {floor}]")
+                    if info.get("elevator") is True: tags.append("[ASCENSEUR: oui]")
+                    elif info.get("elevator") is False: tags.append("[ASCENSEUR: non]")
+                    if tags:
+                        lst.description = (lst.description + "\n" + " ".join(tags)).strip()
+                    return None
+            drops = await asyncio.gather(*(_enrich(l) for l in listings))
+            drop_set = {d for d in drops if d}
+            if drop_set:
+                logger.info("[LOCSERVICE] Dropped %d (non-meublé / étage>3 sans asc)", len(drop_set))
+                listings = [l for l in listings if l.lbc_id not in drop_set]
+
+    logger.info("[LOCSERVICE] Parsed %d listings (with detail)", len(listings))
+    return listings
+
+
+# ─── EntreParticuliers / L'Adresse / Century 21 (3 new agency/p2p sites) ─────
+
+async def _search_entreparticuliers(search_url: str, max_results: int) -> list[Listing]:
+    """EntreParticuliers — 12 listings per arrondissement page. We loop
+    Paris 75001-75020 in parallel for full coverage (~240 listings).
+    `search_url` is ignored — we use the per-arrondissement pattern."""
+    base = "https://www.entreparticuliers.com/annonces-immobilieres/appartement/location"
+    pages = [f"{base}/paris-{i:05d}" for i in range(75001, 75021)]
+    htmls = await _fetch_pages_curl_cffi(pages)
+    listings: list[Listing] = []
+    seen: set[str] = set()
+    for html in htmls:
+        if not html:
+            continue
+        # JSON-LD ref pattern: href="/annonces-immobilieres/appartement/location/{slug}/ref-{id}"
+        for m in _re.finditer(
+            r'href="(/annonces-immobilieres/appartement/location/([a-z0-9-]+)/ref-(\d+))"',
+            html,
+        ):
+            href, slug, rid = m.group(1), m.group(2), m.group(3)
+            if rid in seen:
+                continue
+            seen.add(rid)
+            url = "https://www.entreparticuliers.com" + href
+            # Extract surface from slug if possible (e.g. "studio-de-20m2")
+            surface = None
+            sm = _re.search(r"(\d+)\s*m2", slug)
+            if sm:
+                try: surface = int(sm.group(1))
+                except ValueError: pass
+            # Try to find price near the href in the HTML
+            ctx = html[max(0, m.start() - 500): m.end() + 200]
+            price = None
+            pm = _re.search(r"(\d[\d\s]{1,5})\s*€", ctx)
+            if pm:
+                digits = "".join(c for c in pm.group(1) if c.isdigit())
+                if digits:
+                    try: price = int(digits)
+                    except ValueError: pass
+            listings.append(Listing(
+                lbc_id=f"ep_{rid}",
+                title=slug.replace("-", " ").capitalize()[:200],
+                description="",
+                price=price,
+                location=slug,  # arrondissement embedded in slug
+                seller_name="Particulier",
+                url=url,
+                seller_type_hint="particulier",
+                source="entreparticuliers",
+                surface=surface,
+            ))
+            if len(listings) >= max_results:
+                break
+        if len(listings) >= max_results:
+            break
+    logger.info("[ENTREPARTICULIERS] Parsed %d listings (20 arr.)", len(listings))
+    return listings
+
+
+async def _search_ladresse(search_url: str, max_results: int) -> list[Listing]:
+    """L'Adresse (agency network) — 40 listings/page on IDF search."""
+    sep = "?" if "?" not in search_url else "&"
+    pages = [search_url] + [f"{search_url}{sep}page={n}" for n in range(2, 11)]
+    htmls = await _fetch_pages_curl_cffi(pages)
+    listings: list[Listing] = []
+    seen: set[str] = set()
+    for html in htmls:
+        if not html:
+            continue
+        for m in _re.finditer(
+            r'href="(/annonce/location/appartement/([a-z0-9-]+)/(\d+))"',
+            html,
+        ):
+            href, slug, rid = m.group(1), m.group(2), m.group(3)
+            if rid in seen:
+                continue
+            # Filter to Paris arrondissements only
+            if not slug.startswith("paris-750"):
+                continue
+            seen.add(rid)
+            url = "https://www.ladresse.com" + href
+            ctx = html[max(0, m.start() - 600): m.end() + 200]
+            price = None
+            pm = _re.search(r"(\d[\d\s]{1,5})\s*€", ctx)
+            if pm:
+                digits = "".join(c for c in pm.group(1) if c.isdigit())
+                if digits:
+                    try: price = int(digits)
+                    except ValueError: pass
+            surface = None
+            sm = _re.search(r"(\d+)(?:[,.]\d+)?\s*m²", ctx)
+            if sm:
+                try: surface = int(sm.group(1))
+                except ValueError: pass
+            listings.append(Listing(
+                lbc_id=f"la_{rid}",
+                title=slug.replace("-", " ").capitalize()[:200],
+                description="",
+                price=price,
+                location=slug.replace("paris-", "Paris "),
+                seller_name="L'Adresse",
+                url=url,
+                seller_type_hint="pro",
+                source="ladresse",
+                surface=surface,
+            ))
+            if len(listings) >= max_results:
+                break
+        if len(listings) >= max_results:
+            break
+    logger.info("[LADRESSE] Parsed %d listings", len(listings))
+    return listings
+
+
+async def _search_century21(search_url: str, max_results: int) -> list[Listing]:
+    """Century 21 — paginates /page-N/, ~10 listings/page, 9 pages typically."""
+    pages = [search_url] + [f"{search_url.rstrip('/')}/page-{n}/" for n in range(2, 10)]
+    htmls = await _fetch_pages_curl_cffi(pages)
+    listings: list[Listing] = []
+    seen: set[str] = set()
+    for html in htmls:
+        if not html:
+            continue
+        for m in _re.finditer(r'href="(/trouver_logement/detail/(\d+)/)"', html):
+            href, rid = m.group(1), m.group(2)
+            if rid in seen:
+                continue
+            seen.add(rid)
+            url = "https://www.century21.fr" + href
+            ctx = html[max(0, m.start() - 800): m.end() + 400]
+            price = None
+            pm = _re.search(r"(\d[\d\s]{1,5})\s*€", ctx)
+            if pm:
+                digits = "".join(c for c in pm.group(1) if c.isdigit())
+                if digits:
+                    try: price = int(digits)
+                    except ValueError: pass
+            surface = None
+            sm = _re.search(r"(\d+)(?:[,.]\d+)?\s*m²", ctx)
+            if sm:
+                try: surface = int(sm.group(1))
+                except ValueError: pass
+            # Title hint: nearby text
+            title_m = _re.search(r"(Appartement|Studio|Maison|Loft)\b[^<]{0,80}", ctx)
+            title = title_m.group(0).strip() if title_m else "Appartement"
+            listings.append(Listing(
+                lbc_id=f"c21_{rid}",
+                title=title[:200],
+                description="",
+                price=price,
+                location="Paris",
+                seller_name="Century 21",
+                url=url,
+                seller_type_hint="pro",
+                source="century21",
+                surface=surface,
+            ))
+            if len(listings) >= max_results:
+                break
+        if len(listings) >= max_results:
+            break
+    logger.info("[CENTURY21] Parsed %d listings", len(listings))
+    return listings
+
+
+async def _search_wizi(search_url: str, max_results: int) -> list[Listing]:
+    """Wizi.io scraper via discovered public API at app.wizi.eu/api/public/flats/search.
+    No auth, paginated by offset. Uses Paris coordinates by default."""
+    from curl_cffi.requests import AsyncSession
+    from urllib.parse import parse_qs, urlparse
+
+    # Parse lat/lon/city from the SPA hash route
+    frag = urlparse(search_url).fragment or urlparse(search_url).query
+    if "?" in frag:
+        frag = frag.split("?", 1)[1]
+    qs = parse_qs(frag)
+    lat = (qs.get("lat") or ["48.856614"])[0]
+    lon = (qs.get("long") or qs.get("lon") or qs.get("lng") or ["2.3522219"])[0]
+    city = (qs.get("city") or ["Paris"])[0]
+
+    headers = {
+        "Content-Type": "application/json;charset=UTF-8",
+        "Origin": "https://desk.wizi.eu",
+        "Referer": "https://desk.wizi.eu/",
+        "User-Agent": _HTTPX_UA,
+    }
+
+    listings: list[Listing] = []
+    offset = 0
+    page_size = 20
+
+    try:
+        async with AsyncSession(impersonate="chrome120", timeout=20, headers=headers) as session:
+            while len(listings) < max_results:
+                body = {
+                    "furnished": 2, "offset": offset, "logement_type": 0,
+                    "surfaceMin": 0, "surfaceMax": 500,
+                    "transaction": 2,  # rent only
+                    "positions": {"latitude": lat, "longitude": lon},
+                }
+                r = await session.post(
+                    "https://app.wizi.eu/api/public/flats/search",
+                    json=body,
+                )
+                if r.status_code != 200:
+                    logger.warning("[WIZI] HTTP %s on offset %d", r.status_code, offset)
+                    break
+                items = r.json() or []
+                if not isinstance(items, list) or not items:
+                    break
+                for it in items:
+                    flat_id = str(it.get("id", ""))
+                    if not flat_id:
+                        continue
+                    price = int(float(it.get("price") or 0)) or None
+                    surface = it.get("surface")
+                    surface = int(float(surface)) if surface not in (None, "", "0") else None
+                    title = (it.get("title") or "").strip() or f"Bien {flat_id}"
+                    images = []
+                    for doc in it.get("documents") or []:
+                        if doc.get("category") == "full_picture":
+                            doc_id = doc.get("id")
+                            ext = doc.get("extension", "jpeg")
+                            if doc_id:
+                                images.append(f"https://app.wizi.eu/api/public/documents/{doc_id}.{ext}")
+                    pub = (it.get("publish_at") or it.get("created_at") or "").replace(" ", "T") or None
+                    listings.append(Listing(
+                        lbc_id=f"wizi_{flat_id}",
+                        title=title[:200],
+                        description=f"{(it.get('city') or city)} - {surface or '?'}m²",
+                        price=price,
+                        location=(it.get("city") or city),
+                        seller_name="Wizi",
+                        url=f"https://desk.wizi.eu/#/app/flat/{flat_id}",
+                        seller_type_hint="agency",
+                        source="wizi",
+                        images=images,
+                        surface=surface,
+                        published_at=pub,
+                    ))
+                    if len(listings) >= max_results:
+                        break
+                if len(items) < page_size:
+                    break
+                offset += page_size
     except Exception as exc:
-        logger.warning("[LOCSERVICE] Scraping failed: %s", exc)
-        return []
+        logger.warning("[WIZI] scrape failed: %s", exc)
+
+    # Phase 2: enrich descriptions from per-listing API (curl_cffi, ~80ms each
+    # at concurrency=10). The /search endpoint doesn't include description;
+    # only /flats/{id} does. Cheap because no HTML parse — pure JSON.
+    if listings:
+        from curl_cffi.requests import AsyncSession
+        sem = asyncio.Semaphore(10)
+        async def _enrich(lst):
+            flat_id = lst.lbc_id.removeprefix("wizi_")
+            if not flat_id.isdigit():
+                return
+            async with sem:
+                try:
+                    async with AsyncSession(impersonate="chrome120", timeout=15) as s:
+                        r = await s.get(
+                            f"https://app.wizi.eu/api/public/flats/{flat_id}",
+                            headers={"Origin": "https://desk.wizi.eu",
+                                     "Referer": "https://desk.wizi.eu/"},
+                        )
+                    if r.status_code != 200:
+                        return
+                    desc = (r.json() or {}).get("description") or ""
+                    if isinstance(desc, str) and len(desc) > 80:
+                        lst.description = desc.replace("\r\n", "\n").strip()[:1500]
+                except Exception:
+                    pass
+        await asyncio.gather(*(_enrich(l) for l in listings), return_exceptions=True)
+
+    logger.info("[WIZI] Parsed %d listings", len(listings))
+    return listings
 
 
 async def _search_roomlala_with_playwright(search_url: str, max_results: int) -> list[Listing]:
@@ -1966,6 +3469,456 @@ async def _search_roomlala_with_playwright(search_url: str, max_results: int) ->
         prefix="rl",
         card_selectors=[r"property-card|room-card|listing-card", r"card|listing"],
     )
+
+
+# ─── Laforêt (laforet.com) ─────────────────────────────────────────────────
+#
+# Laforêt's search HTML is rendered server-side (Symfony) but every result
+# card carries `data-gtm-item-*` attributes used by their analytics layer:
+# id, name, price, size, rooms-nb, city, zipcode, criteria. That gives us
+# everything the spec asks for *without* hydrating the Live Components.
+#
+# Strategy:
+#   1. Static fetch via curl_cffi (fast path) — works in probes (HTTP 200,
+#      40 cards/page with full data attributes).
+#   2. If 0 cards (e.g. WAF challenge), fall back to Playwright + stealth
+#      with a 5-10s wait so any Live Component XHRs settle. Same parser.
+#
+# Search URL: /ville/location-appartement-paris-75000?filter[max]=1100
+# Pagination: &page=N (40 cards per page).
+
+_LAFORET_CARD_FIELDS = {
+    "name":     _re.compile(r'data-gtm-item-name-param="([^"]+)"'),
+    "city":     _re.compile(r'data-gtm-item-city-param="([^"]+)"'),
+    "zip":      _re.compile(r'data-gtm-item-zipcode-param="([^"]+)"'),
+    "price":    _re.compile(r'data-gtm-item-price-param="([^"]+)"'),
+    "size":     _re.compile(r'data-gtm-item-size-param="([^"]+)"'),
+    "rooms":    _re.compile(r'data-gtm-item-rooms-nb-param="([^"]+)"'),
+    "criteria": _re.compile(r'data-gtm-item-criteria-param="([^"]+)"'),
+}
+_LAFORET_ID_RE = _re.compile(r'data-gtm-item-id-param="(\d+)"')
+
+
+def _laforet_parse_html(html: str, max_results: int) -> list[Listing]:
+    """Pull listings from a Laforêt search page using GTM data attributes."""
+    listings: list[Listing] = []
+    seen: set[str] = set()
+    for m in _LAFORET_ID_RE.finditer(html):
+        rid = m.group(1)
+        if rid in seen:
+            continue
+        seen.add(rid)
+        # Window covering the card's GTM block (attributes sit within ~2KB)
+        chunk = html[max(0, m.start() - 200): m.start() + 2500]
+        fields = {k: (r.search(chunk).group(1) if r.search(chunk) else "")
+                  for k, r in _LAFORET_CARD_FIELDS.items()}
+        href_m = _re.search(
+            r'href="(https://www\.laforet\.com/agence-immobiliere/[^"]*-' + rid + r')"',
+            chunk,
+        )
+        url = href_m.group(1) if href_m else f"https://www.laforet.com/?id={rid}"
+
+        # Parse price (may carry decimals, e.g. "961.01")
+        price = None
+        if fields["price"]:
+            try: price = int(float(fields["price"]))
+            except ValueError: pass
+
+        # Surface (e.g. "58.18")
+        surface = None
+        if fields["size"]:
+            try: surface = int(float(fields["size"]))
+            except ValueError: pass
+
+        zipcode = fields["zip"]
+        city    = (fields["city"] or "").title() or "Paris"
+        location = f"{city} {zipcode[-2:]}" if zipcode.startswith("75") and len(zipcode) == 5 else city
+
+        # Title — prefer the GTM item-name; enrich with criteria for clarity
+        title = fields["name"] or f"Appartement {fields['rooms']} pièces"
+        if fields["criteria"]:
+            title = f"{title} — {fields['criteria']}"
+
+        listings.append(Listing(
+            lbc_id=f"lf_{rid}",
+            title=title[:240],
+            description=fields["criteria"] or "",
+            price=price,
+            location=location,
+            seller_name="Laforêt",
+            url=url,
+            seller_type_hint="pro",
+            source="laforet",
+            surface=surface,
+        ))
+        if len(listings) >= max_results:
+            break
+    return listings
+
+
+async def _search_laforet_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """Scrape Laforêt rentals.
+
+    `search_url` is normalised to the Paris-rentals page if a generic URL
+    is passed. Static HTML carries 40 cards/page with all needed fields
+    in `data-gtm-item-*` attributes — no Live Component hydration needed
+    in the common case. Falls back to Playwright + stealth if the static
+    response is empty (WAF challenge).
+
+    Important Laforêt quirk: passing `filter[max]=N` makes the backend
+    ignore the city slug and return France-wide results. So we apply the
+    1100 € budget cap client-side and use the unfiltered city URL.
+    """
+    from bs4 import BeautifulSoup  # noqa: F401 — kept for parity w/ siblings
+
+    MAX_PRICE = 1100  # spec target
+
+    # Default to Paris if a non-Laforêt URL is passed
+    if not search_url or "laforet.com" not in search_url:
+        search_url = "https://www.laforet.com/ville/location-appartement-paris-75000"
+
+    # Strip any filter[max]/filter[min] from the URL so the city slug stays scoped
+    search_url = _re.sub(r"[?&]filter%5B(?:max|min)%5D=\d+", "", search_url)
+    search_url = _re.sub(r"[?&]filter\[(?:max|min)\]=\d+", "", search_url)
+    search_url = search_url.rstrip("?&")
+
+    sep = "&" if "?" in search_url else "?"
+    pages = [search_url] + [f"{search_url}{sep}page={n}" for n in range(2, 6)]
+
+    listings: list[Listing] = []
+    seen: set[str] = set()
+
+    # Fast path: curl_cffi static fetch
+    htmls = await _fetch_pages_curl_cffi(pages)
+    for html in htmls:
+        if not html:
+            continue
+        for l in _laforet_parse_html(html, 1000):  # parse all, filter below
+            if l.lbc_id in seen:
+                continue
+            seen.add(l.lbc_id)
+            if l.price is not None and l.price > MAX_PRICE:
+                continue
+            listings.append(l)
+            if len(listings) >= max_results:
+                break
+        if len(listings) >= max_results:
+            break
+
+    if listings:
+        logger.info("[LAFORET] Parsed %d listings via static HTML (≤%d€)",
+                    len(listings), MAX_PRICE)
+        await _laforet_enrich_descriptions(listings)
+        return listings
+
+    # Fallback: Playwright + stealth (handles WAF / Live Component edge cases)
+    logger.info("[LAFORET] Static fetch yielded 0 — falling back to Playwright")
+    try:
+        async with async_playwright() as pw:
+            ctx = await pw.chromium.launch_persistent_context(
+                user_data_dir=_user_data_dir("laforet"),
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
+                user_agent=_HTTPX_UA,
+                viewport={"width": 1280, "height": 800},
+                locale="fr-FR",
+            )
+            page = await ctx.new_page()
+            await Stealth().apply_stealth_async(page)
+            try:
+                for url in pages[:3]:  # 3 pages max via PW (heavier)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    await _handle_cookie_banner(page)
+                    # Give Live Components 5-10s to hydrate (per spec)
+                    await asyncio.sleep(random.uniform(5.0, 8.0))
+                    html = await page.content()
+                    for l in _laforet_parse_html(html, 1000):
+                        if l.lbc_id in seen:
+                            continue
+                        seen.add(l.lbc_id)
+                        if l.price is not None and l.price > MAX_PRICE:
+                            continue
+                        listings.append(l)
+                    if len(listings) >= max_results:
+                        break
+            finally:
+                await ctx.close()
+    except Exception as exc:
+        logger.warning("[LAFORET] Playwright fallback failed: %s", exc)
+
+    logger.info("[LAFORET] Parsed %d listings (Playwright fallback)", len(listings))
+    await _laforet_enrich_descriptions(listings)
+    return listings
+
+
+async def _laforet_enrich_descriptions(listings: list[Listing]) -> None:
+    """Fetch each Laforêt detail page and replace the synthesized description
+    with the full marketing copy (typically 500-1400 chars). curl_cffi only
+    — no Camoufox needed. ~50ms/listing at concurrency=10."""
+    if not listings:
+        return
+    import html as _htmllib
+    from curl_cffi.requests import AsyncSession
+
+    sec_re = _re.compile(r'id="section-description"(.*?)</section>', _re.S)
+    prose_re = _re.compile(r'<div\s+class="prose"\s*>(.*?)</div>', _re.S)
+    tag_re = _re.compile(r'<[^>]+>')
+
+    sem = asyncio.Semaphore(10)
+    async def _enrich(lst, session):
+        async with sem:
+            try:
+                r = await session.get(lst.url, impersonate="chrome120", timeout=15)
+                if r.status_code != 200:
+                    return
+                section = sec_re.search(r.text)
+                if not section:
+                    return
+                prose = prose_re.search(section.group(1))
+                if not prose:
+                    return
+                raw = prose.group(1).replace("<br />", "\n").replace("<br/>", "\n").replace("<br>", "\n")
+                txt = tag_re.sub("", raw)
+                txt = _htmllib.unescape(txt)
+                txt = _re.sub(r"[ \t]+", " ", txt)
+                txt = _re.sub(r"\n{3,}", "\n\n", txt).strip()
+                if len(txt) > 80:
+                    lst.description = txt[:1500]
+            except Exception:
+                pass
+
+    async with AsyncSession() as session:
+        await asyncio.gather(*(_enrich(l, session) for l in listings), return_exceptions=True)
+
+
+# ─── Guy Hoquet ──────────────────────────────────────────────────────────────
+#
+# Architecture: SPA-ish search page that hydrates listings via XHR to
+#   GET /biens/result?templates[]=properties&p=N&filters[10][]=2
+#                    &filters[20][]=<city-slug>&filters[40][]=<max-price>
+# returning JSON {success, total, templates: {properties: <html-fragment>}}.
+# Filter slot IDs (discovered via the search form's hidden inputs):
+#   10 → type_transaction (1=Acheter, 2=Louer, 3=Loc.saisonnière, 5=Meublée)
+#   20 → locations[] (slug from /biens/search-localization?q=…, e.g. paris-75056_c4)
+#   40 → price_max
+#
+# The endpoint is fully cookieless when called with proper headers, so we use
+# curl_cffi + chrome120 fingerprint (10× faster than Playwright). Playwright
+# is the fallback when Cloudflare returns a challenge.
+
+_GH_PARIS_SLUG = "paris-75056_c4"  # from /biens/search-localization?q=paris (id=41)
+_GH_ITEM_RE = _re.compile(
+    r'<div\s+class="[^"]*resultat-item[^"]*"\s+data-id="(\d+)">(.*?)</div>\s*</a>\s*</div>',
+    _re.DOTALL,
+)
+_GH_HREF_RE = _re.compile(r'<a\s+href="(https://www\.guy-hoquet\.com/(?:location|achat-vente)/[^"]+)"')
+_GH_NAME_RE = _re.compile(r'<span class="ttl property-name">\s*([^<\n]+?)\s*(?:<|$)', _re.DOTALL)
+_GH_SURFACE_RE = _re.compile(r'(\d+(?:[\.,]\d+)?)\s*m(?:²|2|&sup2;)')
+_GH_PRICE_RE = _re.compile(r'<div class="price">\s*([^<]+?)\s*</div>', _re.DOTALL)
+_GH_CITY_RE = _re.compile(r'<div class="text-truncate"[^>]*title="([^"]+)"')
+_GH_DESC_RE = _re.compile(r'<div class="description">\s*([^<]+?)\s*</div>', _re.DOTALL)
+_GH_ALT_RE = _re.compile(r'<img[^>]+\balt="([^"]+)"')
+
+
+def _gh_clean(s: str) -> str:
+    """Collapse whitespace and decode the few HTML entities the API emits."""
+    s = (s or "").replace("&nbsp;", " ").replace("&amp;", "&").replace("&#039;", "'")
+    return _re.sub(r"\s+", " ", s).strip()
+
+
+def _gh_parse_html(html_fragment: str, max_results: int) -> list[Listing]:
+    """Parse the `templates.properties` HTML fragment into Listing objects."""
+    listings: list[Listing] = []
+    seen: set[str] = set()
+    for m in _GH_ITEM_RE.finditer(html_fragment):
+        rid = m.group(1)
+        if rid in seen:
+            continue
+        seen.add(rid)
+        chunk = m.group(2)
+
+        href_m = _GH_HREF_RE.search(chunk)
+        url = href_m.group(1) if href_m else f"https://www.guy-hoquet.com/?id={rid}"
+
+        name = _gh_clean(_GH_NAME_RE.search(chunk).group(1)) if _GH_NAME_RE.search(chunk) else ""
+        # The .property-name span contains both the type AND the surface ("Local commercial 21 m²")
+        surf_m = _GH_SURFACE_RE.search(name) or _GH_SURFACE_RE.search(chunk)
+        surface = None
+        if surf_m:
+            try: surface = int(float(surf_m.group(1).replace(",", ".")))
+            except ValueError: pass
+
+        price = None
+        price_m = _GH_PRICE_RE.search(chunk)
+        if price_m:
+            digits = _re.sub(r"[^\d]", "", price_m.group(1))
+            if digits:
+                try: price = int(digits)
+                except ValueError: pass
+
+        city = _gh_clean(_GH_CITY_RE.search(chunk).group(1)) if _GH_CITY_RE.search(chunk) else "Paris"
+        desc = _gh_clean(_GH_DESC_RE.search(chunk).group(1)) if _GH_DESC_RE.search(chunk) else ""
+
+        # Title: prefer image alt (richer, e.g. "PARIS 13e - LOCAL COMMERCIAL 21 m² - EXCLUSIVITÉ"),
+        # fall back to .property-name
+        alt_m = _GH_ALT_RE.search(chunk)
+        title = _gh_clean(alt_m.group(1)) if alt_m else name
+
+        listings.append(Listing(
+            lbc_id=f"gh_{rid}",
+            title=(title or "Annonce Guy Hoquet")[:240],
+            description=desc,
+            price=price,
+            location=city,
+            seller_name="Guy Hoquet",
+            url=url,
+            seller_type_hint="pro",
+            source="guyhoquet",
+            surface=surface,
+        ))
+        if len(listings) >= max_results:
+            break
+    return listings
+
+
+def _gh_build_api_url(page: int, *, location_slug: str = _GH_PARIS_SLUG,
+                     transaction: int = 2, price_max: int = 1100) -> str:
+    """Build the JSON XHR URL the front-end calls when filters are applied."""
+    return (
+        "https://www.guy-hoquet.com/biens/result?"
+        "templates%5B%5D=properties"
+        f"&p={page}"
+        f"&filters%5B10%5D%5B%5D={transaction}"
+        f"&filters%5B20%5D%5B%5D={location_slug}"
+        f"&filters%5B40%5D%5B%5D={price_max}"
+    )
+
+
+async def _gh_fetch_pages_curl_cffi(urls: list[str], timeout: int = 15) -> list[Optional[str]]:
+    """Fetch the JSON XHRs and return the inner properties HTML for each.
+
+    The endpoint requires X-Requested-With:XMLHttpRequest (otherwise it
+    returns the full SPA shell HTML, not the JSON we want).
+    """
+    from curl_cffi.requests import AsyncSession
+    headers = {
+        "User-Agent": _HTTPX_UA,
+        "Accept": "application/json,text/javascript,*/*;q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.guy-hoquet.com/biens/result",
+    }
+    async with AsyncSession(impersonate="chrome120", timeout=timeout, headers=headers) as session:
+        async def _one(url: str) -> Optional[str]:
+            try:
+                r = await session.get(url, allow_redirects=True)
+                if r.status_code != 200:
+                    return None
+                data = r.json()
+                if not data.get("success"):
+                    return None
+                return data.get("templates", {}).get("properties", "") or None
+            except Exception as exc:
+                logger.warning("[GUYHOQUET] curl_cffi fetch failed for %s: %s", url[:120], exc)
+                return None
+        return await asyncio.gather(*(_one(u) for u in urls))
+
+
+async def _search_guyhoquet_with_playwright(search_url: str, max_results: int) -> list[Listing]:
+    """Scrape Guy Hoquet rentals (Paris, ≤1100€ by default).
+
+    `search_url` is best-effort: any Guy Hoquet URL is accepted but filters are
+    re-applied via the JSON endpoint regardless (the public URLs don't carry
+    filter state — it's session-bound). To target Paris rentals ≤1100€ pass
+    any guy-hoquet.com URL or the canonical /annonces/location/paris/.
+
+    Fast path: curl_cffi + chrome120 fingerprint hits /biens/result with the
+    filter slots already encoded — no browser, no cookies, ~1s/page.
+    Fallback: Playwright + stealth replays the same XHR through a real
+    browser context if Cloudflare ever blocks the fast path.
+    """
+    MAX_PRICE = 1100  # spec target
+
+    # We always paginate against the JSON endpoint regardless of input URL.
+    pages = [_gh_build_api_url(p, price_max=MAX_PRICE) for p in range(1, 6)]
+
+    listings: list[Listing] = []
+    seen: set[str] = set()
+
+    # Fast path: curl_cffi
+    fragments = await _gh_fetch_pages_curl_cffi(pages)
+    for frag in fragments:
+        if not frag:
+            continue
+        for l in _gh_parse_html(frag, 1000):
+            if l.lbc_id in seen:
+                continue
+            seen.add(l.lbc_id)
+            if l.price is not None and l.price > MAX_PRICE:
+                continue
+            listings.append(l)
+            if len(listings) >= max_results:
+                break
+        if len(listings) >= max_results:
+            break
+
+    if listings:
+        logger.info("[GUYHOQUET] Parsed %d listings via JSON XHR (≤%d€)",
+                    len(listings), MAX_PRICE)
+        return listings
+
+    # Fallback: Playwright + stealth
+    logger.info("[GUYHOQUET] Fast path empty — falling back to Playwright")
+    try:
+        async with async_playwright() as pw:
+            ctx = await pw.chromium.launch_persistent_context(
+                user_data_dir=_user_data_dir("guyhoquet"),
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled",
+                      "--window-size=1280,800"],
+                user_agent=_HTTPX_UA,
+                viewport={"width": 1280, "height": 800},
+                locale="fr-FR",
+            )
+            page = await ctx.new_page()
+            await Stealth().apply_stealth_async(page)
+            try:
+                # Warm up: load the search page to set Laravel session cookies.
+                await page.goto("https://www.guy-hoquet.com/biens/result",
+                                wait_until="networkidle", timeout=45_000)
+                await asyncio.sleep(1.5)
+                # Replay each filtered XHR through the browser fetch (uses cookies).
+                for url in pages:
+                    try:
+                        frag = await page.evaluate(
+                            "async (u) => {"
+                            "  const r = await fetch(u, {headers:{'X-Requested-With':'XMLHttpRequest'}});"
+                            "  if (!r.ok) return null;"
+                            "  const j = await r.json();"
+                            "  return j && j.templates ? j.templates.properties : null;"
+                            "}",
+                            url,
+                        )
+                    except Exception as exc:
+                        logger.warning("[GUYHOQUET] PW fetch failed: %s", exc)
+                        continue
+                    if not frag:
+                        continue
+                    for l in _gh_parse_html(frag, 1000):
+                        if l.lbc_id in seen:
+                            continue
+                        seen.add(l.lbc_id)
+                        if l.price is not None and l.price > MAX_PRICE:
+                            continue
+                        listings.append(l)
+                    if len(listings) >= max_results:
+                        break
+            finally:
+                await ctx.close()
+    except Exception as exc:
+        logger.warning("[GUYHOQUET] Playwright fallback failed: %s", exc)
+
+    logger.info("[GUYHOQUET] Parsed %d listings (Playwright fallback)", len(listings))
+    return listings
 
 
 # ─── Listing quality + fraud filter ──────────────────────────────────────────
@@ -2066,57 +4019,107 @@ def _is_roomlala(url: str) -> bool:
     return "roomlala.com" in url
 
 
+def _is_entreparticuliers(url: str) -> bool:
+    return "entreparticuliers.com" in url
+
+
+def _is_ladresse(url: str) -> bool:
+    return "ladresse.com" in url
+
+
+def _is_century21(url: str) -> bool:
+    return "century21.fr" in url
+
+
+def _is_wizi(url: str) -> bool:
+    return "wizi.io" in url or "wizi.eu" in url
+
+
+def _is_laforet(url: str) -> bool:
+    return "laforet.com" in url
+
+
+def _is_guyhoquet(url: str) -> bool:
+    return "guy-hoquet.com" in url or "guyhoquet.com" in url
+
+
+# In-memory scrape result cache. Key = (search_url, max_results). Value =
+# (timestamp, listings). TTL = 5 min so back-to-back /campagne calls in the
+# same window don't re-hit the same sources. Saves ~30s on repeat campaigns.
+_SCRAPE_CACHE: dict[tuple, tuple[float, list]] = {}
+_SCRAPE_CACHE_TTL_SEC = 300  # 5 minutes
+
+
 async def search_listings(search_url: str, max_results: int = 50) -> list[Listing]:
     """Scrape a search page. Source auto-detected from URL.
 
     Supported: LBC, SeLoger, PAP, Bien'ici, Logic-Immo,
     Studapart, Paris Attitude, Lodgis, ImmoJeune, LocService, Roomlala.
+
+    Caches results in-memory for 5 minutes — back-to-back campaigns reuse
+    the previous fetch instead of re-scraping.
     """
     if config.MOCK_MODE:
         from mock_data import MOCK_LISTINGS
         logger.info("[MOCK] Returning %d fake listings", len(MOCK_LISTINGS))
         return MOCK_LISTINGS[:max_results]
 
+    cache_key = (search_url, max_results)
+    cached = _SCRAPE_CACHE.get(cache_key)
+    if cached is not None:
+        ts, listings = cached
+        age = time.time() - ts
+        if age < _SCRAPE_CACHE_TTL_SEC:
+            logger.info("[CACHE HIT] %s — returning %d cached (age %.0fs)", search_url[:60], len(listings), age)
+            return listings
+
+    # Dispatch to per-source scraper, then cache result
     if _is_seloger(search_url):
-        return await _search_seloger_with_playwright(search_url, max_results)
-
-    if _is_pap(search_url):
-        return await _search_pap_with_playwright(search_url, max_results)
-
-    if _is_bienici(search_url):
-        return await _search_bienici_with_playwright(search_url, max_results)
-
-    if _is_logicimmo(search_url):
-        return await _search_logicimmo_with_playwright(search_url, max_results)
-
-    if _is_studapart(search_url):
-        return await _search_studapart_with_playwright(search_url, max_results)
-
-    if _is_parisattitude(search_url):
-        return await _search_parisattitude_with_playwright(search_url, max_results)
-
-    if _is_lodgis(search_url):
-        return await _search_lodgis_with_playwright(search_url, max_results)
-
-    if _is_immojeune(search_url):
-        return await _search_immojeune_with_playwright(search_url, max_results)
-
-    if _is_locservice(search_url):
-        return await _search_locservice_with_playwright(search_url, max_results)
-
-    if _is_roomlala(search_url):
-        return await _search_roomlala_with_playwright(search_url, max_results)
-
-    if config.USE_APIFY:
+        listings = await _search_seloger_with_playwright(search_url, max_results)
+    elif _is_pap(search_url):
+        listings = await _search_pap_with_playwright(search_url, max_results)
+    elif _is_bienici(search_url):
+        listings = await _search_bienici_with_playwright(search_url, max_results)
+    elif _is_logicimmo(search_url):
+        listings = await _search_logicimmo_with_playwright(search_url, max_results)
+    elif _is_studapart(search_url):
+        listings = await _search_studapart_with_playwright(search_url, max_results)
+    elif _is_parisattitude(search_url):
+        listings = await _search_parisattitude_with_playwright(search_url, max_results)
+    elif _is_lodgis(search_url):
+        listings = await _search_lodgis_with_playwright(search_url, max_results)
+    elif _is_immojeune(search_url):
+        listings = await _search_immojeune_with_playwright(search_url, max_results)
+    elif _is_locservice(search_url):
+        listings = await _search_locservice_with_playwright(search_url, max_results)
+    elif _is_roomlala(search_url):
+        listings = await _search_roomlala_with_playwright(search_url, max_results)
+    elif _is_entreparticuliers(search_url):
+        listings = await _search_entreparticuliers(search_url, max_results)
+    elif _is_ladresse(search_url):
+        listings = await _search_ladresse(search_url, max_results)
+    elif _is_century21(search_url):
+        listings = await _search_century21(search_url, max_results)
+    elif _is_wizi(search_url):
+        listings = await _search_wizi(search_url, max_results)
+    elif _is_laforet(search_url):
+        listings = await _search_laforet_with_playwright(search_url, max_results)
+    elif _is_guyhoquet(search_url):
+        listings = await _search_guyhoquet_with_playwright(search_url, max_results)
+    elif config.USE_APIFY:
         logger.info("[APIFY] Scraping search (max %d): %s", max_results, search_url)
         items = await _run_actor(config.APIFY_SEARCH_ACTOR, {
             "searchUrl": search_url,
             "maxItems": max_results,
             "proxyConfiguration": {"useApifyProxy": True},
         })
-        return [l for l in (_item_to_listing(i) for i in items) if l]
+        listings = [l for l in (_item_to_listing(i) for i in items) if l]
+    else:
+        listings = await _search_with_playwright(search_url, max_results)
 
-    return await _search_with_playwright(search_url, max_results)
+    if listings:
+        _SCRAPE_CACHE[cache_key] = (time.time(), listings)
+    return listings
 
 
 async def fetch_single_listing(url: str) -> Optional[Listing]:

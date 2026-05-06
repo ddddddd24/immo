@@ -1,9 +1,12 @@
 """Telegram bot entry point — all commands handled here."""
 import asyncio
 import logging
+import os
 import re
 import sys
 import time
+from datetime import datetime
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +28,7 @@ from telegram.request import HTTPXRequest
 
 import config
 import database
-from agent import analyse_listing, format_simulation_text, classify_intent, Listing, score_listing, prescreen_listing
+from agent import analyse_listing, format_simulation_text, classify_intent, Listing, score_listing, score_listings_batch, prescreen_listing
 from scraper import search_listings, fetch_single_listing, is_real_offer, is_suspicious
 from messenger import send_message_safe, check_inbox_lbc
 from profile import PROFILE
@@ -494,34 +497,46 @@ async def _run_campaign_core(
 
 
 _SOURCE_LABELS = {
-    "leboncoin":     "LBC",
-    "seloger":       "SeLoger",
-    "pap":           "PAP",
-    "bienici":       "Bien'ici",
-    "logicimmo":     "Logic-Immo",
-    "studapart":     "Studapart",
-    "parisattitude": "Paris Attitude",
-    "lodgis":        "Lodgis",
-    "immojeune":     "ImmoJeune",
-    "locservice":    "LocService",
-    "roomlala":      "Roomlala",
+    "leboncoin":         "LBC",
+    "seloger":           "SeLoger",
+    "pap":               "PAP",
+    "bienici":           "Bien'ici",
+    "logicimmo":         "Logic-Immo",
+    "studapart":         "Studapart",
+    "parisattitude":     "Paris Attitude",
+    "lodgis":            "Lodgis",
+    "immojeune":         "ImmoJeune",
+    "locservice":        "LocService",
+    "roomlala":          "Roomlala",
+    "entreparticuliers": "EntreParticuliers",
+    "ladresse":          "L'Adresse",
+    "century21":         "Century 21",
+    "wizi":              "Wizi",
+    "laforet":           "Laforêt",
+    "guyhoquet":         "Guy Hoquet",
 }
 
 
 def _source_url(source: str) -> str:
     """Map a normalised source name to its configured search URL ('' if disabled)."""
     return {
-        "leboncoin":     config.DEFAULT_SEARCH_URL,
-        "seloger":       config.DEFAULT_SEARCH_SELOGER_URL,
-        "pap":           config.DEFAULT_SEARCH_PAP_URL,
-        "bienici":       config.DEFAULT_SEARCH_BIENICI_URL,
-        "logicimmo":     config.DEFAULT_SEARCH_LOGICIMMO_URL,
-        "studapart":     config.DEFAULT_SEARCH_STUDAPART_URL,
-        "parisattitude": config.DEFAULT_SEARCH_PARISATTITUDE_URL,
-        "lodgis":        config.DEFAULT_SEARCH_LODGIS_URL,
-        "immojeune":     config.DEFAULT_SEARCH_IMMOJEUNE_URL,
-        "locservice":    config.DEFAULT_SEARCH_LOCSERVICE_URL,
-        "roomlala":      config.DEFAULT_SEARCH_ROOMLALA_URL,
+        "leboncoin":         config.DEFAULT_SEARCH_URL,
+        "seloger":           config.DEFAULT_SEARCH_SELOGER_URL,
+        "pap":               config.DEFAULT_SEARCH_PAP_URL,
+        "bienici":           config.DEFAULT_SEARCH_BIENICI_URL,
+        "logicimmo":         config.DEFAULT_SEARCH_LOGICIMMO_URL,
+        "studapart":         config.DEFAULT_SEARCH_STUDAPART_URL,
+        "parisattitude":     config.DEFAULT_SEARCH_PARISATTITUDE_URL,
+        "lodgis":            config.DEFAULT_SEARCH_LODGIS_URL,
+        "immojeune":         config.DEFAULT_SEARCH_IMMOJEUNE_URL,
+        "locservice":        config.DEFAULT_SEARCH_LOCSERVICE_URL,
+        "roomlala":          config.DEFAULT_SEARCH_ROOMLALA_URL,
+        "entreparticuliers": config.DEFAULT_SEARCH_ENTREPARTICULIERS_URL,
+        "ladresse":          config.DEFAULT_SEARCH_LADRESSE_URL,
+        "century21":         config.DEFAULT_SEARCH_CENTURY21_URL,
+        "wizi":              config.DEFAULT_SEARCH_WIZI_URL,
+        "laforet":           config.DEFAULT_SEARCH_LAFORET_URL,
+        "guyhoquet":         config.DEFAULT_SEARCH_GUYHOQUET_URL,
     }.get(source, "")
 
 
@@ -553,6 +568,12 @@ def _campaign_sources(only: str | None = None) -> list[tuple[str, str]]:
         (config.DEFAULT_SEARCH_IMMOJEUNE_URL, "ImmoJeune"),
         (config.DEFAULT_SEARCH_LOCSERVICE_URL, "LocService"),
         (config.DEFAULT_SEARCH_ROOMLALA_URL, "Roomlala"),
+        (config.DEFAULT_SEARCH_ENTREPARTICULIERS_URL, "EntreParticuliers"),
+        (config.DEFAULT_SEARCH_LADRESSE_URL, "L'Adresse"),
+        (config.DEFAULT_SEARCH_CENTURY21_URL, "Century 21"),
+        (config.DEFAULT_SEARCH_WIZI_URL, "Wizi"),
+        (config.DEFAULT_SEARCH_LAFORET_URL, "Laforêt"),
+        (config.DEFAULT_SEARCH_GUYHOQUET_URL, "Guy Hoquet"),
     ]
     return [(url, label) for url, label in sources if url]
 
@@ -608,8 +629,9 @@ async def _run_campaign_body(
     # post_delay (~5s) easily exceeds 90s. Bien'ici has a 3-stage fallback
     # chain (Playwright → Camoufox → XHR intercept) that needs even more.
     _TIMEOUT_BY_LABEL = {
-        # Pure Playwright + stealth — fast (~20-40s typical)
-        "LBC": 90.0,
+        # Pure Playwright + stealth — fast (~20-40s typical, but LBC's
+        # DataDome challenge can take 60-120s on a cold profile)
+        "LBC": 180.0,
         "PAP": 90.0,
         "Logic-Immo": 90.0,
         # Camoufox-based — needs cold-start headroom
@@ -621,121 +643,209 @@ async def _run_campaign_body(
         # Bien'ici: now uses Camoufox + commit-strategy, ~17s typical
         "Bien'ici": 90.0,
         "SeLoger": 180.0,  # Camoufox + LZString decode
+        # New agency / p2p sites — curl_cffi parallel, fast
+        "EntreParticuliers": 60.0,
+        "L'Adresse": 60.0,
+        "Century 21": 60.0,
+        "Wizi": 30.0,
+        "Laforêt": 90.0,  # Playwright fallback if static fails
+        "Guy Hoquet": 60.0,  # curl_cffi XHR — fast, Playwright fallback only on Cloudflare
     }
     DEFAULT_TIMEOUT = 90.0
 
     from scraper import detect_housing_type
 
-    async def _score_listings_parallel(items: list, concurrency: int = 8) -> None:
-        """Score every listing in parallel, semaphore-bounded to avoid rate limits.
+    async def _score_listings_parallel(items: list, concurrency: int = 16) -> None:
+        """Score listings in parallel, semaphore-bounded.
 
-        Mutates each Listing in-place (sets .score and .score_reason) and
-        persists to DB via set_listing_score so dashboard/Sheets see it.
+        Skips listings that already have a non-null score in DB — re-scoring
+        the same listing wastes DeepSeek calls and time. Only NEW listings
+        (or ones that previously failed to score) hit the API. Existing
+        scores are read back into the Listing object so downstream filters
+        see them.
+
+        Mutates each Listing in-place (sets .score and .score_reason).
         Failures are logged and skipped — don't block the campaign.
         """
-        sem = asyncio.Semaphore(concurrency)
-        n_done = [0]
-        n_total = len(items)
+        # 1. Read existing scores from DB in one batch query.
+        ids = [l.lbc_id for l in items if l.lbc_id]
+        existing: dict[str, tuple[int, str]] = {}
+        if ids:
+            with database._conn() as conn:
+                placeholders = ",".join("?" * len(ids))
+                for row in conn.execute(
+                    f"SELECT lbc_id, score, score_reason FROM listings "
+                    f"WHERE lbc_id IN ({placeholders}) AND score IS NOT NULL",
+                    ids,
+                ).fetchall():
+                    existing[row[0]] = (row[1], row[2] or "")
 
-        async def _one(lst):
-            async with sem:
+        # 2. Hydrate items that already have a score; collect the rest.
+        # Skip listings priced > HARD_PRICE_CAP (1050€) — dealbreakers anyway,
+        # so scoring them wastes DeepSeek calls. Listings 1000-1050€ DO get
+        # scored (they show on dashboard, user wants notes for them).
+        import preferences as _prefs
+        cap = _prefs.HARD_PRICE_CAP
+        to_score = []
+        n_over_budget = 0
+        for lst in items:
+            if lst.lbc_id in existing:
+                lst.score, lst.score_reason = existing[lst.lbc_id]
+            elif lst.price is not None and lst.price > cap:
+                n_over_budget += 1
+            else:
+                to_score.append(lst)
+
+        if not to_score:
+            logger.info(
+                "Scored 0/%d (cached: %d, over-budget skipped: %d)",
+                len(items), len(items) - n_over_budget, n_over_budget,
+            )
+            return
+
+        # Batch-score: 5 listings per DeepSeek call → 5× faster + 5× cheaper.
+        # score_listings_batch fans out groups in parallel internally; the
+        # `concurrency` arg is no longer used here but kept for compatibility.
+        try:
+            batch_results = await score_listings_batch(to_score, batch_size=5)
+            for lst, res in zip(to_score, batch_results):
+                lst.score = res["score"]
+                lst.score_reason = res["reason"]
+                avail = res.get("available_from")
+                if avail:
+                    lst.available_from = avail
                 try:
-                    result = await score_listing(lst)
-                    lst.score = result["score"]
-                    lst.score_reason = result["reason"]
                     database.set_listing_score(
-                        lst.lbc_id, result["score"], result["reason"],
+                        lst.lbc_id, res["score"], res["reason"],
+                        available_from=avail,
                     )
                 except Exception as exc:
-                    logger.warning("Score failed for %s: %s", lst.lbc_id, exc)
-                finally:
-                    n_done[0] += 1
+                    logger.warning("Persist score failed for %s: %s", lst.lbc_id, exc)
+            n_scored = len(batch_results)
+        except Exception as exc:
+            logger.warning("Batch scoring failed (%s) — falling back to per-listing", exc)
+            n_scored = 0
+            sem = asyncio.Semaphore(concurrency)
+            async def _one(lst):
+                nonlocal n_scored
+                async with sem:
+                    try:
+                        result = await score_listing(lst)
+                        lst.score = result["score"]
+                        lst.score_reason = result["reason"]
+                        database.set_listing_score(lst.lbc_id, result["score"], result["reason"])
+                        n_scored += 1
+                    except Exception as exc2:
+                        logger.warning("Score failed for %s: %s", lst.lbc_id, exc2)
+            await asyncio.gather(*(_one(l) for l in to_score))
 
-        await asyncio.gather(*(_one(l) for l in items))
-        logger.info("Scored %d/%d listings", n_done[0], n_total)
+        logger.info(
+            "Scored %d new (batched) / %d cached / %d over-budget skipped (total %d)",
+            n_scored, len(items) - len(to_score) - n_over_budget,
+            n_over_budget, len(items),
+        )
 
     def _persist_batch(batch: list) -> int:
-        """Upsert a batch of just-scraped listings to DB. Called per-source so
-        partial campaigns (timeout / abort mid-flight) don't lose data."""
-        n = 0
-        for lst in batch:
-            try:
-                htype, n_room = detect_housing_type(lst.title or "", lst.description or "")
-                database.upsert_listing(
-                    lbc_id=lst.lbc_id, title=lst.title, price=lst.price,
-                    location=lst.location, seller_name=lst.seller_name,
-                    seller_type="", url=lst.url, source=lst.source,
-                    surface=lst.surface, housing_type=htype, roommate_count=n_room,
-                )
-                n += 1
-            except Exception as exc:
-                logger.warning("Failed to persist listing %s: %s", lst.lbc_id, exc)
-        return n
+        """Bulk-upsert a batch of just-scraped listings to DB in one transaction.
+        Drops listings that fail is_real_offer (e.g. "Recherche location...",
+        "Cherche logement", price <400€, suspect titles).
+        """
+        if not batch:
+            return 0
+        # Pre-filter: drop demand-side / suspect listings before persist
+        from scraper import is_real_offer as _real
+        clean = [l for l in batch if _real(l)]
+        n_dropped = len(batch) - len(clean)
+        if n_dropped > 0:
+            logger.info("[persist] dropped %d non-offer/suspect listings", n_dropped)
+        # Sites where phone is hidden by site policy (form/portal-only contact)
+        _PHONE_BLOCKED_SOURCES = {"studapart", "locservice"}
+        # Sites that DON'T expose publication date publicly — use scrape time
+        # as fallback for NEW listings (so user can sort by recency anyway).
+        # Old listings without pub_date stay NULL (per user instruction).
+        _NO_PUBDATE_SOURCES = {"pap", "lodgis", "locservice"}
+        _now_iso = datetime.utcnow().isoformat()
+        rows = []
+        for lst in clean:
+            htype, n_room = detect_housing_type(lst.title or "", lst.description or "")
+            phone = getattr(lst, "phone", None)
+            if phone is None and lst.source in _PHONE_BLOCKED_SOURCES:
+                phone = "#blocked"
+            pub_at = getattr(lst, "published_at", None)
+            if not pub_at and lst.source in _NO_PUBDATE_SOURCES:
+                # Mark with prefix so dashboard can show ⏱ vs 📅 icon
+                pub_at = f"scrape:{_now_iso}"
+            rows.append({
+                "lbc_id": lst.lbc_id, "title": lst.title, "price": lst.price,
+                "location": lst.location, "seller_name": lst.seller_name,
+                "seller_type": "", "url": lst.url, "source": lst.source,
+                "surface": lst.surface, "housing_type": htype,
+                "roommate_count": n_room,
+                "published_at": pub_at,
+                "phone": phone,
+                "description": lst.description,
+                "available_from": getattr(lst, "available_from", None),
+            })
+        try:
+            return database.upsert_listings_batch(rows)
+        except Exception as exc:
+            logger.warning("Bulk upsert failed (%s) — falling back to per-row", exc)
+            n = 0
+            for r in rows:
+                try:
+                    database.upsert_listing(**r)
+                    n += 1
+                except Exception as exc2:
+                    logger.warning("Failed to persist %s: %s", r["lbc_id"], exc2)
+            return n
 
-    # Open ONE Camoufox browser shared across all Camoufox-using sources.
-    # Without this, Studapart + Lodgis + ImmoJeune + LocService + Bien'ici +
-    # SeLoger all cold-start Firefox separately (5-6 × 30s = ~3 min just on
-    # cold-starts). Shared browser cuts that to a single 30s cold-start.
+    # Camoufox concurrency is bounded by the persistent browser pool
+    # (scraper._CAMOUFOX_POOL, size=2). The semaphore here gates Camoufox
+    # tasks BEFORE entering wait_for so queue waits don't eat the timeout
+    # budget — each source gets its full scrape time. Playwright sources
+    # each launch their own Chromium and stay fully parallel.
     _CAMOUFOX_LABELS = {"Studapart", "Lodgis", "ImmoJeune", "LocService", "Bien'ici", "SeLoger"}
-    needs_camoufox = any(label in _CAMOUFOX_LABELS for _, label in sources)
-    camoufox_cm = None
-    if needs_camoufox:
-        try:
-            from camoufox.async_api import AsyncCamoufox
-            import scraper as _scraper_mod
-            camoufox_cm = AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows")
-            _scraper_mod._SHARED_CAMOUFOX_BROWSER = await camoufox_cm.__aenter__()
-            logger.info("Shared Camoufox browser opened for the campaign")
-        except Exception as exc:
-            logger.warning("Could not open shared Camoufox (%s) — sources will cold-start", exc)
-            camoufox_cm = None
+    per_source: list[tuple[str, int, list]] = [("", 0, []) for _ in sources]
+    refresh_lock = asyncio.Lock()
+    camoufox_sem = asyncio.Semaphore(2)
 
-    per_source: list[tuple[str, int, list]] = []
-    listings: list = []
-    for i, (url, label) in enumerate(sources):
-        states[i] = f"🔄 *{label}* : en cours…"
-        await _refresh_board()
-        timeout = _TIMEOUT_BY_LABEL.get(label, DEFAULT_TIMEOUT)
-        t0 = time.time()
-        try:
-            results = await asyncio.wait_for(
-                search_listings(url, max_results=25),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            elapsed = time.time() - t0
-            logger.warning("%s scrape timed out after %.1fs (limit %.0fs)", label, elapsed, timeout)
-            results = []
-            states[i] = f"⏱ {label} : timeout (>{timeout:.0f}s)"
-        except Exception as exc:
-            logger.error("%s scrape failed: %s", label, exc)
-            results = []
-            states[i] = f"❌ {label} : échec ({type(exc).__name__})"
-        else:
-            n = len(results)
-            elapsed = time.time() - t0
-            logger.info("%s scrape done in %.1fs: %d listings", label, elapsed, n)
-            if n == 0:
-                states[i] = f"⚪ {label} : 0 annonce ({elapsed:.0f}s)"
+    async def _scrape_one(i: int, url: str, label: str) -> None:
+        slot = camoufox_sem if label in _CAMOUFOX_LABELS else nullcontext()
+        async with slot:
+            states[i] = f"🔄 *{label}* : en cours…"
+            async with refresh_lock:
+                await _refresh_board()
+            timeout = _TIMEOUT_BY_LABEL.get(label, DEFAULT_TIMEOUT)
+            t0 = time.time()
+            results: list = []
+            try:
+                results = await asyncio.wait_for(search_listings(url, max_results=500), timeout=timeout)
+            except asyncio.TimeoutError:
+                states[i] = f"⏱ {label} : timeout (>{timeout:.0f}s)"
+                logger.warning("%s scrape timed out after %.1fs", label, time.time() - t0)
+            except Exception as exc:
+                states[i] = f"❌ {label} : échec ({type(exc).__name__})"
+                logger.error("%s scrape failed: %s", label, exc)
             else:
-                states[i] = f"✅ {label} : *{n}* annonce{'s' if n > 1 else ''} ({elapsed:.0f}s)"
-        # Persist immediately — survives subsequent source timeouts / aborts
-        if results:
-            _persist_batch(results)
-        await _refresh_board()
-        per_source.append((label, len(results), results))
-        listings.extend(results)
+                elapsed, n = time.time() - t0, len(results)
+                states[i] = (
+                    f"⚪ {label} : 0 annonce ({elapsed:.0f}s)" if n == 0
+                    else f"✅ {label} : *{n}* annonce{'s' if n > 1 else ''} ({elapsed:.0f}s)"
+                )
+                logger.info("%s scrape done in %.1fs: %d listings", label, elapsed, n)
+            if results:
+                _persist_batch(results)
+            per_source[i] = (label, len(results), results)
+            async with refresh_lock:
+                await _refresh_board()
 
-    # Close the shared Camoufox browser once all sources have run
-    if camoufox_cm is not None:
-        try:
-            import scraper as _scraper_mod
-            _scraper_mod._SHARED_CAMOUFOX_BROWSER = None
-            await camoufox_cm.__aexit__(None, None, None)
-            logger.info("Shared Camoufox browser closed")
-        except Exception as exc:
-            logger.warning("Failed to close shared Camoufox: %s", exc)
-
+    t_parallel = time.time()
+    await asyncio.gather(
+        *(_scrape_one(i, url, label) for i, (url, label) in enumerate(sources)),
+        return_exceptions=True,
+    )
+    logger.info("All %d sources finished in %.1fs (parallel)", len(sources), time.time() - t_parallel)
+    listings: list = [lst for _label, _n, results in per_source for lst in results]
     listings = _deduplicate(listings)
 
     # Final scrape-phase update on the same message
@@ -758,7 +868,31 @@ async def _run_campaign_body(
     # the dashboard / Sheets / /rapport_complet show scores on all rows
     # including over-budget ones the user wants to browse.
     if config.ENABLE_SCORING:
-        await _reply(update, f"🎯 Scoring de *{len(listings)}* annonces en parallèle…")
+        import preferences as _prefs
+        cap = _prefs.HARD_PRICE_CAP
+        # Quick count: cached vs new vs over-budget (will be skipped)
+        ids = [l.lbc_id for l in listings if l.lbc_id]
+        n_cached = 0
+        if ids:
+            with database._conn() as conn:
+                placeholders = ",".join("?" * len(ids))
+                n_cached = conn.execute(
+                    f"SELECT COUNT(*) FROM listings WHERE lbc_id IN ({placeholders}) "
+                    f"AND score IS NOT NULL", ids,
+                ).fetchone()[0]
+        n_over = sum(1 for l in listings if l.price is not None and l.price > cap)
+        n_new = len(listings) - n_cached - n_over
+        if n_new > 0:
+            await _reply(
+                update,
+                f"🎯 Scoring de *{n_new}* nouvelles annonces "
+                f"({n_cached} en cache, {n_over} hors budget skipped)…"
+            )
+        else:
+            await _reply(
+                update,
+                f"✅ Aucune nouvelle à scorer ({n_cached} en cache, {n_over} hors budget)."
+            )
         await _score_listings_parallel(listings)
 
     await _reply(update, f"🧠 Analyse de *{len(listings)}* annonces en cours…")
@@ -819,41 +953,41 @@ async def _run_campaign_body(
                     )
                     continue
 
-            result = await analyse_listing(listing)
-            listing_id = database.upsert_listing(
-                lbc_id=listing.lbc_id,
-                title=listing.title,
-                price=listing.price,
-                location=listing.location,
-                seller_name=listing.seller_name,
-                seller_type=result.seller_type,
-                url=listing.url,
-                source=listing.source,
-                surface=listing.surface,
-            )
-            # Persist score and fire high-interest alert
-            if score_result is not None:
-                database.set_listing_score(
-                    listing.lbc_id, score_result["score"], score_result["reason"]
+            # High-interest alert (independent of contact prep)
+            if score_result is not None and score_result["score"] >= config.INTEREST_THRESHOLD:
+                await _reply(
+                    update,
+                    f"🔥 *ANNONCE INTÉRESSANTE* ⭐{score_result['score']}/10\n"
+                    f"📍 _{_escape_md(listing.title)}_ ({_escape_md(listing.location)})\n"
+                    f"💰 {listing.price}€/mois\n"
+                    f"🔗 {listing.url}\n"
+                    f"💡 _{score_result['reason']}_"
                 )
-                if score_result["score"] >= config.INTEREST_THRESHOLD:
-                    await _reply(
-                        update,
-                        f"🔥 *ANNONCE INTÉRESSANTE* ⭐{score_result['score']}/10\n"
-                        f"📍 _{_escape_md(listing.title)}_ ({_escape_md(listing.location)})\n"
-                        f"💰 {listing.price}€/mois\n"
-                        f"🔗 {listing.url}\n"
-                        f"💡 _{score_result['reason']}_"
-                    )
 
-            # Prepare-only: persist as pending, no actual send
-            database.create_contact(listing_id, result.message)
-            sent += 1
-            score_str = f" ⭐{score_result['score']}/10" if score_result else ""
-            await _reply(
-                update,
-                f"📝 Préparé{score_str} → _{_escape_md(listing.title)}_ ({_escape_md(listing.location)})"
-            )
+            if config.ENABLE_CONTACT_PREP:
+                result = await analyse_listing(listing)
+                listing_id = database.upsert_listing(
+                    lbc_id=listing.lbc_id,
+                    title=listing.title,
+                    price=listing.price,
+                    location=listing.location,
+                    seller_name=listing.seller_name,
+                    seller_type=result.seller_type,
+                    url=listing.url,
+                    source=listing.source,
+                    surface=listing.surface,
+                )
+                # Prepare-only: persist as pending, no actual send
+                database.create_contact(listing_id, result.message)
+                sent += 1
+                score_str = f" ⭐{score_result['score']}/10" if score_result else ""
+                await _reply(
+                    update,
+                    f"📝 Préparé{score_str} → _{_escape_md(listing.title)}_ ({_escape_md(listing.location)})"
+                )
+            else:
+                # Contact-prep disabled — just count eligible matches
+                sent += 1
         except Exception as exc:
             logger.error("Campaign error on %s: %s", listing.lbc_id, exc)
             errors += 1
@@ -926,6 +1060,48 @@ async def _run_campaign_body(
                 logger.error("Smart re-contact prep failed for %s: %s", drop["url"], exc)
 
     # Auto-sync to Google Sheets if configured
+    # Activity check: prune listings that are now 404/dead on the source site.
+    # Only check listings NOT in this campaign's results AND scraped > 1 day ago
+    # (recent ones are likely still alive).
+    try:
+        scraped_ids = {l.lbc_id for l in listings}
+        with database._conn() as conn:
+            stale_rows = conn.execute(
+                "SELECT lbc_id, url FROM listings "
+                "WHERE lbc_id NOT IN ({}) AND datetime(scraped_at) < datetime('now', '-1 day') "
+                "AND datetime(scraped_at) > datetime('now', '-7 days')"
+                .format(",".join("?" * len(scraped_ids)) or "''"),
+                list(scraped_ids),
+            ).fetchall()
+        if stale_rows:
+            logger.info("[activity-check] checking %d not-recently-seen listings", len(stale_rows))
+            import httpx as _httpx
+            sem_chk = asyncio.Semaphore(20)
+            dead = []
+            async with _httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0 Chrome/120 Safari/537.36"},
+                                          timeout=10, follow_redirects=True) as cc:
+                async def _check(lbc_id, url):
+                    if not url:
+                        return
+                    async with sem_chk:
+                        try:
+                            r = await cc.head(url)
+                            if r.status_code in (404, 410, 451):
+                                dead.append(lbc_id)
+                        except Exception:
+                            pass  # network errors → don't drop
+                await asyncio.gather(*(_check(r["lbc_id"], r["url"]) for r in stale_rows))
+            if dead:
+                with database._conn() as conn:
+                    conn.execute(
+                        "DELETE FROM listings WHERE lbc_id IN ({})".format(",".join("?" * len(dead))),
+                        dead,
+                    )
+                logger.info("[activity-check] deleted %d dead listings", len(dead))
+                await _reply(update, f"🗑 Activity check : {len(dead)} annonces désactivées purgées.")
+    except Exception as exc:
+        logger.warning("Activity check failed (non-fatal): %s", exc)
+
     if config.SYNC_AFTER_CAMPAIGN:
         try:
             import sheets_sync
@@ -938,6 +1114,14 @@ async def _run_campaign_body(
                 )
         except Exception as exc:
             logger.warning("Auto Sheets sync failed (non-fatal): %s", exc)
+
+    # Regen + push static dashboard to GitHub Pages
+    try:
+        import subprocess
+        await asyncio.to_thread(_publish_static_dashboard)
+        await _reply(update, "🌐 Dashboard public mis à jour sur GitHub Pages.")
+    except Exception as exc:
+        logger.warning("Static dashboard publish failed (non-fatal): %s", exc)
 
     # Check LBC inbox for new replies
     try:
@@ -1208,45 +1392,63 @@ async def cmd_score_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, "✅ Toutes les annonces ont déjà un score.")
         return
 
+    # Cost: ~$0.000065/listing with batch 5-in-1 on DeepSeek (cache hits on prefix)
     await _reply(
         update,
-        f"🎯 Scoring de *{len(unscored)}* annonce(s) sans score (parallèle, semaphore=8)…\n"
-        f"Coût estimé : ~{len(unscored) * 0.005:.2f}$ via DeepSeek.",
+        f"🎯 Scoring de *{len(unscored)}* annonce(s) sans score (batch 5-en-1)…\n"
+        f"Coût estimé : ~${len(unscored) * 0.000065:.3f} via DeepSeek.",
     )
 
-    # Build minimal Listing-like objects for score_listing
+    # Build Listing objects, skip listings above hard price cap (>1050€ are
+    # dealbreakers anyway via scoring v2 — wasted DeepSeek calls).
     from agent import Listing
+    import preferences as _prefs
+    cap = _prefs.HARD_PRICE_CAP
     items = []
+    n_skip = 0
     for r in unscored:
+        if r["price"] is not None and r["price"] > cap:
+            n_skip += 1
+            continue
         items.append(Listing(
-            lbc_id=r["lbc_id"], title=r["title"] or "", description="",
-            price=r["price"] or 0, location=r["location"] or "",
+            lbc_id=r["lbc_id"], title=r["title"] or "",
+            description=r.get("description") or "",
+            price=r["price"], location=r["location"] or "",
             seller_name="", url=r["url"] or "",
             source=r["source"] or "", surface=r.get("surface"),
             housing_type=r.get("housing_type") or "",
             roommate_count=r.get("roommate_count"),
         ))
 
-    sem = asyncio.Semaphore(8)
-    n_done = [0]
-    n_total = len(items)
+    if not items:
+        await _reply(update, f"✅ Aucune annonce ≤{cap}€ à scorer ({n_skip} skip >{cap}€).")
+        return
 
-    async def _one(lst):
-        async with sem:
-            try:
-                result = await score_listing(lst)
-                database.set_listing_score(
-                    lst.lbc_id, result["score"], result["reason"],
-                )
-            except Exception as exc:
-                logger.warning("Backfill score failed for %s: %s", lst.lbc_id, exc)
-            finally:
-                n_done[0] += 1
-
-    await asyncio.gather(*(_one(l) for l in items))
     await _reply(
         update,
-        f"✅ Backfill terminé : *{n_done[0]}/{n_total}* annonces scorées.",
+        f"🚀 Scoring batch 5-en-1 sur *{len(items)}* annonces ({n_skip} skip >{cap}€)…"
+    )
+
+    # Batch scoring: 5 listings per DeepSeek call, all batches in parallel
+    results = await score_listings_batch(items, batch_size=5)
+    n_done = 0
+    n_avail = 0
+    for lst, res in zip(items, results):
+        try:
+            avail = res.get("available_from")
+            database.set_listing_score(
+                lst.lbc_id, res["score"], res["reason"], available_from=avail,
+            )
+            n_done += 1
+            if avail:
+                n_avail += 1
+        except Exception as exc:
+            logger.warning("Persist score failed for %s: %s", lst.lbc_id, exc)
+
+    await _reply(
+        update,
+        f"✅ Backfill terminé : *{n_done}/{len(items)}* annonces scorées "
+        f"(*{n_avail}* avec date dispo) + *{n_skip}* hors budget skip.",
     )
 
 
@@ -1433,7 +1635,6 @@ async def _watch_pool_loop(
 ) -> None:
     """One pool: poll a subset of sources every `interval_min`, score new
     listings, alert on score >= INTEREST_THRESHOLD."""
-    import scraper as _scraper_mod
     import random as _random
     while True:
         try:
@@ -1444,17 +1645,7 @@ async def _watch_pool_loop(
                 await asyncio.sleep(interval_min * 60)
                 continue
 
-            # Open shared Camoufox if this pool needs it
-            cm_handle = None
-            if any(l in _CAMOUFOX_WATCH_LABELS for _u, l in sources):
-                try:
-                    from camoufox.async_api import AsyncCamoufox
-                    cm_handle = AsyncCamoufox(headless=False, locale=["fr-FR"], os="windows")
-                    _scraper_mod._SHARED_CAMOUFOX_BROWSER = await cm_handle.__aenter__()
-                except Exception as exc:
-                    logger.warning("[WATCH %s] could not open shared Camoufox: %s", pool_name, exc)
-                    cm_handle = None
-
+            # Camoufox sources reuse the bot-wide pool (scraper._CAMOUFOX_POOL)
             all_listings: list = []
             for url, label in sources:
                 try:
@@ -1467,14 +1658,6 @@ async def _watch_pool_loop(
                     logger.warning("[WATCH %s] %s timed out", pool_name, label)
                 except Exception as exc:
                     logger.warning("[WATCH %s] %s failed: %s", pool_name, label, exc)
-
-            # Close shared Camoufox
-            if cm_handle is not None:
-                try:
-                    _scraper_mod._SHARED_CAMOUFOX_BROWSER = None
-                    await cm_handle.__aexit__(None, None, None)
-                except Exception:
-                    pass
 
             all_listings = _deduplicate(all_listings)
 
@@ -1842,7 +2025,48 @@ def main() -> None:
         write_timeout=30,
         connection_pool_size=8,
     )
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).request(request).build()
+    def _publish_static_dashboard() -> None:
+        """Regenerate public/index.html + git commit/push to GitHub Pages.
+        Sync function (subprocess), called via asyncio.to_thread."""
+        import subprocess
+        from pathlib import Path
+        # 1. Regenerate the HTML
+        import generate_static
+        generate_static.main()
+        # 2. Git commit + push (only if changes)
+        public_dir = Path("public")
+        env = os.environ.copy()
+        env.setdefault("GIT_AUTHOR_EMAIL", "dashboard@immo.local")
+        env.setdefault("GIT_AUTHOR_NAME", "immo-dashboard")
+        env.setdefault("GIT_COMMITTER_EMAIL", "dashboard@immo.local")
+        env.setdefault("GIT_COMMITTER_NAME", "immo-dashboard")
+        try:
+            subprocess.run(["git", "add", "."], cwd=public_dir, check=True, env=env, capture_output=True)
+            # commit returns 1 if no changes; tolerate
+            subprocess.run(
+                ["git", "commit", "-m", f"update {datetime.utcnow().isoformat(timespec='seconds')}Z"],
+                cwd=public_dir, env=env, capture_output=True,
+            )
+            subprocess.run(["git", "push", "origin", "HEAD"], cwd=public_dir, check=True, env=env, capture_output=True, timeout=30)
+        except Exception as exc:
+            logger.warning("Static publish git step failed: %s", exc)
+
+    async def _post_init(_app):
+        import scraper as _scraper_mod
+        await _scraper_mod.init_camoufox_pool(size=2)
+
+    async def _post_shutdown(_app):
+        import scraper as _scraper_mod
+        await _scraper_mod.shutdown_camoufox_pool()
+
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("settings", cmd_settings))
