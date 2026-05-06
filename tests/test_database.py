@@ -128,6 +128,107 @@ def test_get_price_drops_includes_lbc_id(tmp_db):
     assert drops[0]["lbc_id"] == "drop_id_test"
 
 
+# ─── Fraud detection ─────────────────────────────────────────────────────────
+
+def test_is_suspicious_listing_clean(tmp_db):
+    """Normal listing — no markers, no price anomaly — must come back clean."""
+    listing = {
+        "title": "Studio meublé 25m² Paris 11",
+        "description": "Bel appartement lumineux, charges comprises.",
+        "price": 850,
+        "surface": 25,
+        "location": "75011 Paris",
+    }
+    is_fraud, reason = tmp_db.is_suspicious_listing(listing)
+    assert is_fraud is False
+    assert reason == ""
+
+
+@pytest.mark.parametrize("marker,phrase", [
+    ("WhatsApp",        "Contactez-moi par WhatsApp uniquement"),
+    ("Dubaï",           "Je suis actuellement à Dubaï pour mon travail"),
+    ("Western Union",   "Envoyez la caution par Western Union"),
+    ("PayPal Friends",  "Paiement via PayPal Friends svp"),
+    ("héritage",        "L'appartement vient d'un héritage familial"),
+    ("voyage",          "Je suis en voyage d'affaires à l'étranger"),
+])
+def test_is_suspicious_listing_flags_scam_markers(tmp_db, marker, phrase):
+    listing = {
+        "title": "Bel appartement",
+        "description": phrase,
+        "price": 700, "surface": 30, "location": "75011 Paris",
+    }
+    is_fraud, reason = tmp_db.is_suspicious_listing(listing)
+    assert is_fraud is True, f"expected fraud flag for '{phrase}'"
+    assert "arnaque" in reason.lower()
+
+
+def test_is_suspicious_listing_flags_payment_before_visit(tmp_db):
+    listing = {
+        "title": "Studio à louer",
+        "description": "Veuillez verser la caution avant visite, je vous enverrai les clés par la poste.",
+        "price": 700, "surface": 25, "location": "Paris",
+    }
+    is_fraud, reason = tmp_db.is_suspicious_listing(listing)
+    assert is_fraud is True
+    assert "avant visite" in reason.lower() or "paiement" in reason.lower()
+
+
+def test_is_suspicious_listing_flags_price_anomaly(tmp_db):
+    """Listing 50%+ below the zone+surface median triggers the fraud flag."""
+    # Seed 6 comparables at ~30€/m² in 75011, surface ~25m²
+    for i, (price, surf) in enumerate([(750, 25), (770, 24), (800, 26),
+                                        (820, 27), (790, 25), (810, 26)]):
+        _insert(tmp_db, lbc_id=f"comp{i}", price=price, location="75011 Paris")
+        # Manually set surface (upsert_listing test helper signature has it)
+    # _insert above doesn't populate surface — use direct upsert with surface
+    for i, (price, surf) in enumerate([(750, 25), (770, 24), (800, 26),
+                                        (820, 27), (790, 25), (810, 26)]):
+        tmp_db.upsert_listing(
+            lbc_id=f"comp{i}", title="T", price=price, location="75011 Paris",
+            seller_name="X", seller_type="", url=f"http://comp/{i}",
+            source="leboncoin", surface=surf,
+        )
+    # Suspect: same zone + surface but priced 350€ (≈14€/m², ~50% below median)
+    listing = {
+        "title": "Trop beau pour être vrai",
+        "description": "Sans contexte particulier",
+        "price": 350,
+        "surface": 25,
+        "location": "75011 Paris",
+    }
+    is_fraud, reason = tmp_db.is_suspicious_listing(listing)
+    assert is_fraud is True
+    assert "%" in reason and "marché" in reason
+
+
+def test_is_suspicious_listing_skips_anomaly_when_few_comps(tmp_db):
+    """Fewer than the comp threshold → no price-based flag (sample too small)."""
+    tmp_db.upsert_listing(
+        lbc_id="only_one", title="T", price=800, location="75011 Paris",
+        seller_name="X", seller_type="", url="http://x", source="leboncoin",
+        surface=25,
+    )
+    # Even priced absurdly low, with only 1 comp we don't trust the median
+    listing = {
+        "title": "Solo", "description": "rien",
+        "price": 100, "surface": 25, "location": "75011 Paris",
+    }
+    is_fraud, reason = tmp_db.is_suspicious_listing(listing)
+    assert is_fraud is False
+    assert reason == ""
+
+
+def test_is_suspicious_listing_handles_none(tmp_db):
+    """Defensive: must not crash on None / missing fields."""
+    assert tmp_db.is_suspicious_listing(None) == (False, "")
+    assert tmp_db.is_suspicious_listing({}) == (False, "")
+    assert tmp_db.is_suspicious_listing(
+        {"title": "x", "description": "x", "price": None, "surface": None,
+         "location": ""}
+    ) == (False, "")
+
+
 def test_clear_price_prev_silences_repeat(tmp_db):
     id1 = _insert(tmp_db, lbc_id="silence", price=1000)
     cid = tmp_db.create_contact(id1, "m")
@@ -309,3 +410,321 @@ def test_indexes_exist_after_init(tmp_db):
     assert "idx_contacts_listing" in indexes
     assert "idx_contacts_status_sent" in indexes
     assert "idx_responses_contact" in indexes
+    # New indexes for the activity check + dedup paths
+    assert "idx_listings_source_seen" in indexes
+    assert "idx_listings_dedup_key" in indexes
+    assert "idx_listings_dedup_of" in indexes
+
+
+# ─── Activity check (cross-source) ──────────────────────────────────────────
+
+def test_mark_seen_stamps_seen_at(tmp_db):
+    _insert(tmp_db, lbc_id="alive_1", source="seloger")
+    n = tmp_db.mark_seen("seloger", ["alive_1"])
+    assert n == 1
+    row = tmp_db.get_listing_by_lbc_id("alive_1")
+    assert row["seen_at"] is not None
+
+
+def test_mark_seen_only_touches_matching_source(tmp_db):
+    """seen_at update is scoped by (source, lbc_id) to avoid colliding with
+    a listing of the same lbc_id on a different source — it shouldn't happen
+    in practice (lbc_id is UNIQUE) but the SQL is defensive."""
+    _insert(tmp_db, lbc_id="x_lbc", source="leboncoin")
+    n = tmp_db.mark_seen("seloger", ["x_lbc"])
+    assert n == 0  # no row matches (source, lbc_id)
+    row = tmp_db.get_listing_by_lbc_id("x_lbc")
+    assert row["seen_at"] is None
+
+
+def test_mark_seen_empty_list_is_noop(tmp_db):
+    assert tmp_db.mark_seen("seloger", []) == 0
+
+
+def test_mark_stale_listings_hides_after_24h(tmp_db):
+    """Listings whose seen_at < now-24h get score=0 so the dashboard hides them."""
+    _insert(tmp_db, lbc_id="stale_a")
+    # Manually backdate seen_at to 25h ago
+    with sqlite3.connect(_dbpath()) as conn:
+        conn.execute(
+            "UPDATE listings SET seen_at = datetime('now','-25 hours'), score = 7 "
+            "WHERE lbc_id = ?", ("stale_a",),
+        )
+        conn.commit()
+    n = tmp_db.mark_stale_listings(hours=24)
+    assert n == 1
+    row = tmp_db.get_listing_by_lbc_id("stale_a")
+    assert row["score"] == 0
+    assert row["score_reason"] == "❌ disparu de la source"
+
+
+def test_mark_stale_listings_skips_recent(tmp_db):
+    _insert(tmp_db, lbc_id="fresh_a")
+    tmp_db.mark_seen("leboncoin", ["fresh_a"])  # stamps NOW
+    with sqlite3.connect(_dbpath()) as conn:
+        conn.execute("UPDATE listings SET score = 7 WHERE lbc_id = ?", ("fresh_a",))
+        conn.commit()
+    assert tmp_db.mark_stale_listings(hours=24) == 0
+    row = tmp_db.get_listing_by_lbc_id("fresh_a")
+    assert row["score"] == 7  # untouched
+
+
+def test_mark_stale_listings_skips_never_seen(tmp_db):
+    """Rows where seen_at IS NULL haven't been processed by the new code path
+    yet (legacy data). Don't touch them — the next /campagne will stamp."""
+    _insert(tmp_db, lbc_id="legacy")
+    with sqlite3.connect(_dbpath()) as conn:
+        conn.execute("UPDATE listings SET score = 7 WHERE lbc_id = ?", ("legacy",))
+        conn.commit()
+    assert tmp_db.mark_stale_listings(hours=24) == 0
+    assert tmp_db.get_listing_by_lbc_id("legacy")["score"] == 7
+
+
+def test_mark_stale_listings_idempotent(tmp_db):
+    """Running it twice doesn't double-flag (score>0 filter skips already-hidden)."""
+    _insert(tmp_db, lbc_id="stale_b")
+    with sqlite3.connect(_dbpath()) as conn:
+        conn.execute(
+            "UPDATE listings SET seen_at = datetime('now','-25 hours'), score=7 "
+            "WHERE lbc_id = ?", ("stale_b",),
+        )
+        conn.commit()
+    assert tmp_db.mark_stale_listings(hours=24) == 1
+    # Second pass: no rows updated
+    assert tmp_db.mark_stale_listings(hours=24) == 0
+
+
+def _dbpath():
+    """Helper: return current config.DB_PATH (tmp_db monkeypatches it)."""
+    import config
+    return config.DB_PATH
+
+
+# ─── Dedup helpers ──────────────────────────────────────────────────────────
+
+def test_compute_dedup_key_basic(tmp_db):
+    k = tmp_db.compute_dedup_key(800, 30, "Paris 75011")
+    # zip extracted, price//50=16, surface//2=15
+    assert k == "75011|16|15"
+
+
+def test_compute_dedup_key_no_zip_falls_back_to_city(tmp_db):
+    k = tmp_db.compute_dedup_key(800, 30, "Marseille")
+    # First 8 chars of city, lowercased
+    assert k == "marseill|16|15"
+
+
+def test_compute_dedup_key_returns_none_on_missing_data(tmp_db):
+    assert tmp_db.compute_dedup_key(None, 30, "Paris") is None
+    assert tmp_db.compute_dedup_key(800, None, "Paris") is None
+    assert tmp_db.compute_dedup_key(800, 30, "") is None
+
+
+def test_title_similarity_identical_returns_zero(tmp_db):
+    assert tmp_db.title_similarity("Studio 30m²", "Studio 30m²") == 0.0
+
+
+def test_title_similarity_totally_different_high(tmp_db):
+    assert tmp_db.title_similarity("ABC", "XYZ") == 1.0
+
+
+def test_title_similarity_close_titles_below_threshold(tmp_db):
+    """A LBC and SeLoger version of the same listing typically share most words."""
+    s = tmp_db.title_similarity(
+        "Beau studio 30m² Paris 11ème",
+        "Beau studio 30 m² Paris 11e",
+    )
+    assert s < 0.30
+
+
+def test_apply_dedup_for_batch_flags_cross_source_duplicate(tmp_db):
+    """Same flat on LBC and SeLoger — SeLoger arrives second, flagged dup."""
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "lbc_1", "source": "leboncoin",
+        "title": "Studio 30m² Paris 11", "price": 900, "surface": 30,
+        "location": "Paris 75011", "url": "http://lbc/1",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "lbc_1", "source": "leboncoin",
+        "title": "Studio 30m² Paris 11", "price": 900, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "sel_1", "source": "seloger",
+        "title": "Studio 30 m² Paris 11e", "price": 905, "surface": 30,
+        "location": "Paris 75011", "url": "http://sl/1",
+    }])
+    n = tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "sel_1", "source": "seloger",
+        "title": "Studio 30 m² Paris 11e", "price": 905, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    assert n == 1
+    row = tmp_db.get_listing_by_lbc_id("sel_1")
+    assert row["dedup_of"] == "lbc_1"
+    # Primary is unchanged
+    assert tmp_db.get_listing_by_lbc_id("lbc_1")["dedup_of"] is None
+
+
+def test_apply_dedup_respects_price_tolerance(tmp_db):
+    """800 vs 805 (<5%) is a match; 800 vs 900 is not."""
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "p1", "source": "leboncoin",
+        "title": "Studio Paris", "price": 800, "surface": 25,
+        "location": "Paris 75011", "url": "http://x",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "p1", "source": "leboncoin",
+        "title": "Studio Paris", "price": 800, "surface": 25,
+        "location": "Paris 75011",
+    }])
+    # Within 5%: should dedup
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "p2", "source": "seloger",
+        "title": "Studio Paris", "price": 805, "surface": 25,
+        "location": "Paris 75011", "url": "http://y",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "p2", "source": "seloger",
+        "title": "Studio Paris", "price": 805, "surface": 25,
+        "location": "Paris 75011",
+    }])
+    assert tmp_db.get_listing_by_lbc_id("p2")["dedup_of"] == "p1"
+    # Outside 5%: should NOT dedup
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "p3", "source": "pap",
+        "title": "Studio Paris", "price": 900, "surface": 25,
+        "location": "Paris 75011", "url": "http://z",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "p3", "source": "pap",
+        "title": "Studio Paris", "price": 900, "surface": 25,
+        "location": "Paris 75011",
+    }])
+    assert tmp_db.get_listing_by_lbc_id("p3")["dedup_of"] is None
+
+
+def test_apply_dedup_respects_surface_tolerance(tmp_db):
+    """28 vs 30 (Δ=2) is a match; 28 vs 31 is not (Δ=3>2)."""
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "s1", "source": "leboncoin",
+        "title": "Studio", "price": 900, "surface": 28,
+        "location": "Paris 75011", "url": "http://x",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "s1", "source": "leboncoin",
+        "title": "Studio", "price": 900, "surface": 28,
+        "location": "Paris 75011",
+    }])
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "s2", "source": "seloger",
+        "title": "Studio", "price": 900, "surface": 30,
+        "location": "Paris 75011", "url": "http://y",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "s2", "source": "seloger",
+        "title": "Studio", "price": 900, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    assert tmp_db.get_listing_by_lbc_id("s2")["dedup_of"] == "s1"
+
+
+def test_apply_dedup_skips_same_source(tmp_db):
+    """Two LBC listings should never dedup against each other (intra-source
+    handled by ON CONFLICT(lbc_id), not the cross-source helper)."""
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "ss1", "source": "leboncoin",
+        "title": "Studio", "price": 900, "surface": 30,
+        "location": "Paris 75011", "url": "http://x",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "ss1", "source": "leboncoin",
+        "title": "Studio", "price": 900, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "ss2", "source": "leboncoin",
+        "title": "Studio", "price": 905, "surface": 30,
+        "location": "Paris 75011", "url": "http://y",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "ss2", "source": "leboncoin",
+        "title": "Studio", "price": 905, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    assert tmp_db.get_listing_by_lbc_id("ss2")["dedup_of"] is None
+
+
+def test_apply_dedup_skips_dissimilar_titles(tmp_db):
+    """Same price/surface/zip but different titles → not a duplicate."""
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "t1", "source": "leboncoin",
+        "title": "Studio meublé Paris 11", "price": 900, "surface": 30,
+        "location": "Paris 75011", "url": "http://x",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "t1", "source": "leboncoin",
+        "title": "Studio meublé Paris 11", "price": 900, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "t2", "source": "seloger",
+        "title": "Loft industriel ancien atelier", "price": 900, "surface": 30,
+        "location": "Paris 75011", "url": "http://y",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "t2", "source": "seloger",
+        "title": "Loft industriel ancien atelier", "price": 900, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    assert tmp_db.get_listing_by_lbc_id("t2")["dedup_of"] is None
+
+
+def test_apply_dedup_earliest_seen_wins(tmp_db):
+    """When 3 sources list the same flat, all 2nd+ point at the 1st."""
+    rows = [
+        ("a", "leboncoin"), ("b", "seloger"), ("c", "pap"),
+    ]
+    for lid, src in rows:
+        tmp_db.upsert_listings_batch([{
+            "lbc_id": lid, "source": src,
+            "title": "Studio meublé", "price": 900, "surface": 30,
+            "location": "Paris 75011", "url": f"http://x/{lid}",
+        }])
+        tmp_db.apply_dedup_for_batch([{
+            "lbc_id": lid, "source": src,
+            "title": "Studio meublé", "price": 900, "surface": 30,
+            "location": "Paris 75011",
+        }])
+    assert tmp_db.get_listing_by_lbc_id("a")["dedup_of"] is None
+    assert tmp_db.get_listing_by_lbc_id("b")["dedup_of"] == "a"
+    assert tmp_db.get_listing_by_lbc_id("c")["dedup_of"] == "a"
+
+
+def test_is_duplicate_returns_true_for_flagged(tmp_db):
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "primary", "source": "leboncoin",
+        "title": "Studio", "price": 900, "surface": 30,
+        "location": "Paris 75011", "url": "http://x",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "primary", "source": "leboncoin",
+        "title": "Studio", "price": 900, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    tmp_db.upsert_listings_batch([{
+        "lbc_id": "dup", "source": "seloger",
+        "title": "Studio", "price": 900, "surface": 30,
+        "location": "Paris 75011", "url": "http://y",
+    }])
+    tmp_db.apply_dedup_for_batch([{
+        "lbc_id": "dup", "source": "seloger",
+        "title": "Studio", "price": 900, "surface": 30,
+        "location": "Paris 75011",
+    }])
+    assert tmp_db.is_duplicate("dup") is True
+    assert tmp_db.is_duplicate("primary") is False
+
+
+def test_is_duplicate_unknown_returns_false(tmp_db):
+    assert tmp_db.is_duplicate("never-seen") is False

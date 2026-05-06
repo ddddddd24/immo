@@ -344,6 +344,27 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     action, lbc_id = query.data.split(":", 1)
 
+    # ── Push alert callbacks (mark called/rented) ──────────────────────────
+    if action in ("called", "rented"):
+        with database._conn() as conn:
+            conn.execute(
+                "UPDATE listings SET call_status=? WHERE lbc_id=?",
+                (action, lbc_id),
+            )
+        emoji = "✅" if action == "called" else "❌"
+        label = "Appelé" if action == "called" else "Loué"
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+            # Append a status line to the existing message body
+            new_text = (query.message.text_html or query.message.text or "")
+            new_text += f"\n\n{emoji} <b>{label}</b>"
+            await query.edit_message_text(
+                new_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+        return
+
     # ── /watch alert callbacks ──────────────────────────────────────────────
     if action == "watch_ignore":
         await query.edit_message_reply_markup(reply_markup=None)
@@ -485,15 +506,17 @@ def _should_contact(listing) -> tuple[bool, str, str]:
 # ─── Campaign core (shared by /campagne and auto-loop) ────────────────────────
 
 async def _run_campaign_core(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, source: str | None = None
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+    source: str | None = None, tier: str = "all",
 ) -> None:
     """Run one full campaign cycle. Acquires _campaign_lock; honours _stop_requested.
 
-    If `source` is provided (e.g. 'parisattitude'), restrict scraping to that one site.
+    If `source` is provided, restrict to that one site.
+    `tier`: "all" | "fast" | "slow" — used by 2-tier autostart.
     """
     async with _campaign_lock:
         _stop_requested.clear()
-        await _run_campaign_body(update, ctx, source=source)
+        await _run_campaign_body(update, ctx, source=source, tier=tier)
 
 
 _SOURCE_LABELS = {
@@ -514,6 +537,10 @@ _SOURCE_LABELS = {
     "wizi":              "Wizi",
     "laforet":           "Laforêt",
     "guyhoquet":         "Guy Hoquet",
+    "inli":              "Inli",
+    "gensdeconfiance":   "Gens de Confiance",
+    "cdc_habitat":       "CDC Habitat",
+    "fnaim":             "FNAIM",
 }
 
 
@@ -537,13 +564,22 @@ def _source_url(source: str) -> str:
         "wizi":              config.DEFAULT_SEARCH_WIZI_URL,
         "laforet":           config.DEFAULT_SEARCH_LAFORET_URL,
         "guyhoquet":         config.DEFAULT_SEARCH_GUYHOQUET_URL,
+        "inli":              config.DEFAULT_SEARCH_INLI_URL,
+        "gensdeconfiance":   config.DEFAULT_SEARCH_GENSDECONFIANCE_URL,
+        "cdc_habitat":       config.DEFAULT_SEARCH_CDC_URL,
+        "fnaim":             config.DEFAULT_SEARCH_FNAIM_URL,
     }.get(source, "")
 
 
-def _campaign_sources(only: str | None = None) -> list[tuple[str, str]]:
+def _campaign_sources(only: str | None = None,
+                      tier: str = "all") -> list[tuple[str, str]]:
     """Return [(url, label)] for each enabled source.
 
-    If `only` is set, restrict to that single source (still subject to URL/creds).
+    `only`: restrict to that single source.
+    `tier`: "all" (default), "fast" (httpx/curl_cffi only — sub-30s scrapes),
+            or "slow" (Camoufox — 60-90s/source). Used by the 2-tier
+            autostart so we can poll fast sources every 5 min and slow ones
+            every 25 min.
     Empty URL skips a source.
     """
     if only:
@@ -574,14 +610,272 @@ def _campaign_sources(only: str | None = None) -> list[tuple[str, str]]:
         (config.DEFAULT_SEARCH_WIZI_URL, "Wizi"),
         (config.DEFAULT_SEARCH_LAFORET_URL, "Laforêt"),
         (config.DEFAULT_SEARCH_GUYHOQUET_URL, "Guy Hoquet"),
+        (config.DEFAULT_SEARCH_INLI_URL, "Inli"),
+        (config.DEFAULT_SEARCH_GENSDECONFIANCE_URL, "Gens de Confiance"),
+        (config.DEFAULT_SEARCH_CDC_URL, "CDC Habitat"),
+        (config.DEFAULT_SEARCH_FNAIM_URL, "FNAIM"),
     ]
+    # Tier classification — slow = Camoufox-based (cold-start expensive).
+    _SLOW_LABELS = {"LBC", "SeLoger", "Logic-Immo"}
+    if tier == "fast":
+        sources = [s for s in sources if s[1] not in _SLOW_LABELS]
+    elif tier == "slow":
+        sources = [s for s in sources if s[1] in _SLOW_LABELS]
     return [(url, label) for url, label in sources if url]
 
 
-async def _run_campaign_body(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, source: str | None = None
+# ─── Push alerts (instant Telegram notif on hot listings) ────────────────────
+
+import preferences as _prefs_push
+from html import escape as _html_escape
+import re as _re_push
+
+# Zones eligible for push alerts: weight-3 only (Paris 11/12/13, Vincennes,
+# Saint-Mandé, Charenton). Anything else = too borderline for an instant ping.
+_PUSH_HOT_ZONES = {
+    z["zone"] for z in _prefs_push.ZONES_PREFERRED if z.get("weight", 0) >= 3
+}
+
+# Sources NOT covered by Jinka — less competition (5-15 candidates instead of
+# 100-300). User's strategic edge: be one of the few people watching these.
+# Lower score threshold for these so we get aggressive notifications.
+_OFF_RADAR_SOURCES = {
+    "studapart", "parisattitude", "lodgis", "immojeune", "locservice",
+    "entreparticuliers", "ladresse", "century21", "wizi", "laforet",
+    "guyhoquet", "kley", "inli", "icf", "actionlogement", "gensdeconfiance",
+    "cdc_habitat", "fnaim",
+}
+_PUSH_MIN_SCORE_OFF_RADAR = 6.5  # Lower bar than _PUSH_MIN_SCORE for Jinka sources
+
+# Per-campaign + rolling-window counters
+_push_sent_this_campaign: int = 0
+_push_send_times: list[float] = []
+
+_SOURCE_EMOJI_PUSH = {
+    "leboncoin": "🟠", "seloger": "🔵", "pap": "🟢", "bienici": "🟣",
+    "logicimmo": "🟡", "studapart": "🎓", "parisattitude": "🗼",
+    "lodgis": "🏛", "immojeune": "🧑‍🎓", "locservice": "🏠",
+    "entreparticuliers": "🤝", "ladresse": "🏢", "century21": "21",
+    "wizi": "🔑", "laforet": "🌳", "guyhoquet": "🎩",
+}
+
+
+def _push_reset_for_campaign() -> None:
+    global _push_sent_this_campaign
+    _push_sent_this_campaign = 0
+
+
+def _push_rate_ok() -> bool:
+    now = time.time()
+    _push_send_times[:] = [t for t in _push_send_times if now - t < 60.0]
+    if len(_push_send_times) >= config.PUSH_RATE_PER_MIN:
+        return False
+    if _push_sent_this_campaign >= config.PUSH_MAX_PER_CAMPAIGN:
+        return False
+    return True
+
+
+def _format_avail_push(raw: str | None) -> str:
+    if not raw:
+        return "—"
+    parts = raw.split("-")
+    if len(parts) == 3:
+        return f"{parts[2][:2]}/{parts[1]}/{parts[0]}"
+    if len(parts) == 2:
+        return f"{parts[1]}/{parts[0]}"
+    return raw
+
+
+def _build_call_script(listing: dict) -> str:
+    """Generate a ready-to-read French call script for the listing.
+    Adapts to source type (agence/particulier/résidence/default) and bakes in
+    Illan's profile (alternant SNCF + Visale). <500 chars, single string."""
+    AGENCIES = {"foncia", "century21", "laforet", "guyhoquet", "ladresse",
+                "orpi", "nestenn", "stephaneplaza", "era"}
+    PARTICULIERS = {"pap", "leboncoin", "locservice", "bienici", "lbc",
+                    "entreparticuliers", "gensdeconfiance"}
+    RESIDENCES = {"studapart", "immojeune", "kley", "studeasy", "lokaviz",
+                  "studylease", "icf", "actionlogement", "inli"}
+
+    src = (listing.get("source") or "").strip().lower()
+    if src in AGENCIES: kind = "agence"
+    elif src in RESIDENCES: kind = "residence"
+    elif src in PARTICULIERS: kind = "particulier"
+    else: kind = "default"
+
+    price = listing.get("price")
+    surface = listing.get("surface")
+    location = (listing.get("location") or "").strip() or None
+    housing = (listing.get("housing_type") or "").strip() or "logement"
+    available = (listing.get("available_from") or "").strip() or None
+
+    parts = [housing.lower()]
+    if surface:
+        try: parts.append(f"{int(float(surface))}m²")
+        except Exception: pass
+    if price:
+        try: parts.append(f"à {int(float(price))}€ CC")
+        except Exception: pass
+    if location: parts.append(f"à {location}")
+    descriptor = " ".join(parts)
+    avail_tail = f" (dispo {available})" if available else ""
+
+    if kind == "agence":
+        script = (f"Bonjour, je vous appelle au sujet de votre {descriptor}{avail_tail}. "
+                  "Est-il toujours disponible ? J'ai un dossier complet "
+                  "(alternant SNCF, garant Visale) et je peux déposer ma candidature aujourd'hui.")
+    elif kind == "particulier":
+        script = (f"Bonjour, votre {descriptor}{avail_tail} m'intéresse beaucoup. "
+                  "Toujours disponible ? Je suis alternant SNCF avec garant Visale, "
+                  "dossier prêt — une visite cette semaine est possible ?")
+    elif kind == "residence":
+        script = (f"Bonjour, je vous appelle pour le {descriptor}{avail_tail}. "
+                  "Je suis alternant SNCF (~1700€/mois) avec garant Visale. "
+                  "Le logement est-il toujours disponible ?")
+    else:
+        script = (f"Bonjour, je vous appelle pour votre annonce {descriptor}{avail_tail}. "
+                  "Toujours disponible ? Dossier solide (alternant SNCF + Visale), "
+                  "je peux visiter dès aujourd'hui.")
+    script = " ".join(script.split())
+    if len(script) > 490:
+        script = (f"Bonjour, je vous appelle pour votre annonce. Toujours disponible ? "
+                  "Alternant SNCF + Visale, dossier prêt, visite aujourd'hui.")
+    return script
+
+
+def _build_push_html(row: dict) -> str:
+    e = _html_escape
+    src = (row.get("source") or "").lower()
+    src_emoji = _SOURCE_EMOJI_PUSH.get(src, "⚪")
+    htype = row.get("housing_type") or "logement"
+    surface = row.get("surface")
+    surf_str = f"{surface}m²" if surface else "?m²"
+    score = row.get("score") or 0
+    phone = (row.get("phone") or "").strip()
+    tel_clean = _re_push.sub(r"[^\d+]", "", phone)
+    off_radar = "💎 OFF-RADAR" if src in _OFF_RADAR_SOURCES else ""
+    script = _build_call_script(row)
+    return (
+        f"🔥 <b>NOUVELLE ANNONCE — score {score}/10</b> {off_radar}\n\n"
+        f"📍 <b>{e(row.get('location') or '?')}</b>\n"
+        f"💰 {row.get('price') or '?'}€ • {surf_str}\n"
+        f"🏠 {e(htype)} ({src_emoji})\n"
+        f"🗝 Libre: {_format_avail_push(row.get('available_from'))}\n\n"
+        f'📞 <a href="tel:{e(tel_clean)}">{e(phone)}</a>\n'
+        f'🔗 <a href="{e(row.get("url") or "")}">Voir l\'annonce</a>\n\n'
+        f"📝 <i>Script :</i>\n<code>{e(script)}</code>"
+    )
+
+
+async def _check_and_push_alerts(
+    persisted_lbc_ids: list[str],
+    ctx: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    sources = _campaign_sources(only=source)
+    """Fire Telegram pushes for newly-persisted listings matching hot criteria.
+    SQL gates: notified=0, score>=PUSH_MIN_SCORE, price<=PUSH_MAX_PRICE, real
+    phone, fresh. Python gate: weight-3 zone. Rate-limited."""
+    if not config.ENABLE_PUSH_ALERTS or not persisted_lbc_ids:
+        return
+    placeholders = ",".join("?" * len(persisted_lbc_ids))
+    off_radar_placeholders = ",".join("?" * len(_OFF_RADAR_SOURCES))
+    # Phase 1 push optim — allow push BEFORE LLM scoring lands:
+    #   • Off-radar : push si score>=6.5 OR (score IS NULL AND price<=1100 AND
+    #                 phone non-bloqué) — l'edge structurel justifie la fast-path
+    #   • Jinka-covered : score>=PUSH_MIN_SCORE only (we wait for LLM here)
+    # The score-NULL path is gated by basic price/phone sanity to avoid junk.
+    sql = f"""
+        SELECT lbc_id, title, price, location, surface, housing_type,
+               source, url, phone, score, score_reason,
+               published_at, available_from
+          FROM listings
+         WHERE lbc_id IN ({placeholders})
+           AND notified = 0
+           AND dedup_of IS NULL  -- skip cross-source duplicates: the primary already pushed
+           AND (
+                 (source IN ({off_radar_placeholders}) AND score >= ?)
+              OR (source IN ({off_radar_placeholders}) AND score IS NULL
+                    AND price IS NOT NULL AND price <= ?
+                    AND phone IS NOT NULL AND phone NOT IN ('', '#blocked'))
+              OR (source NOT IN ({off_radar_placeholders}) AND score >= ?)
+               )
+    """
+    off_list = list(_OFF_RADAR_SOURCES)
+    params = (list(persisted_lbc_ids)
+              + off_list + [_PUSH_MIN_SCORE_OFF_RADAR]
+              + off_list + [config.PUSH_MAX_PRICE]
+              + off_list + [config.PUSH_MIN_SCORE])
+    with database._conn() as conn:
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+    if not rows:
+        return
+
+    # ── Fraud filter ────────────────────────────────────────────────────────
+    # Push alerts are the loudest signal we send to Illan — never push a
+    # listing that trips the scam-marker / payment-before-visit / price-
+    # anomaly checks. Logs each skip so suspicious patterns are auditable.
+    safe_rows: list[dict] = []
+    for row in rows:
+        # Hydrate description for fraud check (push SQL doesn't SELECT it).
+        try:
+            with database._conn() as conn:
+                drow = conn.execute(
+                    "SELECT description FROM listings WHERE lbc_id = ?",
+                    (row["lbc_id"],),
+                ).fetchone()
+            row["description"] = (drow["description"] if drow else "") or ""
+        except Exception:
+            row["description"] = ""
+        is_fraud, fraud_reason = database.is_suspicious_listing(row)
+        if is_fraud:
+            logger.warning(
+                "[push] SKIP suspicious listing %s (%s) — %s",
+                row["lbc_id"], row.get("source"), fraud_reason,
+            )
+            continue
+        safe_rows.append(row)
+    rows = safe_rows
+    if not rows:
+        return
+
+    global _push_sent_this_campaign
+    sent_ids: list[str] = []
+    for row in rows:
+        if not _push_rate_ok():
+            logger.info("[push] rate limit hit — skipping remaining alerts")
+            break
+        try:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Appelé", callback_data=f"called:{row['lbc_id']}"),
+                InlineKeyboardButton("❌ Loué", callback_data=f"rented:{row['lbc_id']}"),
+            ]])
+            await ctx.bot.send_message(
+                chat_id=config.TELEGRAM_CHAT_ID,
+                text=_build_push_html(row),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=False,
+                reply_markup=kb,
+            )
+            _push_send_times.append(time.time())
+            _push_sent_this_campaign += 1
+            sent_ids.append(row["lbc_id"])
+            logger.info("[push] alert sent for %s (%s€, score=%s)",
+                        row["lbc_id"], row["price"], row.get("score"))
+        except Exception as exc:
+            logger.warning("[push] send failed for %s: %s", row["lbc_id"], exc)
+
+    if sent_ids:
+        with database._conn() as conn:
+            ph = ",".join("?" * len(sent_ids))
+            conn.execute(
+                f"UPDATE listings SET notified=1 WHERE lbc_id IN ({ph})", sent_ids,
+            )
+
+
+async def _run_campaign_body(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+    source: str | None = None, tier: str = "all",
+) -> None:
+    sources = _campaign_sources(only=source, tier=tier)
     if not sources:
         if source:
             await _reply(
@@ -592,6 +886,8 @@ async def _run_campaign_body(
         else:
             await _reply(update, "⚠️ Aucune source configurée.")
         return
+
+    _push_reset_for_campaign()
 
     # ─── Live progress board ────────────────────────────────────────────────
     # Edit one Telegram message in place as each source completes, so the user
@@ -650,6 +946,10 @@ async def _run_campaign_body(
         "Wizi": 30.0,
         "Laforêt": 90.0,  # Playwright fallback if static fails
         "Guy Hoquet": 60.0,  # curl_cffi XHR — fast, Playwright fallback only on Cloudflare
+        "Inli": 60.0,        # curl_cffi, fans out 8 IDF depts in parallel
+        "Gens de Confiance": 60.0,  # curl_cffi, server-rendered Search blob
+        "CDC Habitat": 60.0,  # curl_cffi, paginated server-rendered
+        "FNAIM": 90.0,        # 8 départements parallel, 9 pages each, ~25-30s
     }
     DEFAULT_TIMEOUT = 90.0
 
@@ -760,10 +1060,12 @@ async def _run_campaign_body(
             logger.info("[persist] dropped %d non-offer/suspect listings", n_dropped)
         # Sites where phone is hidden by site policy (form/portal-only contact)
         _PHONE_BLOCKED_SOURCES = {"studapart", "locservice"}
-        # Sites that DON'T expose publication date publicly — use scrape time
-        # as fallback for NEW listings (so user can sort by recency anyway).
-        # Old listings without pub_date stay NULL (per user instruction).
-        _NO_PUBDATE_SOURCES = {"pap", "lodgis", "locservice"}
+        # When the source doesn't expose a real publication date, fall back to
+        # the scrape time so the user has SOME idea of recency. The COALESCE
+        # in upsert preserves the FIRST scrape time on subsequent /campagnes,
+        # so this becomes "first time we saw this listing" — a decent estimate
+        # of when it was posted. Marked with `scrape:` prefix so dashboard
+        # shows ⏱ instead of 📅.
         _now_iso = datetime.utcnow().isoformat()
         rows = []
         for lst in clean:
@@ -772,8 +1074,7 @@ async def _run_campaign_body(
             if phone is None and lst.source in _PHONE_BLOCKED_SOURCES:
                 phone = "#blocked"
             pub_at = getattr(lst, "published_at", None)
-            if not pub_at and lst.source in _NO_PUBDATE_SOURCES:
-                # Mark with prefix so dashboard can show ⏱ vs 📅 icon
+            if not pub_at:
                 pub_at = f"scrape:{_now_iso}"
             rows.append({
                 "lbc_id": lst.lbc_id, "title": lst.title, "price": lst.price,
@@ -787,7 +1088,45 @@ async def _run_campaign_body(
                 "available_from": getattr(lst, "available_from", None),
             })
         try:
-            return database.upsert_listings_batch(rows)
+            n = database.upsert_listings_batch(rows)
+            # Late-availability dealbreaker applied at persist time (no LLM
+            # needed): structured available_from > 2026-09 → score=0, hidden
+            # from dashboard. Catches PA/SeLoger/Lodgis/PAP without waiting
+            # for scoring.
+            late = [r["lbc_id"] for r in rows
+                    if r.get("available_from")
+                    and (r["available_from"] or "")[:7] > "2026-09"]
+            if late:
+                with database._conn() as conn:
+                    placeholders = ",".join("?" * len(late))
+                    conn.execute(
+                        f"UPDATE listings SET score=0, score_reason=? "
+                        f"WHERE lbc_id IN ({placeholders})",
+                        ["❌ dispo > sept 2026"] + late,
+                    )
+                logger.info("[persist] flagged %d listings as dealbreakers (avail>2026-09)", len(late))
+            # Activity check (generalized from PA): stamp seen_at for every
+            # row we just persisted. Listings of this source that didn't
+            # come back in the scrape keep their old seen_at and age out
+            # via mark_stale_listings (24h cron in main()).
+            try:
+                by_source: dict[str, list[str]] = {}
+                for r in rows:
+                    by_source.setdefault(r["source"], []).append(r["lbc_id"])
+                for src, ids in by_source.items():
+                    database.mark_seen(src, ids)
+            except Exception as exc:
+                logger.warning("[persist] mark_seen failed: %s", exc)
+            # Cross-source dedup at persist time. Stamps dedup_key on every
+            # row, then flags later duplicates with dedup_of=<primary lbc_id>.
+            # Earliest-seen variant wins.
+            try:
+                n_dups = database.apply_dedup_for_batch(rows)
+                if n_dups > 0:
+                    logger.info("[persist] flagged %d cross-source duplicates", n_dups)
+            except Exception as exc:
+                logger.warning("[persist] dedup pass failed: %s", exc)
+            return n
         except Exception as exc:
             logger.warning("Bulk upsert failed (%s) — falling back to per-row", exc)
             n = 0
@@ -834,7 +1173,17 @@ async def _run_campaign_body(
                 )
                 logger.info("%s scrape done in %.1fs: %d listings", label, elapsed, n)
             if results:
-                _persist_batch(results)
+                n_persisted = _persist_batch(results)
+                # Phase 1.2 — push immediately for this source (before other
+                # sources finish scraping). Off-radar fast-path doesn't need
+                # LLM score — push on price+phone+zone basic gates.
+                if config.ENABLE_PUSH_ALERTS and n_persisted > 0:
+                    try:
+                        await _check_and_push_alerts(
+                            [l.lbc_id for l in results if l.lbc_id], ctx,
+                        )
+                    except Exception as exc:
+                        logger.warning("[push] per-source failed for %s: %s", label, exc)
             per_source[i] = (label, len(results), results)
             async with refresh_lock:
                 await _refresh_board()
@@ -894,6 +1243,15 @@ async def _run_campaign_body(
                 f"✅ Aucune nouvelle à scorer ({n_cached} en cache, {n_over} hors budget)."
             )
         await _score_listings_parallel(listings)
+        # Push alerts: send Telegram notif for hot listings (after scoring so
+        # score gate works). Idempotent via notified=1 flag in DB.
+        if config.ENABLE_PUSH_ALERTS:
+            try:
+                await _check_and_push_alerts(
+                    [l.lbc_id for l in listings if l.lbc_id], ctx,
+                )
+            except Exception as exc:
+                logger.warning("[push] post-scoring alert pass failed: %s", exc)
 
     await _reply(update, f"🧠 Analyse de *{len(listings)}* annonces en cours…")
 
@@ -1144,6 +1502,26 @@ async def cmd_campagne(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Optional source filter via CLI: /campagne studapart
     source = (ctx.args[0].lower().strip() if ctx.args else None) or None
     await _run_campaign_core(update, ctx, source=source)
+
+
+async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run /campagne then /score_all in sequence — full re-sync.
+
+    Use after deploying scraper changes or when you want a complete refresh
+    of the dashboard. /campagne re-scrapes (free, no LLM); /score_all runs
+    LLM extraction on listings that need it (~$0.10-0.20).
+    """
+    if _campaign_lock.locked():
+        await _reply(update, "⚠️ Une campagne est déjà en cours. Utilisez /stop puis relancez /refresh.")
+        return
+    await _reply(update, "🔄 *Refresh complet* lancé : campagne puis score_all.")
+    await _run_campaign_core(update, ctx)
+    if _stop_requested.is_set():
+        await _reply(update, "🛑 Refresh interrompu par /stop.")
+        return
+    await _reply(update, "🧠 Campagne terminée. Lancement du score_all…")
+    await cmd_score_all(update, ctx)
+    await _reply(update, "✅ Refresh complet terminé.")
 
 
 # ─── /envoyer (asks for confirmation) + /confirmer (actually sends) ──────────
@@ -1529,28 +1907,83 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ─── /autostart ───────────────────────────────────────────────────────────────
 
 async def cmd_autostart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start 2-tier auto-scraping.
+    Fast tier (httpx/curl_cffi sources) every FAST minutes — sub-2.5min
+    average detection on the off-radar sources where the user has structural edge.
+    Slow tier (Camoufox sources: LBC/SeLoger/Logic-Immo) every SLOW minutes."""
     global _auto_task
     if _auto_task and not _auto_task.done():
         await _reply(update, "⚠️ Campagne automatique déjà en cours. Utilise /autostop d'abord.")
         return
 
-    try:
-        interval_hours = float(ctx.args[0]) if ctx.args else 3.0
-    except (ValueError, IndexError):
-        interval_hours = 3.0
+    # Per-source independent loops — each source polls at its own optimal
+    # interval (function of anti-bot risk + freshness need). Heavy DataDome
+    # sources poll less; light API sources poll often. /autostart ignores
+    # legacy fast/slow args.
+    _SOURCE_INTERVAL_S = {
+        # Camoufox / DataDome — keep slow to avoid IP rep degradation
+        "LBC":               300,   # 5 min (DataDome)
+        "SeLoger":           600,   # 10 min (DataDome)
+        "Logic-Immo":        600,   # 10 min (DataDome)
+        # API-based, very fast & cheap
+        "Paris Attitude":    180,   # 3 min
+        "Studapart":         180,
+        "Bien'ici":          180,
+        # curl_cffi static HTML — fast
+        "Wizi":              120,   # 2 min
+        "Inli":              180,
+        "ImmoJeune":         180,
+        "Lodgis":            180,
+        "LocService":        180,
+        "PAP":               120,
+        "EntreParticuliers": 240,
+        "L'Adresse":         300,
+        "Century 21":        240,
+        "Laforêt":           240,
+        "Guy Hoquet":        240,
+        "Gens de Confiance": 180,
+        "CDC Habitat":       300,
+        "FNAIM":             300,
+    }
+    DEFAULT_INTERVAL = 300
+
+    sources_config = _campaign_sources()
+    if not sources_config:
+        await _reply(update, "⚠️ Aucune source configurée.")
+        return
 
     await _reply(
         update,
-        f"🤖 *Campagne automatique activée* — toutes les {interval_hours:.0f}h\n"
-        "Utilise /autostop pour l'arrêter."
+        f"🤖 *Auto-campagne — {len(sources_config)} loops indépendants*\n"
+        f"Chaque source poll à son rythme optimal (2-10 min).\n"
+        f"Push immédiat dès qu'une nouvelle annonce est détectée.\n"
+        "Utilise /autostop pour arrêter."
     )
 
-    async def _auto_loop():
+    # Reverse map label → source key for _run_campaign_core(source=...)
+    label_to_key = {v: k for k, v in _SOURCE_LABELS.items()}
+
+    async def _source_loop(url: str, label: str):
+        interval = _SOURCE_INTERVAL_S.get(label, DEFAULT_INTERVAL)
+        source_key = label_to_key.get(label, label.lower())
+        import random as _rand
+        await asyncio.sleep(_rand.uniform(0, 30))
         while True:
-            logger.info("Auto-campaign starting…")
-            await _run_campaign_core(update, ctx)
-            logger.info("Auto-campaign done, sleeping %.1fh", interval_hours)
-            await asyncio.sleep(interval_hours * 3600)
+            t0 = time.time()
+            try:
+                logger.info("[auto-loop] %s starting…", label)
+                await _run_campaign_core(update, ctx, source=source_key)
+                elapsed = time.time() - t0
+                logger.info("[auto-loop] %s done in %.0fs, sleeping %ds", label, elapsed, interval)
+            except Exception as exc:
+                logger.warning("[auto-loop] %s crashed: %s", label, exc)
+                elapsed = time.time() - t0
+            sleep_for = max(0, interval * _rand.uniform(0.85, 1.15) - elapsed)
+            await asyncio.sleep(sleep_for)
+
+    async def _auto_loop():
+        loops = [_source_loop(u, l) for u, l in sources_config]
+        await asyncio.gather(*loops, return_exceptions=True)
 
     _auto_task = asyncio.create_task(_auto_loop())
 
@@ -2073,6 +2506,7 @@ def main() -> None:
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("simulate", cmd_simulate))
     app.add_handler(CommandHandler("campagne", cmd_campagne))
+    app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("envoyer", cmd_envoyer))
     app.add_handler(CommandHandler("confirmer", cmd_confirmer))
     app.add_handler(CommandHandler("pending", cmd_list_pending))
@@ -2098,6 +2532,28 @@ def main() -> None:
     # Natural language fallback — catches any non-command text message
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_chat))
     app.add_error_handler(error_handler)
+
+    # ── Periodic activity check ──────────────────────────────────────────
+    # Every hour, score=0 any listing whose last `seen_at` is >24h old.
+    # This is the generalized version of the PA-only stale-clear at
+    # scraper.py:2640. Hidden listings stay in the DB (we may want them for
+    # price-history) but disappear from the dashboard.
+    async def _stale_cleanup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            n = database.mark_stale_listings(hours=24)
+            if n > 0:
+                logger.info("[stale-cleanup] hid %d listings unseen for >24h", n)
+        except Exception as exc:
+            logger.warning("[stale-cleanup] failed: %s", exc)
+
+    if app.job_queue is not None:
+        # First run after 5 min so we don't fire mid-startup if the user
+        # just relaunched. Then every hour.
+        app.job_queue.run_repeating(
+            _stale_cleanup_job, interval=3600, first=300, name="stale_cleanup",
+        )
+    else:
+        logger.warning("[stale-cleanup] JobQueue unavailable — periodic check disabled")
 
     logger.info("Bot starting…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

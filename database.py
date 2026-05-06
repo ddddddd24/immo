@@ -121,6 +121,30 @@ def init_db() -> None:
         if "description" not in cols:
             conn.execute("ALTER TABLE listings ADD COLUMN description TEXT")
             logger.info("Migrated listings table: added description column (used by /score_all to backfill LLM extraction)")
+        if "availability_extracted" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN availability_extracted INTEGER DEFAULT 0")
+            logger.info("Migrated listings table: added availability_extracted flag (1 once LLM has tried; prevents token waste on /score_all loops)")
+        if "notified" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
+            logger.info("Migrated listings table: added notified flag (1 = push alert sent; prevents duplicate Telegram pings)")
+        if "call_status" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN call_status TEXT")
+            logger.info("Migrated listings table: added call_status (set via push inline buttons: 'called', 'rented', 'skipped')")
+        if "seen_at" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN seen_at TEXT")
+            logger.info("Migrated listings table: added seen_at (last time listing appeared in a /campagne for its source — drives 24h activity check)")
+        if "dedup_of" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN dedup_of TEXT")
+            logger.info("Migrated listings table: added dedup_of (lbc_id of the primary cross-source variant — NULL for primaries)")
+        if "dedup_key" not in cols:
+            conn.execute("ALTER TABLE listings ADD COLUMN dedup_key TEXT")
+            logger.info("Migrated listings table: added dedup_key (coarse fingerprint zip|price_bucket|surface_bucket — speeds cross-source candidate lookup)")
+
+        # Indexes that the activity check + dedup queries lean on.
+        # Idempotent so they run safely on every startup.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_source_seen ON listings(source, seen_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_dedup_key ON listings(dedup_key)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_dedup_of ON listings(dedup_of)")
 
     logger.info("Database initialised at %s", config.DB_PATH)
 
@@ -265,6 +289,16 @@ def upsert_listings_batch(rows: list) -> int:
                  published_at   = COALESCE(excluded.published_at, listings.published_at),
                  phone          = COALESCE(excluded.phone, listings.phone),
                  description    = COALESCE(NULLIF(excluded.description, ''), listings.description),
+                 -- Clear the LLM-attempted flag when a NEW description arrives
+                 -- (description was empty or different before). Lets /score_all
+                 -- retry availability extraction with the freshly-enriched text.
+                 availability_extracted = CASE
+                     WHEN excluded.description IS NOT NULL
+                          AND excluded.description != ''
+                          AND COALESCE(listings.description, '') != excluded.description
+                     THEN 0
+                     ELSE listings.availability_extracted
+                 END,
                  available_from = COALESCE(excluded.available_from, listings.available_from),
                  price_prev     = CASE
                      WHEN excluded.price IS NOT NULL
@@ -419,32 +453,42 @@ def set_listing_score(lbc_id: str, score: int, reason: str,
                       available_from: Optional[str] = None) -> None:
     """Record Claude's score (1–10), short reason, and optional availability date.
 
-    `available_from` is the LLM-extracted YYYY-MM date when the listing
-    becomes free (None if not mentioned). COALESCE preserves any prior
-    non-null value to avoid clobbering structured-source data with a
-    later silent LLM pass.
+    Sets availability_extracted=1 unconditionally — once the LLM has been asked,
+    we don't ask again until /campagne brings a fresh description (which clears
+    the flag elsewhere, or the listing goes through the structured path).
+    Prevents token waste loops on listings whose LLM truly returned null.
+
+    COALESCE preserves any prior non-null available_from to avoid clobbering
+    structured-source data with a later silent LLM pass.
     """
     with _conn() as conn:
         conn.execute(
             """UPDATE listings
                SET score = ?,
                    score_reason = ?,
-                   available_from = COALESCE(?, available_from)
+                   available_from = COALESCE(?, available_from),
+                   availability_extracted = 1
                WHERE lbc_id = ?""",
             (score, reason, available_from, lbc_id),
         )
 
 
 def get_unscored_listings(limit: Optional[int] = None) -> list[dict]:
-    """Return listings needing LLM extraction — either no score, or scored but
-    missing available_from AND have a stored description (so re-running the
-    LLM can actually extract the date). Used by the /score_all backfill flow.
+    """Return listings needing LLM extraction. Two cases:
+    1. No score yet (`score IS NULL`).
+    2. Scored, but available_from is NULL AND we never tried LLM extraction
+       (`availability_extracted=0`) AND we have a description to extract from.
+
+    Crucial: case (2) skips listings where the LLM was already asked and
+    returned null. Without `availability_extracted` we'd re-burn tokens on
+    every /score_all asking the same question with the same input.
     """
     sql = """SELECT lbc_id, source, title, price, location, url, surface,
                     housing_type, roommate_count, description
              FROM listings
              WHERE score IS NULL
                 OR (available_from IS NULL
+                    AND availability_extracted = 0
                     AND description IS NOT NULL
                     AND description != '')
              ORDER BY id DESC"""
@@ -676,3 +720,419 @@ def get_sent_contacts_without_response() -> list[dict]:
                ORDER BY c.sent_at DESC"""
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ─── Fraud detection ──────────────────────────────────────────────────────────
+
+import re as _re_fraud
+
+# Markers commonly seen in immobilier scams (Dubaï, Western Union, "frais de
+# dossier" demanded before visit, fake heritage stories, off-platform shift to
+# WhatsApp). Compiled once at module load — case-insensitive, accent-tolerant.
+# We match on raw text after lowercasing; word-boundary kept loose because
+# scammers often inject spaces/punctuation ("West-ern  Union").
+_SCAM_MARKERS = (
+    ("whatsapp",            r"whats?\s*app"),
+    ("dubai",               r"duba[iï]"),
+    ("etranger",            r"(?:à|a)\s+l[''’]?\s*(?:é|e)tranger"),
+    ("frais_dossier",       r"frais\s+de\s+dossier"),
+    ("western_union",       r"western\s*union"),
+    ("paypal_friends",      r"paypal\s+friends?"),
+    ("voyage_affaires",     r"voyage\s+d[''’]?\s*affaires?"),
+    ("heritage",            r"h[ée]ritage"),
+)
+_SCAM_PATTERNS = [(label, _re_fraud.compile(rx, _re_fraud.IGNORECASE))
+                  for label, rx in _SCAM_MARKERS]
+
+# "Payment before visit" — fraudsters demand a deposit / send keys / sign
+# before any in-person visit. Captured separately for a clearer reason string.
+_PAYMENT_BEFORE_VISIT = _re_fraud.compile(
+    r"(?:"
+    r"caution\s+avant\s+visite"
+    r"|paiement\s+avant\s+visite"
+    r"|verser\s+(?:la\s+)?caution\s+avant"
+    r"|envoyer\s+(?:l[''’]?\s*argent|les\s+fonds)\s+avant"
+    r"|acompte\s+avant\s+(?:la\s+)?visite"
+    r"|(?:les\s+)?cl[ée]s\s+(?:par\s+|en\s+)?(?:la\s+)?poste"
+    r"|virement\s+avant\s+(?:la\s+)?visite"
+    r")",
+    _re_fraud.IGNORECASE,
+)
+
+# Threshold: a listing is flagged as suspiciously cheap when its price is
+# at least 50 % below the median €/m² of comparable listings (same broad
+# zone + similar surface ±25 %). Need ≥5 comps to trust the median — under
+# that, sample is too small and we silently skip the price check.
+_PRICE_ANOMALY_RATIO = 0.50  # 50 % under median = flag
+_PRICE_ANOMALY_MIN_COMPS = 5
+_SURFACE_TOLERANCE = 0.25    # ±25 % of the listing's surface
+
+
+def _zone_key(location: str) -> str:
+    """Best-effort zone fingerprint for median calc.
+
+    Uses the 5-digit ZIP if present (most precise), else the first 8 chars
+    of the city name lowercased. Mirrors the dedup key used in dashboard.py
+    so the comparison cohort matches the user's mental model of "same area".
+    """
+    if not location:
+        return ""
+    m = _re_fraud.search(r"\b(\d{5})\b", location)
+    if m:
+        return m.group(1)
+    return location.strip()[:8].lower()
+
+
+def is_suspicious_listing(listing) -> tuple[bool, str]:
+    """Return (is_fraud, reason) for a listing.
+
+    Accepts a dict or sqlite3.Row. Checks, in order:
+      1. Scam-marker keywords in title/description (WhatsApp, Dubaï,
+         à l'étranger, Western Union, etc.).
+      2. "Payment-before-visit" phrasing (caution/virement avant visite,
+         clés par la poste...).
+      3. Price anomalously low: ≥ 50 % under the median €/m² of comparable
+         listings in the same zone (5-digit ZIP) and surface band (±25 %).
+         Requires ≥ 5 comparables; otherwise skipped silently.
+
+    Returns (False, "") for clean listings. The reason string is always
+    short and user-facing — used directly in the dashboard badge tooltip.
+    """
+    if listing is None:
+        return (False, "")
+    # Normalise input — sqlite3.Row + dict both work via __getitem__, but Row
+    # raises IndexError on missing keys (no .get()). Wrap once.
+    def _g(key, default=""):
+        try:
+            v = listing[key]
+        except (KeyError, IndexError, TypeError):
+            v = default
+        return v if v is not None else default
+
+    title = str(_g("title", "") or "")
+    description = str(_g("description", "") or "")
+    blob = f"{title}\n{description}"
+
+    # 1. Scam markers
+    hits: list[str] = []
+    for label, rx in _SCAM_PATTERNS:
+        if rx.search(blob):
+            # Friendly French label for the badge tooltip
+            hits.append({
+                "whatsapp":        "WhatsApp",
+                "dubai":           "Dubaï",
+                "etranger":        "à l'étranger",
+                "frais_dossier":   "frais de dossier",
+                "western_union":   "Western Union",
+                "paypal_friends":  "PayPal Friends",
+                "voyage_affaires": "voyage d'affaires",
+                "heritage":        "héritage",
+            }[label])
+    if hits:
+        # Only show first 2 markers in reason — avoid 80-char tooltip
+        joined = " + ".join(hits[:2])
+        return (True, f"Mots-clés arnaque : {joined}")
+
+    # 2. Payment-before-visit
+    if _PAYMENT_BEFORE_VISIT.search(blob):
+        return (True, "Paiement exigé avant visite")
+
+    # 3. Price anomaly vs. zone+surface median
+    price = _g("price", None)
+    surface = _g("surface", None)
+    location = _g("location", "")
+    if price and surface and location:
+        try:
+            price_i = int(price)
+            surf_i = int(surface)
+        except (TypeError, ValueError):
+            return (False, "")
+        if price_i > 0 and surf_i > 0:
+            zk = _zone_key(location)
+            if zk:
+                surf_low = max(1, int(surf_i * (1 - _SURFACE_TOLERANCE)))
+                surf_high = int(surf_i * (1 + _SURFACE_TOLERANCE)) + 1
+                # Median €/m² for the cohort. We compute via SQL window with
+                # a CTE — sqlite has had window functions since 3.25 (2018),
+                # safe to assume on any modern Python.
+                with _conn() as conn:
+                    rows = conn.execute(
+                        """SELECT price * 1.0 / surface AS ppm
+                           FROM listings
+                           WHERE price IS NOT NULL AND price > 0
+                             AND surface IS NOT NULL AND surface > 0
+                             AND surface BETWEEN ? AND ?
+                             AND (
+                                 location LIKE ?
+                              OR substr(lower(location), 1, 8) = ?
+                             )""",
+                        (surf_low, surf_high, f"%{zk}%", zk),
+                    ).fetchall()
+                ppms = sorted(r["ppm"] for r in rows if r["ppm"])
+                # Drop the listing's own row if present (avoid biasing median
+                # toward the very listing we're judging).
+                # NB: sqlite returns floats; equality-on-floats is fragile,
+                # but worst case we don't drop — tolerable since N≥5.
+                own = price_i / surf_i if surf_i else None
+                if own is not None and own in ppms:
+                    ppms.remove(own)
+                if len(ppms) >= _PRICE_ANOMALY_MIN_COMPS:
+                    mid = ppms[len(ppms) // 2]
+                    if mid > 0:
+                        ratio = (price_i / surf_i) / mid
+                        if ratio <= (1 - _PRICE_ANOMALY_RATIO):
+                            pct = int(round((1 - ratio) * 100))
+                            return (True, f"Prix {pct}% sous le marché")
+
+    return (False, "")
+
+
+# ─── Activity check (cross-source) ────────────────────────────────────────────
+
+def mark_seen(source: str, lbc_ids: list) -> int:
+    """Stamp `seen_at = now` for every listing in (source, lbc_ids).
+
+    Called right after `_persist_batch` finishes for a given source. Listings
+    of `source` that are NOT in `lbc_ids` keep their old `seen_at`, so they
+    age out and are caught by `mark_stale_listings` once they cross 24h.
+    Returns rows updated.
+    """
+    if not lbc_ids:
+        return 0
+    now = datetime.utcnow().isoformat()
+    placeholders = ",".join("?" * len(lbc_ids))
+    with _conn() as conn:
+        cur = conn.execute(
+            f"UPDATE listings SET seen_at = ? "
+            f"WHERE source = ? AND lbc_id IN ({placeholders})",
+            (now, source, *lbc_ids),
+        )
+        return cur.rowcount
+
+
+def mark_stale_listings(hours: int = 24) -> int:
+    """Soft-delete listings that haven't been seen in any /campagne for `hours`.
+
+    Sets `score = 0`, `score_reason = "❌ disparu de la source"` so the
+    dashboard hides them automatically (it filters out score=0). We only
+    touch rows with `score > 0` to avoid re-flagging dealbreakers (which
+    already have score=0 with a more informative reason) and we skip rows
+    where `seen_at IS NULL` (legacy: never seen in a post-migration scrape,
+    so we can't tell yet — they'll be stamped on the next /campagne).
+
+    Idempotent: if seen_at hasn't moved since last check, the row is already
+    score=0 and the WHERE clause filters it out. Returns rows hidden.
+    """
+    cutoff = f"-{int(hours)} hours"
+    with _conn() as conn:
+        cur = conn.execute(
+            """UPDATE listings
+                  SET score = 0,
+                      score_reason = '❌ disparu de la source'
+                WHERE seen_at IS NOT NULL
+                  AND seen_at < datetime('now', ?)
+                  AND (score IS NULL OR score > 0)""",
+            (cutoff,),
+        )
+        return cur.rowcount
+
+
+# ─── Cross-source dedup ───────────────────────────────────────────────────────
+
+def _normalise_zip_or_city(location: Optional[str]) -> str:
+    """Same convention as dashboard.py used to fingerprint a listing.
+    Prefers a 5-digit postal code; otherwise falls back to first 8 chars
+    of the city name lowercased — matches the previous dedup behaviour.
+    """
+    if not location:
+        return ""
+    import re as _re
+    m = _re.search(r"\b(\d{5})\b", location)
+    if m:
+        return m.group(1)
+    return location[:8].lower().strip()
+
+
+def compute_dedup_key(price: Optional[int], surface: Optional[int],
+                      location: Optional[str]) -> Optional[str]:
+    """Coarse bucket key — `<zip>|<price//50>|<surface//2>`.
+
+    Used as a SQL pre-filter to find candidate cross-source duplicates
+    cheaply. The actual ±5% / ±2 / Levenshtein checks happen in Python on
+    the small candidate set returned by the query.
+
+    Returns None when we don't have enough info to fingerprint reliably.
+    """
+    if price is None or surface is None:
+        return None
+    z = _normalise_zip_or_city(location)
+    if not z:
+        return None
+    return f"{z}|{int(price) // 50}|{int(surface) // 2}"
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Iterative Levenshtein — pure stdlib, O(len(a)*len(b)) time, O(len(b)) space.
+    Good enough for short titles (< 200 chars) which is all we ever feed it.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[-1] + 1, prev[j] + 1, prev[j - 1] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def title_similarity(a: str, b: str) -> float:
+    """Normalised Levenshtein distance ∈ [0,1] — 0 = identical, 1 = totally different.
+    Lowercases both sides; empty inputs return 1.0 (treated as "no signal").
+    """
+    a = (a or "").strip().lower()
+    b = (b or "").strip().lower()
+    if not a or not b:
+        return 1.0
+    n = max(len(a), len(b))
+    return _levenshtein(a, b) / n
+
+
+def find_dedup_primary(
+    *,
+    lbc_id: str,
+    source: str,
+    price: Optional[int],
+    surface: Optional[int],
+    location: Optional[str],
+    title: Optional[str],
+    price_tol_pct: float = 0.05,
+    surface_tol: int = 2,
+    title_tol: float = 0.30,
+) -> Optional[str]:
+    """Locate the earliest-seen cross-source primary that matches this listing.
+
+    Match criteria (all must hold):
+      • Different source (intra-source dups are handled by ON CONFLICT(lbc_id))
+      • |price_a - price_b| / min(price_a, price_b) ≤ 5%
+      • |surface_a - surface_b| ≤ 2 m²
+      • Same zip-or-city slug
+      • Levenshtein(title_a, title_b) / max(len) < 30%
+      • Candidate is itself a primary (dedup_of IS NULL) — so we never chain.
+
+    Returns the lbc_id of the primary, or None if no match. The candidate
+    SQL is bucketed by `dedup_key` (±1 bucket on price and surface) so even
+    on a 100k-row DB we only Levenshtein a handful of titles.
+    """
+    if price is None or surface is None or not title:
+        return None
+    z = _normalise_zip_or_city(location)
+    if not z:
+        return None
+    p_bucket = int(price) // 50
+    s_bucket = int(surface) // 2
+    # Generate the (zip|p|s) keys we want to scan: ±1 bucket on each axis.
+    candidate_keys = [
+        f"{z}|{p}|{s}"
+        for p in (p_bucket - 1, p_bucket, p_bucket + 1)
+        for s in (s_bucket - 1, s_bucket, s_bucket + 1)
+    ]
+    placeholders = ",".join("?" * len(candidate_keys))
+    price_tol_abs = max(int(round(price * price_tol_pct)), 5)  # ≥5€ floor
+    with _conn() as conn:
+        rows = conn.execute(
+            f"""SELECT lbc_id, source, price, surface, title, scraped_at
+                  FROM listings
+                 WHERE dedup_key IN ({placeholders})
+                   AND dedup_of IS NULL
+                   AND lbc_id != ?
+                   AND source != ?
+                   AND price IS NOT NULL AND surface IS NOT NULL
+                   AND ABS(price - ?) <= ?
+                   AND ABS(surface - ?) <= ?
+                 ORDER BY id ASC
+                 LIMIT 20""",
+            (*candidate_keys, lbc_id, source,
+             price, price_tol_abs, surface, surface_tol),
+        ).fetchall()
+    for r in rows:
+        # ±5% relative price tol (the SQL already used absolute bound, but the
+        # spec is relative — re-check on the raw values).
+        p1, p2 = price, r["price"]
+        denom = min(p1, p2) or 1
+        if abs(p1 - p2) / denom > price_tol_pct:
+            continue
+        if title_similarity(title, r["title"] or "") >= title_tol:
+            continue
+        return r["lbc_id"]
+    return None
+
+
+def apply_dedup_for_batch(rows: list) -> int:
+    """Walk freshly-persisted rows and stamp `dedup_of`/`dedup_key` columns.
+
+    `rows` is the same payload list passed to upsert_listings_batch (dicts
+    with keys: lbc_id, source, price, surface, location, title). We do this
+    AFTER the bulk upsert so the new rows' dedup_key is visible to peers
+    inside the same batch (earliest-seen wins — and ties break by id ASC).
+
+    Idempotent: re-running on the same rows is safe — `find_dedup_primary`
+    skips the row's own lbc_id, and we never overwrite an existing
+    dedup_of. Returns count of rows stamped as duplicates.
+    """
+    if not rows:
+        return 0
+    n_dups = 0
+    # First pass: write dedup_key for every row (cheap, 1 UPDATE per row).
+    # Second pass: detect duplicates against earlier primaries.
+    with _conn() as conn:
+        for r in rows:
+            key = compute_dedup_key(r.get("price"), r.get("surface"),
+                                    r.get("location"))
+            if key is None:
+                continue
+            conn.execute(
+                "UPDATE listings SET dedup_key = ? "
+                "WHERE lbc_id = ? AND (dedup_key IS NULL OR dedup_key != ?)",
+                (key, r["lbc_id"], key),
+            )
+    for r in rows:
+        # Skip rows already flagged in a previous run.
+        existing = get_listing_by_lbc_id(r["lbc_id"])
+        if existing is None or existing["dedup_of"] is not None:
+            continue
+        primary = find_dedup_primary(
+            lbc_id=r["lbc_id"],
+            source=r.get("source", ""),
+            price=r.get("price"),
+            surface=r.get("surface"),
+            location=r.get("location"),
+            title=r.get("title"),
+        )
+        if primary:
+            with _conn() as conn:
+                conn.execute(
+                    "UPDATE listings SET dedup_of = ? WHERE lbc_id = ? "
+                    "AND dedup_of IS NULL",
+                    (primary, r["lbc_id"]),
+                )
+            n_dups += 1
+            logger.info("[dedup] %s flagged as duplicate of %s",
+                        r["lbc_id"], primary)
+    return n_dups
+
+
+def is_duplicate(lbc_id: str) -> bool:
+    """Return True if this listing was flagged as a cross-source duplicate.
+    Used by the push-alert path to skip re-notifying about the same flat.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT dedup_of FROM listings WHERE lbc_id = ?", (lbc_id,)
+        ).fetchone()
+    return bool(row and row["dedup_of"])
