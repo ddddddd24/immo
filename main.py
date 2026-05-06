@@ -2484,12 +2484,133 @@ def main() -> None:
         except Exception as exc:
             logger.warning("Static publish git step failed: %s", exc)
 
+    # LBC sentinel state — global so /sentinel commands can manage it
+    _sentinel_task: asyncio.Task | None = None
+    _sentinel_scrape_lock = asyncio.Lock()
+    _sentinel_last_scrape_ts = [0.0]  # mutable container for closure
+    _sentinel_bot_ref = [None]  # captures Application.bot at post_init
+
+    async def _on_lbc_change(new_id: str) -> None:
+        """Sentinel detected new LBC listing → trigger full scrape via campaign."""
+        now = time.time()
+        if now - _sentinel_last_scrape_ts[0] < 90:
+            logger.info("[SENTINEL] change %s ignored — recent scrape (%.0fs ago)",
+                        new_id, now - _sentinel_last_scrape_ts[0])
+            return
+        if _sentinel_scrape_lock.locked():
+            logger.info("[SENTINEL] change %s skipped — scrape already running", new_id)
+            return
+        async with _sentinel_scrape_lock:
+            _sentinel_last_scrape_ts[0] = time.time()
+            logger.info("[SENTINEL] triggering LBC scrape (new_id=%s)", new_id)
+            try:
+                # Use _campaign_lock-protected core to feed the full pipeline
+                # (persist + score + push). Pass dummy update.
+                class _DummyUpdate:
+                    effective_message = type("M", (), {"reply_text": lambda *a, **kw: None})()
+                    effective_chat = type("C", (), {"id": int(config.TELEGRAM_CHAT_ID)})()
+                class _DummyCtx:
+                    bot = None
+                # Easier path: just call search_listings + persist+push directly
+                from scraper import search_listings, is_real_offer, detect_housing_type
+                from datetime import datetime as _dt
+                listings = await search_listings(config.DEFAULT_SEARCH_URL, max_results=30)
+                clean = [l for l in listings if is_real_offer(l)]
+                _now = _dt.utcnow().isoformat()
+                rows = []
+                for l in clean:
+                    htype, n_room = detect_housing_type(l.title or "", l.description or "")
+                    pub_at = getattr(l, "published_at", None) or f"scrape:{_now}"
+                    rows.append({
+                        "lbc_id": l.lbc_id, "title": l.title, "price": l.price,
+                        "location": l.location, "seller_name": l.seller_name,
+                        "seller_type": "", "url": l.url, "source": l.source,
+                        "surface": l.surface, "housing_type": htype,
+                        "roommate_count": n_room, "published_at": pub_at,
+                        "phone": getattr(l, "phone", None),
+                        "description": l.description,
+                        "available_from": getattr(l, "available_from", None),
+                    })
+                n = database.upsert_listings_batch(rows)
+                logger.info("[SENTINEL] persisted %d/%d LBC listings", n, len(clean))
+                # Trigger push for newly-persisted IDs
+                if config.ENABLE_PUSH_ALERTS and n > 0:
+                    # Need a real ctx with bot — use the global app's bot
+                    fake_ctx = type("C", (), {"bot": _app.bot})()
+                    await _check_and_push_alerts([r["lbc_id"] for r in rows], fake_ctx)
+            except Exception as exc:
+                logger.warning("[SENTINEL] triggered scrape failed: %s", exc)
+
+    async def _on_pap_change(new_id: str) -> None:
+        """PAP sentinel detected new listing → trigger PAP scrape."""
+        now = time.time()
+        if now - _sentinel_last_scrape_ts[0] < 60:
+            return
+        if _sentinel_scrape_lock.locked():
+            return
+        async with _sentinel_scrape_lock:
+            _sentinel_last_scrape_ts[0] = time.time()
+            logger.info("[PAP-SENTINEL] triggering PAP scrape (new_id=r%s)", new_id)
+            try:
+                from scraper import search_listings, is_real_offer, detect_housing_type
+                from datetime import datetime as _dt
+                listings = await search_listings(config.DEFAULT_SEARCH_PAP_URL, max_results=30)
+                clean = [l for l in listings if is_real_offer(l)]
+                _now = _dt.utcnow().isoformat()
+                rows = []
+                for l in clean:
+                    htype, n_room = detect_housing_type(l.title or "", l.description or "")
+                    pub_at = getattr(l, "published_at", None) or f"scrape:{_now}"
+                    rows.append({
+                        "lbc_id": l.lbc_id, "title": l.title, "price": l.price,
+                        "location": l.location, "seller_name": l.seller_name,
+                        "seller_type": "", "url": l.url, "source": l.source,
+                        "surface": l.surface, "housing_type": htype,
+                        "roommate_count": n_room, "published_at": pub_at,
+                        "phone": getattr(l, "phone", None),
+                        "description": l.description,
+                        "available_from": getattr(l, "available_from", None),
+                    })
+                n = database.upsert_listings_batch(rows)
+                logger.info("[PAP-SENTINEL] persisted %d/%d", n, len(clean))
+                if config.ENABLE_PUSH_ALERTS and n > 0 and _sentinel_bot_ref[0]:
+                    fake_ctx = type("C", (), {"bot": _sentinel_bot_ref[0]})()
+                    await _check_and_push_alerts([r["lbc_id"] for r in rows], fake_ctx)
+            except Exception as exc:
+                logger.warning("[PAP-SENTINEL] scrape failed: %s", exc)
+
+    _pap_sentinel_task = [None]  # mutable container
+
     async def _post_init(_app):
         import scraper as _scraper_mod
         await _scraper_mod.init_camoufox_pool(size=2)
+        _sentinel_bot_ref[0] = _app.bot
+        nonlocal _sentinel_task
+        try:
+            _sentinel_task = asyncio.create_task(
+                _scraper_mod._lbc_sentinel_loop(_on_lbc_change)
+            )
+            logger.info("[SENTINEL] LBC sentinel loop started (60s±15s polling)")
+        except Exception as exc:
+            logger.warning("[SENTINEL] LBC failed to start: %s", exc)
+        try:
+            _pap_sentinel_task[0] = asyncio.create_task(
+                _scraper_mod._pap_sentinel_loop(_on_pap_change)
+            )
+            logger.info("[SENTINEL] PAP sentinel loop started (75s polling)")
+        except Exception as exc:
+            logger.warning("[SENTINEL] PAP failed to start: %s", exc)
 
     async def _post_shutdown(_app):
         import scraper as _scraper_mod
+        if _sentinel_task and not _sentinel_task.done():
+            _sentinel_task.cancel()
+            try: await _sentinel_task
+            except asyncio.CancelledError: pass
+        if _pap_sentinel_task[0] and not _pap_sentinel_task[0].done():
+            _pap_sentinel_task[0].cancel()
+            try: await _pap_sentinel_task[0]
+            except asyncio.CancelledError: pass
         await _scraper_mod.shutdown_camoufox_pool()
 
     app = (

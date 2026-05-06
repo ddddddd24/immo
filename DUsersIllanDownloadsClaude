@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "<string>", line 10, in <module>
+UnicodeEncodeError: 'cp932' codec can't encode character '\xe8' in position 821: illegal multibyte sequence
+Found at idx: 96944
+---BEFORE---

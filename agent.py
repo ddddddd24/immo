@@ -465,14 +465,20 @@ async def score_listings_batch(listings: list[Listing], batch_size: int = 5) -> 
 
         # Capture availability for ALL listings (even dealbroken ones) so the
         # dashboard can show "Libre" across the full table, not just scored rows.
-        # Accept both YYYY-MM (10 chars) and YYYY-MM-DD (10 chars) formats.
+        # Accept both YYYY-MM (7 chars) and YYYY-MM-DD (10 chars). Validate via
+        # strptime — rejects "2026-13", "2026-09-31", malformed garbage.
         avail = item.get("available")
         avail_str = None
         if isinstance(avail, str):
-            if len(avail) >= 10 and avail[4] == '-' and avail[7] == '-':
-                avail_str = avail[:10]  # YYYY-MM-DD
-            elif len(avail) >= 7 and avail[4] == '-':
-                avail_str = avail[:7]   # YYYY-MM
+            try:
+                if len(avail) >= 10 and avail[4] == '-' and avail[7] == '-':
+                    _dt.datetime.strptime(avail[:10], "%Y-%m-%d")
+                    avail_str = avail[:10]
+                elif len(avail) >= 7 and avail[4] == '-':
+                    _dt.datetime.strptime(avail[:7], "%Y-%m")
+                    avail_str = avail[:7]
+            except (ValueError, IndexError):
+                avail_str = None
         # Drop past-dated extractions — almost always year hallucinations.
         if avail_str and avail_str[:7] < earliest_avail:
             avail_str = None

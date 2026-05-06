@@ -189,6 +189,35 @@ DEFAULT_SEARCH_GUYHOQUET_URL: str = os.getenv(
     "https://www.guy-hoquet.com/annonces/location/paris/?priceMax=1100",
 )
 
+# Inli (CDC Habitat — logement intermédiaire IDF). Off-radar — paginates
+# per-département, scraper expands the 8 IDF depts internally.
+DEFAULT_SEARCH_INLI_URL: str = os.getenv(
+    "INLI_SEARCH_URL",
+    "https://www.inli.fr/locations/offres/idf",
+)
+
+# Gens de Confiance (P2P trust network) — server-renders 30 listings/page in
+# React-on-Rails JSON blob. Off-radar (login required only to contact, not
+# to browse). ~4900 IDF active rentals. User needs 3 sponsors to message.
+DEFAULT_SEARCH_GENSDECONFIANCE_URL: str = os.getenv(
+    "GENSDECONFIANCE_SEARCH_URL",
+    "https://www.gensdeconfiance.com/fr/s/immobilier/locations-immobilieres",
+)
+
+# CDC Habitat (public sister of Inli) — 573k national units, ~44 IDF listings
+# ≤1100€ CC, 62% intermediate (sweet spot for SNCF alternant). Server-rendered.
+DEFAULT_SEARCH_CDC_URL: str = os.getenv(
+    "CDC_SEARCH_URL",
+    "https://www.cdc-habitat.fr/recherche/location/ile-de-france",
+)
+
+# FNAIM — federated portal of 12 000 independent agencies. ~1100 IDF listings.
+# Many small agencies skip the big portals → real off-radar volume.
+DEFAULT_SEARCH_FNAIM_URL: str = os.getenv(
+    "FNAIM_SEARCH_URL",
+    "https://www.fnaim.fr/liste-annonces-immobilieres/18-location-appartement-ile-de-france.htm",
+)
+
 # Roomlala disabled — site redirects geo-aware and 404s on every URL pattern
 # tried with Camoufox; site may be restructured or geo-blocked. Set the env
 # var manually if you find a working URL.
@@ -222,3 +251,14 @@ SYNC_AFTER_CAMPAIGN: bool = os.getenv("SYNC_AFTER_CAMPAIGN", "true").lower() in 
 # eligible listing. Set ENABLE_CONTACT_PREP=false in .env to disable while
 # keeping default true here for tests + dispatcher safety.
 ENABLE_CONTACT_PREP: bool = os.getenv("ENABLE_CONTACT_PREP", "true").lower() in ("true", "1", "yes")
+
+# ── Push alerts (instant Telegram notif on hot listings) ─────────────────────
+# When true, a Telegram message fires during /campagne for any newly-persisted
+# listing matching strict hot criteria: score>=PUSH_MIN_SCORE, price<=PUSH_MAX_PRICE,
+# weight-3 zone (Paris 11/12/13, Vincennes, Saint-Mandé, Charenton), real phone,
+# fresh (<24h published or scrape-marker today). Off by default.
+ENABLE_PUSH_ALERTS: bool = os.getenv("ENABLE_PUSH_ALERTS", "false").lower() in ("true", "1", "yes")
+PUSH_MIN_SCORE: int = int(os.getenv("PUSH_MIN_SCORE", "7"))
+PUSH_MAX_PRICE: int = int(os.getenv("PUSH_MAX_PRICE", "1100"))
+PUSH_RATE_PER_MIN: int = int(os.getenv("PUSH_RATE_PER_MIN", "20"))
+PUSH_MAX_PER_CAMPAIGN: int = int(os.getenv("PUSH_MAX_PER_CAMPAIGN", "200"))

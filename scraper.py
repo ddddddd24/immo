@@ -110,7 +110,9 @@ async def _pw_get_next_data(url: str, site: str = "leboncoin") -> Optional[dict]
         )
 
     # ─── Attempt 2: Camoufox fallback (anti-detect Firefox) ──────────────────
-    cam_html = await _fetch_html_with_camoufox(url, post_delay=(3.0, 5.0))
+    # Pass `site=` explicitly — for LBC and SeLoger this routes to the warm
+    # per-site context (DataDome cookie reused across scrapes).
+    cam_html = await _fetch_html_with_camoufox(url, post_delay=(3.0, 5.0), site=site)
     if not cam_html:
         logger.warning("[%s] Camoufox also failed to retrieve HTML for %s", site, url)
         return None
@@ -686,25 +688,10 @@ async def _fetch_single_with_playwright(lbc_url: str) -> Optional[Listing]:
 
 # ─── SeLoger Playwright scrapers ─────────────────────────────────────────────
 
-async def _pw_get_seloger_data(url: str) -> Optional[dict]:
-    """Fetch SeLoger page via curl_cffi (Chrome TLS fingerprint) to bypass
-    DataDome — ~5× faster than Camoufox and no browser overhead.
-    Extracts listing data from window["__UFRN_FETCHER__"] in the SSR HTML.
-    """
-    from curl_cffi.requests import AsyncSession
-
-    try:
-        async with AsyncSession(impersonate="chrome120", timeout=30) as session:
-            r = await session.get(url, allow_redirects=True)
-            if r.status_code != 200:
-                logger.warning("[SELOGER] HTTP %s on %s", r.status_code, url[:80])
-                return None
-            ssr_html = r.text
-    except Exception as exc:
-        logger.warning("[SELOGER] curl_cffi fetch failed: %s", exc)
-        return None
-
-    # Extract window["__UFRN_FETCHER__"] — SeLoger's SSR data container
+def _seloger_parse_fetcher_html(ssr_html: str) -> Optional[dict]:
+    """Shared parser for SeLoger SSR HTML (window['__UFRN_FETCHER__']).
+    Returns the decompressed serp dict or None. Used by both curl_cffi
+    (fast path) and the Camoufox fallback."""
     m = _re.search(
         r'window\["__UFRN_FETCHER__"\]=JSON\.parse\("(.*?)"\);\s*</script>',
         ssr_html, _re.DOTALL
@@ -734,6 +721,45 @@ async def _pw_get_seloger_data(url: str) -> Optional[dict]:
     except Exception as exc:
         logger.warning("[SELOGER] Failed to decompress/parse serp data: %s", exc)
         return None
+
+
+async def _pw_get_seloger_data(url: str) -> Optional[dict]:
+    """Fetch SeLoger page via curl_cffi (Chrome TLS fingerprint) to bypass
+    DataDome — ~5× faster than Camoufox and no browser overhead.
+    Extracts listing data from window["__UFRN_FETCHER__"] in the SSR HTML.
+
+    Fallback chain when curl_cffi is blocked (HTTP 403/captcha):
+        curl_cffi → warm Camoufox "seloger" context (DataDome cookie reused)
+    """
+    from curl_cffi.requests import AsyncSession
+
+    ssr_html: Optional[str] = None
+    try:
+        async with AsyncSession(impersonate="chrome120", timeout=30) as session:
+            r = await session.get(url, allow_redirects=True)
+            if r.status_code == 200:
+                ssr_html = r.text
+            else:
+                logger.warning("[SELOGER] HTTP %s on %s — trying Camoufox", r.status_code, url[:80])
+    except Exception as exc:
+        logger.warning("[SELOGER] curl_cffi fetch failed: %s — trying Camoufox", exc)
+
+    # Fast-path parse
+    if ssr_html:
+        data = _seloger_parse_fetcher_html(ssr_html)
+        if data is not None:
+            return data
+        logger.warning("[SELOGER] curl_cffi got HTML but no fetcher data — trying Camoufox")
+
+    # Camoufox fallback via the warm "seloger" context. First call cold-starts
+    # the browser + solves the DataDome challenge (~30s); subsequent calls
+    # reuse the cookie jar and run in 5-10s.
+    cam_html = await _fetch_html_with_camoufox(
+        url, post_delay=(2.0, 4.0), site="seloger", goto_timeout=60_000,
+    )
+    if not cam_html:
+        return None
+    return _seloger_parse_fetcher_html(cam_html)
 
 
 def _seloger_enrich_detail(html: str) -> dict:
@@ -1076,7 +1102,7 @@ async def _search_pap_with_playwright(search_url: str, max_results: int) -> list
                     # Hard dealbreakers
                     if info.get("furnished") is False:
                         return lst.lbc_id  # drop: non-meublé
-                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"] > "2026-09":
+                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"][:7] > "2026-09":
                         return lst.lbc_id  # drop: dispo trop tard
                     floor = info.get("floor")
                     if isinstance(floor, int) and floor > 3 and info.get("elevator") is False:
@@ -1615,79 +1641,91 @@ def _li_parse_surface(raw: str | None) -> Optional[int]:
 
 
 async def _search_logicimmo_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    """Scrape Logic-Immo /classified-search via Camoufox.
+    """Scrape Logic-Immo /classified-search via the warm Camoufox context.
 
     Stealth Playwright is reliably DataDome-blocked here (captcha-delivery iframe).
-    Camoufox walks straight in. ~10–15s typical wall-clock time.
-    """
-    from camoufox.async_api import AsyncCamoufox
+    Camoufox walks straight in. With a warm DataDome cookie this runs in ~5-10s
+    (cold-start was ~30-45s including browser launch + challenge).
 
+    Uses the persistent "logicimmo" context — only the first scrape after bot
+    startup pays the DataDome challenge cost.
+    """
     t0 = time.time()
     raw_cards: list = []
+    page = None
 
     try:
-        async with AsyncCamoufox(headless=True, locale=["fr-FR"], os="windows") as browser:
-            page = await browser.new_page()
+        context = await _get_camoufox_context("logicimmo")
+        page = await context.new_page()
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
             try:
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
-                try:
-                    await page.evaluate(
-                        "() => { const r = document.querySelector('#usercentrics-root');"
-                        "        if (r) r.remove(); return true; }"
-                    )
-                except Exception:
-                    pass
-                try:
-                    await page.wait_for_selector(
-                        '[data-testid="serp-core-classified-card-testid"]',
-                        timeout=20_000,
-                    )
-                except Exception as exc:
-                    logger.warning("[LOGICIMMO] cards never rendered: %s", exc)
-                    return []
-                raw_cards = await page.evaluate(
-                    """(maxN) => {
-                      const cards = Array.from(document.querySelectorAll(
-                        '[data-testid="serp-core-classified-card-testid"]'
-                      )).slice(0, maxN);
-                      const text = (el, sel) => {
-                        const x = el.querySelector(sel);
-                        return x ? (x.innerText || x.textContent || '').trim() : '';
-                      };
-                      return cards.map(c => {
-                        const link  = c.querySelector('[data-testid="card-mfe-covering-link-testid"]');
-                        let href = '';
-                        let summary = '';
-                        if (link) {
-                          href = link.getAttribute('href') || '';
-                          const dataBase = link.getAttribute('data-base') || '';
-                          if (!href && dataBase) {
-                            try { href = decodeURIComponent(dataBase); } catch (e) { href = dataBase; }
-                          }
-                          summary = link.getAttribute('title') || '';
-                        }
-                        const imgs = Array.from(c.querySelectorAll('img'))
-                          .map(i => i.src || i.getAttribute('data-src') || '')
-                          .filter(s => s.startsWith('http'));
-                        const agency = (
-                          text(c, '[data-testid*="agency-publisher"]') ||
-                          text(c, '[data-testid*="publisher"]')
-                        );
-                        return {
-                          href, summary, imgs, agency,
-                          price:    text(c, '[data-testid="cardmfe-price-testid"]'),
-                          address:  text(c, '[data-testid="cardmfe-description-box-address"]'),
-                          keyfacts: text(c, '[data-testid="cardmfe-keyfacts-testid"]'),
-                          desc:     text(c, '[data-testid="cardmfe-description-text-test-id"]'),
-                        };
-                      });
-                    }""",
-                    max_results,
+                await page.evaluate(
+                    "() => { const r = document.querySelector('#usercentrics-root');"
+                    "        if (r) r.remove(); return true; }"
                 )
-            finally:
-                await page.close()
+            except Exception:
+                pass
+            try:
+                await page.wait_for_selector(
+                    '[data-testid="serp-core-classified-card-testid"]',
+                    timeout=20_000,
+                )
+            except Exception as exc:
+                logger.warning("[LOGICIMMO] cards never rendered: %s", exc)
+                return []
+            raw_cards = await page.evaluate(
+                """(maxN) => {
+                  const cards = Array.from(document.querySelectorAll(
+                    '[data-testid="serp-core-classified-card-testid"]'
+                  )).slice(0, maxN);
+                  const text = (el, sel) => {
+                    const x = el.querySelector(sel);
+                    return x ? (x.innerText || x.textContent || '').trim() : '';
+                  };
+                  return cards.map(c => {
+                    const link  = c.querySelector('[data-testid="card-mfe-covering-link-testid"]');
+                    let href = '';
+                    let summary = '';
+                    if (link) {
+                      href = link.getAttribute('href') || '';
+                      const dataBase = link.getAttribute('data-base') || '';
+                      if (!href && dataBase) {
+                        try { href = decodeURIComponent(dataBase); } catch (e) { href = dataBase; }
+                      }
+                      summary = link.getAttribute('title') || '';
+                    }
+                    const imgs = Array.from(c.querySelectorAll('img'))
+                      .map(i => i.src || i.getAttribute('data-src') || '')
+                      .filter(s => s.startsWith('http'));
+                    const agency = (
+                      text(c, '[data-testid*="agency-publisher"]') ||
+                      text(c, '[data-testid*="publisher"]')
+                    );
+                    return {
+                      href, summary, imgs, agency,
+                      price:    text(c, '[data-testid="cardmfe-price-testid"]'),
+                      address:  text(c, '[data-testid="cardmfe-description-box-address"]'),
+                      keyfacts: text(c, '[data-testid="cardmfe-keyfacts-testid"]'),
+                      desc:     text(c, '[data-testid="cardmfe-description-text-test-id"]'),
+                    };
+                  });
+                }""",
+                max_results,
+            )
+        finally:
+            try: await page.close()
+            except Exception: pass
     except Exception as exc:
         logger.warning("[LOGICIMMO] Camoufox failed: %s", exc)
+        # If the warm context died, mark it dead so the next call recreates.
+        try:
+            ctx = _CAMOUFOX_CTXS.get("logicimmo")
+            if ctx is not None:
+                _ = ctx.pages
+        except Exception:
+            logger.warning("[LOGICIMMO] context died; will recreate on next scrape")
+            await _close_site_context("logicimmo")
         return []
 
     logger.info("[LOGICIMMO] extracted %d raw cards in %.1fs", len(raw_cards), time.time() - t0)
@@ -2001,11 +2039,30 @@ async def _search_via_generic(
 # Run /search <url> against each platform after first launch and tune the
 # `card_selectors` list (and source-specific JSON paths) against live HTML.
 
-# Camoufox browser pool — kept alive for the bot's lifetime to amortize the
-# ~30s cold-start across all campaigns and watches. Pool size = max concurrent
-# Camoufox-using sources (queue.get blocks past that, naturally serializing).
-_CAMOUFOX_POOL: Optional["asyncio.Queue"] = None
-_CAMOUFOX_CMS: list = []  # AsyncCamoufox context managers, kept open until shutdown
+# ─── Camoufox per-site persistent contexts ───────────────────────────────────
+# Each anti-bot-protected site gets its OWN long-lived Camoufox Browser +
+# BrowserContext. The context's cookie jar persists across scrapes, so the
+# DataDome cookie obtained on the first (cold) scrape is reused on every
+# subsequent scrape — turning ~60-90s cold scrapes into ~5-15s warm ones.
+#
+# Memory budget: ~200MB per context × 3 sites = ~600MB, comfortably below
+# Oracle ARM 24GB. Contexts close cleanly on bot shutdown via
+# `shutdown_camoufox_pool` (kept named for caller compat in main.py).
+#
+# Sites with their own warm context:
+#   - "leboncoin"  : LBC DataDome challenge
+#   - "seloger"    : SeLoger DataDome (used as Camoufox fallback to curl_cffi)
+#   - "logicimmo"  : Logic-Immo DataDome
+#   - "_generic"   : shared context for sites without per-site cookies
+#                    (Studapart/Lodgis/Bien'ici/ImmoJeune/LocService etc.)
+_CAMOUFOX_CTXS: dict[str, "object"] = {}        # site -> BrowserContext
+_CAMOUFOX_BROWSERS: dict[str, "object"] = {}    # site -> Browser
+_CAMOUFOX_CMS_BY_SITE: dict[str, "object"] = {} # site -> AsyncCamoufox CM (for shutdown)
+_CAMOUFOX_LOCKS: dict[str, "asyncio.Lock"] = {} # site -> per-site init/recreate lock
+_CAMOUFOX_INIT_LOCK: Optional["asyncio.Lock"] = None  # global lock for lock-dict init
+
+# Sites that get a dedicated warm context. Anything else routes to "_generic".
+_NAMED_SITES = ("leboncoin", "seloger", "logicimmo")
 
 
 # Generic browser-like UA for httpx fetches. Most French rental sites (PAP,
@@ -2056,48 +2113,120 @@ async def _fetch_pages_curl_cffi(urls: list[str], timeout: int = 15, impersonate
         return await asyncio.gather(*(_one(u) for u in urls))
 
 
-async def init_camoufox_pool(size: int = 2) -> int:
-    """Launch `size` long-lived Camoufox browsers. Idempotent — safe to call
-    multiple times; subsequent calls with a live pool are no-ops.
+def _site_key_from_url(url: str) -> str:
+    """Map a URL to a named-context site key, or '_generic' for the rest.
 
-    Returns the number of browsers actually launched.
+    Used by `_fetch_html_with_camoufox` to route to the right warm context
+    when callers don't pass an explicit `site=` kwarg.
     """
-    global _CAMOUFOX_POOL
-    if _CAMOUFOX_POOL is not None:
-        return _CAMOUFOX_POOL.qsize()
+    host = url.split("/", 3)[2].lower() if "://" in url else url.lower()
+    if "leboncoin.fr" in host:
+        return "leboncoin"
+    if "seloger.com" in host:
+        return "seloger"
+    if "logic-immo.com" in host:
+        return "logicimmo"
+    return "_generic"
+
+
+async def _launch_camoufox_context(site: str):
+    """Cold-start a Camoufox Browser + BrowserContext for `site`.
+
+    Returns (cm, browser, context). `cm` is the AsyncCamoufox context manager,
+    held in `_CAMOUFOX_CMS_BY_SITE` so we can `__aexit__` it on shutdown.
+    """
     from camoufox.async_api import AsyncCamoufox
-    pool: asyncio.Queue = asyncio.Queue()
-    for i in range(size):
+    cm = AsyncCamoufox(headless=True, locale=["fr-FR"], os="windows")
+    t0 = time.time()
+    browser = await cm.__aenter__()
+    logger.info("[CAMOUFOX %s] browser launched in %.1fs", site, time.time() - t0)
+    t1 = time.time()
+    # One persistent context per site → cookies (incl. DataDome) survive across
+    # scrapes. We don't pass storage_state — first scrape solves the challenge,
+    # subsequent scrapes reuse the in-memory cookie jar.
+    context = await browser.new_context(locale="fr-FR", viewport={"width": 1280, "height": 800})
+    logger.info("[CAMOUFOX %s] context ready in %.1fs", site, time.time() - t1)
+    return cm, browser, context
+
+
+async def _get_camoufox_context(site: str):
+    """Return the warm BrowserContext for `site`, lazily creating it on first
+    use. Recreates transparently if the previous context died (DataDome
+    refresh challenge can kill the page; the context itself usually survives,
+    but we're defensive).
+
+    Per-site lock prevents concurrent scrapes from racing the cold start.
+    """
+    global _CAMOUFOX_INIT_LOCK
+    if _CAMOUFOX_INIT_LOCK is None:
+        _CAMOUFOX_INIT_LOCK = asyncio.Lock()
+    async with _CAMOUFOX_INIT_LOCK:
+        if site not in _CAMOUFOX_LOCKS:
+            _CAMOUFOX_LOCKS[site] = asyncio.Lock()
+    site_lock = _CAMOUFOX_LOCKS[site]
+
+    async with site_lock:
+        ctx = _CAMOUFOX_CTXS.get(site)
+        # Probe liveness — closed contexts raise when you call new_page on them
+        if ctx is not None:
+            try:
+                # A cheap liveness check: pages property doesn't I/O, but if
+                # the underlying browser died this throws.
+                _ = ctx.pages
+                return ctx
+            except Exception as exc:
+                logger.warning("[CAMOUFOX %s] context dead (%s); recreating", site, exc)
+                # Fall through to recreate
+                await _close_site_context(site)
+
+        cm, browser, context = await _launch_camoufox_context(site)
+        _CAMOUFOX_CMS_BY_SITE[site] = cm
+        _CAMOUFOX_BROWSERS[site] = browser
+        _CAMOUFOX_CTXS[site] = context
+        return context
+
+
+async def _close_site_context(site: str) -> None:
+    """Tear down the warm context + browser for `site`. Safe to call on a
+    site that was never initialized."""
+    cm = _CAMOUFOX_CMS_BY_SITE.pop(site, None)
+    _CAMOUFOX_BROWSERS.pop(site, None)
+    _CAMOUFOX_CTXS.pop(site, None)
+    if cm is not None:
         try:
-            cm = AsyncCamoufox(headless=True, locale=["fr-FR"], os="windows")
-            t0 = time.time()
-            browser = await cm.__aenter__()
-            logger.info("Camoufox %d: __aenter__ done in %.1fs", i + 1, time.time() - t0)
-            t1 = time.time()
-            warmup_page = await asyncio.wait_for(browser.new_page(), timeout=30)
-            logger.info("Camoufox %d: warmup new_page in %.1fs", i + 1, time.time() - t1)
-            await warmup_page.close()
-            _CAMOUFOX_CMS.append(cm)
-            await pool.put(browser)
+            await cm.__aexit__(None, None, None)
         except Exception as exc:
-            logger.warning("Could not launch Camoufox browser %d/%d: %s", i + 1, size, exc)
-    n = pool.qsize()
-    _CAMOUFOX_POOL = pool if n > 0 else None
-    logger.info("Camoufox pool initialized: %d/%d browsers ready", n, size)
+            logger.warning("[CAMOUFOX %s] failed to close: %s", site, exc)
+
+
+async def init_camoufox_pool(size: int = 2) -> int:
+    """Pre-warm the named Camoufox contexts (LBC, SeLoger, Logic-Immo).
+
+    `size` is kept for back-compat with main.py's `_post_init` call but is
+    now ignored — we always pre-warm the named sites + a generic context.
+    Idempotent: re-calling on already-initialized sites is a no-op.
+
+    Returns the number of contexts successfully warmed.
+    """
+    sites = list(_NAMED_SITES) + ["_generic"]
+    n = 0
+    for site in sites:
+        try:
+            await _get_camoufox_context(site)
+            n += 1
+        except Exception as exc:
+            logger.warning("Could not pre-warm Camoufox context for %s: %s", site, exc)
+    logger.info("Camoufox contexts initialized: %d/%d ready", n, len(sites))
     return n
 
 
 async def shutdown_camoufox_pool() -> None:
-    """Close all pooled Camoufox browsers. Called on bot shutdown."""
-    global _CAMOUFOX_POOL
-    _CAMOUFOX_POOL = None
-    for cm in _CAMOUFOX_CMS:
-        try:
-            await cm.__aexit__(None, None, None)
-        except Exception as exc:
-            logger.warning("Failed to close Camoufox browser: %s", exc)
-    _CAMOUFOX_CMS.clear()
-    logger.info("Camoufox pool shut down")
+    """Close every warm Camoufox context. Called from main.py on bot shutdown."""
+    sites = list(_CAMOUFOX_CTXS.keys())
+    for site in sites:
+        await _close_site_context(site)
+    _CAMOUFOX_LOCKS.clear()
+    logger.info("Camoufox contexts shut down")
 
 
 async def _fetch_html_with_camoufox(
@@ -2105,56 +2234,62 @@ async def _fetch_html_with_camoufox(
     post_delay: tuple[float, float] = (5.0, 8.0),
     wait_until: str = "domcontentloaded",
     goto_timeout: int = 60_000,
+    site: Optional[str] = None,
 ) -> Optional[str]:
-    """Fetch a page with Camoufox (anti-detect Firefox) — bypasses stealth-Playwright fingerprinting.
+    """Fetch a page with Camoufox using the warm per-site context.
 
-    Acquires a browser from `_CAMOUFOX_POOL` if available (caller must have
-    called `init_camoufox_pool` at startup), otherwise cold-starts a one-off
-    browser. The pool path saves ~30s per source by avoiding cold-starts and
-    naturally bounds concurrency by pool size.
+    Routes to the right named context based on the URL host (or `site` kwarg).
+    First call per site cold-starts the browser + solves DataDome (~30s);
+    subsequent calls reuse the cookie jar and run in 5-15s.
 
-    Studapart/Lodgis/ImmoJeune/LocService work fine with the default
-    `wait_until="domcontentloaded"`. Bien'ici has aggressive bot detection
-    that holds the document open for 5+ minutes during the DataDome
-    challenge — for that site, callers should pass `wait_until="commit"`.
+    Studapart/Lodgis/ImmoJeune/LocService share the "_generic" context.
+    Bien'ici callers should pass `wait_until="commit"` (its DataDome
+    challenge holds the document open).
+
+    On a single failed scrape we DON'T tear down the context — DataDome
+    sometimes serves a captcha for one URL but lets the next through. We
+    only recreate when the context itself is dead (see `_get_camoufox_context`).
     """
-    async def _scrape_on(browser) -> Optional[str]:
-        t0 = time.time()
-        host = url.split("/")[2] if "://" in url else url[:30]
-        def _step(name: str) -> None:
-            logger.info("[CAMOUFOX %s] %s @ +%.1fs", host, name, time.time() - t0)
-        page = await browser.new_page()
-        _step("new_page done")
-        try:
-            _step(f"goto start (wait_until={wait_until}, timeout={goto_timeout/1000:.0f}s)")
-            await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
-            _step("goto done")
-            await _handle_cookie_banner(page)
-            _step("cookie banner done")
-            await asyncio.sleep(random.uniform(*post_delay))
-            _step("post_delay done")
-            html = await page.content()
-            _step(f"content done ({len(html)} chars)")
-            return html
-        except Exception as exc:
-            _step(f"EXCEPTION: {type(exc).__name__}: {exc}")
-            logger.warning("Camoufox fetch failed for %s: %s", url, exc)
-            return None
-        finally:
-            try: await page.close()
-            except Exception: pass
+    # Resolve to a known named site, else share the "_generic" context. Phase 2
+    # callers pass site="studapart"/"lodgis"/etc. which map to "_generic" so we
+    # don't spawn a warm browser per every minor portal (memory budget).
+    raw_site = site or _site_key_from_url(url)
+    site_key = raw_site if raw_site in _NAMED_SITES else "_generic"
+    context = await _get_camoufox_context(site_key)
 
-    if _CAMOUFOX_POOL is not None:
-        browser = await _CAMOUFOX_POOL.get()
-        try:
-            return await _scrape_on(browser)
-        finally:
-            await _CAMOUFOX_POOL.put(browser)
+    t0 = time.time()
+    host = url.split("/")[2] if "://" in url else url[:30]
+    def _step(name: str) -> None:
+        logger.info("[CAMOUFOX %s/%s] %s @ +%.1fs", site_key, host, name, time.time() - t0)
 
-    # Fallback: standalone browser (tests, or pool init failed)
-    from camoufox.async_api import AsyncCamoufox
-    async with AsyncCamoufox(headless=True, locale=["fr-FR"], os="windows") as browser:
-        return await _scrape_on(browser)
+    page = await context.new_page()
+    _step("new_page done")
+    try:
+        _step(f"goto start (wait_until={wait_until}, timeout={goto_timeout/1000:.0f}s)")
+        await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
+        _step("goto done")
+        await _handle_cookie_banner(page)
+        _step("cookie banner done")
+        await asyncio.sleep(random.uniform(*post_delay))
+        _step("post_delay done")
+        html = await page.content()
+        _step(f"content done ({len(html)} chars)")
+        return html
+    except Exception as exc:
+        _step(f"EXCEPTION: {type(exc).__name__}: {exc}")
+        logger.warning("Camoufox fetch failed for %s: %s", url, exc)
+        # If the context itself died, mark it for recreation on next call.
+        # Callers above us will retry; the next `_get_camoufox_context`
+        # liveness check will see it's dead and rebuild transparently.
+        try:
+            _ = context.pages
+        except Exception:
+            logger.warning("[CAMOUFOX %s] context died mid-scrape; will recreate", site_key)
+            await _close_site_context(site_key)
+        return None
+    finally:
+        try: await page.close()
+        except Exception: pass
 
 
 def _studapart_card_to_listing(card) -> Optional[Listing]:
@@ -2763,6 +2898,14 @@ def _lodgis_enrich_detail(html: str) -> dict:
     if (m := _re.search(r"Available from\s*[:\s]*(\d{1,2})[-/](\d{1,2})[-/](\d{4})", html, _re.I)):
         out["available_yyyy_mm"] = f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
 
+    # Lodgis HQ phone — single tel: link on every detail page (they're the agent for every listing)
+    if (m := _re.search(r'href="tel:([+\d]+)"', html)):
+        raw = m.group(1).lstrip("+")
+        if raw.startswith("33"):
+            raw = "0" + raw[2:]
+        if _re.fullmatch(r"0[1-9]\d{8}", raw):
+            out["phone"] = raw
+
     # Description: long English paragraph in <div class="appart__infos__description">.
     # Verified live: 645–810 chars of real listing copy (location, surface, transit, nearby amenities).
     try:
@@ -2818,13 +2961,15 @@ async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> l
                         info = _lodgis_enrich_detail(r.text)
                     except Exception:
                         return None
-                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"] > "2026-09":
+                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"][:7] > "2026-09":
                         return lst.lbc_id
                     floor = info.get("floor")
                     if isinstance(floor, int) and floor > 3 and info.get("elevator") is False:
                         return lst.lbc_id
                     if (av := info.get("available_yyyy_mm")):
                         lst.available_from = av
+                    if (ph := info.get("phone")):
+                        lst.phone = ph
                     if (desc := info.get("description")):
                         lst.description = desc  # replace empty placeholder
                     tags = []
@@ -2950,6 +3095,10 @@ def _immojeune_enrich_detail(html: str) -> dict:
         unit = m.group(2).lower()
         days = n * {"jour": 1, "semaine": 7, "mois": 30, "an": 365}[unit]
         out["published_at"] = (_dt.utcnow() - _td(days=days)).isoformat()
+    # Phone: ImmoJeune owners often write "Tel : 06 XX XX XX XX" in description body
+    text = _re.sub(r"<[^>]+>", " ", html)
+    if (m := _re.search(r"\b(0[1-9](?:[\s.\-]?\d{2}){4})\b", text)):
+        out["phone"] = _re.sub(r"[\s.\-]", "", m.group(1))
     return out
 
 
@@ -2995,10 +3144,12 @@ async def _search_immojeune_with_playwright(search_url: str, max_results: int) -
                         info = _immojeune_enrich_detail(r.text)
                     except Exception:
                         return None
-                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"] > "2026-09":
+                    if info.get("available_yyyy_mm") and info["available_yyyy_mm"][:7] > "2026-09":
                         return lst.lbc_id
                     if (pub := info.get("published_at")):
                         lst.published_at = pub
+                    if (ph := info.get("phone")):
+                        lst.phone = ph
                     tags = []
                     if info.get("furnished") is True: tags.append("[MEUBLÉ: oui]")
                     if info.get("elevator") is True: tags.append("[ASCENSEUR: oui]")
@@ -3460,6 +3611,508 @@ async def _search_wizi(search_url: str, max_results: int) -> list[Listing]:
     return listings
 
 
+# ─── Inli (CDC Habitat — logement intermédiaire) ─────────────────────────────
+_INLI_IDF_DEPTS: list[tuple[str, int]] = [
+    ("paris", 75), ("seine-et-marne", 77), ("yvelines", 78), ("essonne", 91),
+    ("hauts-de-seine", 92), ("seine-saint-denis", 93), ("val-de-marne", 94),
+    ("val-d-oise", 95),
+]
+_INLI_CARD_RE = _re.compile(r'<div class="featured-item">(.*?)</a>\s*</div>', _re.DOTALL)
+_INLI_HREF_RE = _re.compile(r'href="(/locations/offre/([a-z0-9-]+)/([A-Z0-9-]+))"')
+_INLI_PRICE_RE = _re.compile(
+    r'<span class="demi-condensed">([\d\s]+)\s*€\s*</span>\s*<span class="book-condensed">cc</span>'
+)
+_INLI_DETAILS_RE = _re.compile(
+    r'<div class="featured-details"[^>]*>\s*<span>\s*(.*?)\s*</span>', _re.DOTALL,
+)
+_INLI_IMG_RE = _re.compile(r'<img[^>]+src="([^"]+)"[^>]*class="featured-image[^"]*"')
+_INLI_SURFACE_RE = _re.compile(r"(\d+(?:[.,]\d+)?)\s*m[²2]")
+_INLI_PIECES_RE = _re.compile(r"(\d+)\s*pi[èe]ces?", _re.IGNORECASE)
+
+
+def _inli_card_to_listing(card_html: str) -> Optional[Listing]:
+    href_m = _INLI_HREF_RE.search(card_html)
+    if not href_m:
+        return None
+    href, slug_city, raw_id = href_m.group(1), href_m.group(2), href_m.group(3)
+    url = "https://www.inli.fr" + href
+    price_m = _INLI_PRICE_RE.search(card_html)
+    if not price_m:
+        return None
+    try:
+        price = int(price_m.group(1).replace(" ", ""))
+    except ValueError:
+        return None
+    details_m = _INLI_DETAILS_RE.search(card_html)
+    raw_details = ""
+    if details_m:
+        raw_details = _re.sub(r"<[^>]+>", " ", details_m.group(1))
+        raw_details = _re.sub(r"\s+", " ", raw_details).strip()
+    surface: Optional[int] = None
+    if (sm := _INLI_SURFACE_RE.search(raw_details)):
+        try: surface = int(round(float(sm.group(1).replace(",", "."))))
+        except ValueError: pass
+    typology = "Studio" if "Studio" in raw_details else None
+    if (pm := _INLI_PIECES_RE.search(raw_details)):
+        typology = f"{pm.group(1)} pièces"
+    after_m2 = _re.split(r"m[²2]\s*", raw_details, maxsplit=1)
+    location = (after_m2[1] if len(after_m2) > 1 else raw_details).strip()
+    if not location:
+        location = slug_city.replace("-", " ").title()
+    location = _re.sub(r"\s+", " ", location)
+    title_parts = [p for p in (typology, f"{surface} m²" if surface else None, location) if p]
+    title = " · ".join(title_parts) or raw_details[:120] or "Logement Inli"
+    images = [m.group(1) for m in _INLI_IMG_RE.finditer(card_html)
+              if "placeholder" not in m.group(1)]
+    return Listing(
+        lbc_id=f"inli_{raw_id}", title=title[:200], description=raw_details,
+        price=price, location=location[:120], seller_name="in'li", url=url,
+        seller_type_hint="bailleur", source="inli", images=images,
+        surface=surface, housing_type="appartement",
+    )
+
+
+async def _search_inli(search_url: str, max_results: int) -> list[Listing]:
+    """Inli (CDC Habitat — logement intermédiaire IDF). Off-radar source.
+    Paginates per-département. ~49 listings IDF ≤1100€ CC."""
+    from curl_cffi.requests import AsyncSession
+    PRICE_CAP = 1100
+    PER_PAGE = 24
+    MAX_PAGES = 12
+    listings: list[Listing] = []
+    seen: set[str] = set()
+    async with AsyncSession(impersonate="chrome120", timeout=20) as session:
+        async def _fetch(url):
+            try:
+                r = await session.get(url, allow_redirects=True)
+                return r.text if r.status_code == 200 else None
+            except Exception:
+                return None
+        async def _scrape_dept(name, num):
+            base = f"https://www.inli.fr/locations/offres/{name}_d:{num}/"
+            html1 = await _fetch(base)
+            if not html1:
+                return []
+            cards1 = _INLI_CARD_RE.findall(html1)
+            if len(cards1) < PER_PAGE:
+                page_htmls = [html1]
+            else:
+                more = await asyncio.gather(*(_fetch(f"{base}?page={p}") for p in range(2, MAX_PAGES + 1)))
+                page_htmls = [html1] + [h for h in more if h]
+            out = []
+            for h in page_htmls:
+                cards = _INLI_CARD_RE.findall(h)
+                if not cards: break
+                for card in cards:
+                    lst = _inli_card_to_listing(card)
+                    if not lst or lst.lbc_id in seen: continue
+                    seen.add(lst.lbc_id)
+                    if lst.price and lst.price <= PRICE_CAP:
+                        out.append(lst)
+            return out
+        per_dept = await asyncio.gather(*(_scrape_dept(n, d) for n, d in _INLI_IDF_DEPTS))
+        for batch in per_dept:
+            listings.extend(batch)
+            if len(listings) >= max_results:
+                break
+    listings = listings[:max_results]
+    logger.info("[INLI] Parsed %d listings ≤%d€ CC across IDF", len(listings), PRICE_CAP)
+    return listings
+
+
+# ─── Gens de Confiance (P2P trust network) ───────────────────────────────────
+async def _search_gensdeconfiance(search_url: str, max_results: int) -> list[Listing]:
+    """Off-radar P2P trust network. Server-renders 30 listings/page in a
+    React-on-Rails JSON blob. Filter to IDF zip prefixes."""
+    import json as _json
+    base = search_url.rstrip("/")
+    sep = "&" if "?" in base else "?"
+    pages = [base] + [f"{base}{sep}page={n}" for n in range(2, 31)]
+    htmls = await _fetch_pages_curl_cffi(pages)
+
+    listings: list[Listing] = []
+    seen: set[str] = set()
+    idf_prefixes = ("75", "77", "78", "91", "92", "93", "94", "95")
+
+    for html in htmls:
+        if not html:
+            continue
+        m = _re.search(
+            r'data-component-name="Search"[^>]*>(\{.*?\})</script>',
+            html, _re.DOTALL,
+        )
+        if not m:
+            continue
+        try:
+            blob = _json.loads(m.group(1))
+        except _json.JSONDecodeError:
+            continue
+        pr = blob.get("preloadedResults")
+        if isinstance(pr, str):
+            try:
+                pr = _json.loads(pr)
+            except _json.JSONDecodeError:
+                continue
+        if not isinstance(pr, list):
+            continue
+        for r in pr:
+            if r.get("category") != "realestate__rent":
+                continue
+            rid = str(r.get("id") or "")
+            if not rid or rid in seen:
+                continue
+            zip_ = str(r.get("zip") or "")
+            if zip_[:2] not in idf_prefixes:
+                continue
+            seen.add(rid)
+            slug = r.get("slug") or ""
+            attrs = r.get("attributes") or {}
+            try:
+                surface = int(attrs.get("nbSquareMeters")) if attrs.get("nbSquareMeters") else None
+            except (TypeError, ValueError):
+                surface = None
+            try:
+                price = int(r.get("price") or 0) or None
+            except (TypeError, ValueError):
+                price = None
+            parts = []
+            if attrs.get("nbPieces"): parts.append(f"{attrs['nbPieces']} pièce(s)")
+            if surface: parts.append(f"{surface} m²")
+            if attrs.get("furnished") is True or attrs.get("rentalFurnishings") == "furnished":
+                parts.append("meublé")
+            if attrs.get("propertyFloor") is not None: parts.append(f"étage {attrs['propertyFloor']}")
+            if attrs.get("dpe"): parts.append(f"DPE {attrs['dpe']}")
+            if r.get("rentalCharge"): parts.append(f"charges {r['rentalCharge']}€")
+            equipments = attrs.get("equipments") or []
+            if equipments: parts.append(", ".join(str(e) for e in equipments[:5]))
+            description = (r.get("title") or "") + ". " + " · ".join(parts)
+            url = f"https://www.gensdeconfiance.com/fr/annonce/{slug}" if slug else "https://www.gensdeconfiance.com/fr/recherche"
+            pub = None
+            if r.get("displayDate"):
+                try:
+                    from datetime import datetime as _dt2, timezone as _tz
+                    pub = _dt2.fromtimestamp(int(r["displayDate"]), tz=_tz.utc).isoformat()
+                except (TypeError, ValueError, OSError):
+                    pub = None
+            images = []
+            if r.get("imageUrl"):
+                images.append(r["imageUrl"])
+            seller_hint = "particulier" if not r.get("pro") else "pro"
+            listings.append(Listing(
+                lbc_id=f"gdc_{rid}", title=(r.get("title") or "")[:200],
+                description=description[:1500], price=price,
+                location=f"{r.get('city') or ''} {zip_}".strip(),
+                seller_name="Particulier" if not r.get("pro") else "Gens de Confiance",
+                url=url, seller_type_hint=seller_hint, source="gensdeconfiance",
+                images=images, surface=surface, published_at=pub,
+            ))
+            if len(listings) >= max_results:
+                break
+        if len(listings) >= max_results:
+            break
+    logger.info("[GENSDECONFIANCE] Parsed %d IDF rentals", len(listings))
+    return listings
+
+
+def _is_gensdeconfiance(url: str) -> bool:
+    return "gensdeconfiance" in url
+
+
+def _is_cdc_habitat(url: str) -> bool:
+    return "cdc-habitat.fr" in url
+
+
+def _is_fnaim(url: str) -> bool:
+    return "fnaim.fr" in url
+
+
+# ─── FNAIM (Fédération Nationale de l'Immobilier — 12k agences) ──────────────
+_FNAIM_IDF_DEPT_SLUGS: list[str] = [
+    "paris-75", "seine-et-marne-77", "yvelines-78", "essonne-91",
+    "hauts-de-seine-92", "seine-saint-denis-93", "val-de-marne-94", "val-d-oise-95",
+]
+_FNAIM_PAGE_LIMIT = 9
+_FNAIM_INTER_PAGE_DELAY = 0.6
+_FNAIM_CARD_RE = _re.compile(r'<li class="item"><div class="itemInfo"[^>]*>(.*?)</li>', _re.DOTALL)
+_FNAIM_HREF_RE = _re.compile(r'href="(/annonce-immobiliere/(\d+)/[^"]+\.htm)"')
+_FNAIM_TITLE_RE = _re.compile(r'data-title="([^"]+)"')
+_FNAIM_PRICE_RE = _re.compile(r'<p class="price">\s*([\d ]+)\s*&euro;')
+_FNAIM_LOC_RE = _re.compile(r'<p class="picto lieu clear">\s*<a[^>]*>(.*?)</a>', _re.DOTALL)
+_FNAIM_DESC_RE = _re.compile(r'<p class="description">\s*(.*?)\s*</p>', _re.DOTALL)
+_FNAIM_AGENCY_RE = _re.compile(r'<div class="nom">.*?<b>([^<]+)</b>', _re.DOTALL)
+_FNAIM_IMG_RE = _re.compile(r'<img[^>]*src="(https://imagesv2\.fnaim\.fr/[^"]+)"')
+_FNAIM_SURFACE_RE = _re.compile(r"(\d+)\s*m[²2]")
+_FNAIM_PIECES_RE = _re.compile(r"(\d+)\s*pi[èe]ces?", _re.IGNORECASE)
+
+
+def _fnaim_card_to_listing(card_html: str) -> Optional[Listing]:
+    import html as _html
+    href_m = _FNAIM_HREF_RE.search(card_html)
+    if not href_m: return None
+    url_path, ad_id = href_m.group(1), href_m.group(2)
+    price_m = _FNAIM_PRICE_RE.search(card_html)
+    if not price_m: return None
+    try: price = int(price_m.group(1).replace(" ", ""))
+    except ValueError: return None
+    title_m = _FNAIM_TITLE_RE.search(card_html)
+    title = _html.unescape(title_m.group(1)).strip() if title_m else f"Annonce {ad_id}"
+    loc_m = _FNAIM_LOC_RE.search(card_html)
+    cp = ""
+    city = ""
+    location = ""
+    if loc_m:
+        raw = _re.sub(r"<[^>]+>", "|", loc_m.group(1))
+        raw = _html.unescape(raw)
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        if parts and parts[0].isdigit():
+            cp = parts[0]
+            city = parts[1].title() if len(parts) > 1 else ""
+        else:
+            city = parts[0].title() if parts else ""
+        if city.lower().startswith("paris ") and cp.startswith("75") and len(cp) == 5:
+            location = f"Paris {cp[-2:]}, {cp}"
+        else:
+            location = f"{city}, {cp}" if cp else city
+    desc_m = _FNAIM_DESC_RE.search(card_html)
+    description = ""
+    if desc_m:
+        desc_raw = _re.sub(r"<[^>]+>", " ", desc_m.group(1))
+        desc_raw = _html.unescape(desc_raw)
+        description = _re.sub(r"\s+", " ", desc_raw).strip()[:1500]
+    agency_m = _FNAIM_AGENCY_RE.search(card_html)
+    agency = _html.unescape(agency_m.group(1)).strip() if agency_m else "Agence FNAIM"
+    images = []
+    seen_imgs = set()
+    for m in _FNAIM_IMG_RE.finditer(card_html):
+        u = m.group(1)
+        if u not in seen_imgs:
+            seen_imgs.add(u)
+            images.append(u)
+    surface = None
+    sm = _FNAIM_SURFACE_RE.search(title)
+    if sm:
+        try: surface = int(sm.group(1))
+        except ValueError: pass
+    housing_type = ""
+    pm = _FNAIM_PIECES_RE.search(title)
+    if pm:
+        n = int(pm.group(1))
+        housing_type = "studio" if n == 1 else f"T{min(n, 5)}" if n <= 5 else "T5+"
+    return Listing(
+        lbc_id=f"fnaim_{ad_id}", title=title[:240], description=description or title,
+        price=price, location=(location or "Île-de-France")[:120],
+        seller_name=agency[:120], url="https://www.fnaim.fr" + url_path,
+        seller_type_hint="agence", source="fnaim", images=images,
+        surface=surface, housing_type=housing_type,
+    )
+
+
+async def _search_fnaim(search_url: str, max_results: int) -> list[Listing]:
+    """FNAIM — federated portal of 12k independent agencies. Off-radar.
+    Sweeps 8 IDF départements in parallel sessions (server caps at 9 pages/query).
+    ~1100 IDF listings ≤1100€."""
+    from curl_cffi.requests import AsyncSession
+    PRICE_CAP = 1100
+    BASE = "https://www.fnaim.fr"
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    }
+    listings = []
+    seen = set()
+    lock = asyncio.Lock()
+    page2_link_re_tpl = (r'href="(/liste-annonces-immobilieres/'
+                        r'18-location-appartement-{slug}-page-2\.htm[^"]+)"')
+
+    async def _scrape_dept(slug):
+        out = []
+        base_url = f"{BASE}/liste-annonces-immobilieres/18-location-appartement-{slug}.htm"
+        link_pattern = _re.compile(page2_link_re_tpl.format(slug=_re.escape(slug)))
+        try:
+            async with AsyncSession(impersonate="chrome120", timeout=25,
+                                    max_redirects=5, headers=headers) as sess:
+                r1 = await sess.get(base_url)
+                if r1.status_code != 200 or len(r1.text) < 250_000:
+                    logger.warning("[FNAIM] %s warm-up bad: %d / %d bytes", slug, r1.status_code, len(r1.text))
+                    return out
+                pages_html = [r1.text]
+                tpl_m = link_pattern.search(r1.text)
+                if tpl_m:
+                    tpl = tpl_m.group(1).replace("&amp;", "&")
+                    for p in range(2, _FNAIM_PAGE_LIMIT + 1):
+                        url_path = _re.sub(r"-page-2\.htm", f"-page-{p}.htm", tpl)
+                        url_path = _re.sub(r"([?&])ip=2(?=[&]|$)", rf"\g<1>ip={p}", url_path)
+                        try:
+                            r = await sess.get(BASE + url_path, headers={"Referer": base_url})
+                        except Exception:
+                            break
+                        if r.status_code != 200 or len(r.text) < 250_000:
+                            break
+                        pages_html.append(r.text)
+                        await asyncio.sleep(_FNAIM_INTER_PAGE_DELAY)
+                for html in pages_html:
+                    for card in _FNAIM_CARD_RE.findall(html):
+                        lst = _fnaim_card_to_listing(card)
+                        if not lst: continue
+                        async with lock:
+                            if lst.lbc_id in seen: continue
+                            seen.add(lst.lbc_id)
+                        if lst.price is not None and lst.price <= PRICE_CAP:
+                            out.append(lst)
+        except Exception as exc:
+            logger.warning("[FNAIM] %s scrape failed: %s", slug, exc)
+        return out
+
+    per_dept = await asyncio.gather(*(_scrape_dept(slug) for slug in _FNAIM_IDF_DEPT_SLUGS))
+    for batch in per_dept:
+        listings.extend(batch)
+        if len(listings) >= max_results: break
+    listings = listings[:max_results]
+    logger.info("[FNAIM] Parsed %d listings ≤%d€/mois IDF", len(listings), PRICE_CAP)
+    return listings
+
+
+# ─── CDC Habitat (cdc-habitat.fr) ────────────────────────────────────────────
+_CDC_HREF_RE = _re.compile(
+    r'href="(https?://www\.cdc-habitat\.fr/annonces-immobilieres/location/'
+    r'([^/"]+)/([^/"]+)/([^/"]+)/(\d+))"'
+)
+_CDC_PRICE_RE = _re.compile(r'<div class="price[^"]*">\s*([\d\s\., ]+)\s*€')
+_CDC_LOC_RE = _re.compile(r'<div class="location[^"]*">\s*([^<]+?)\s*\(([0-9A-Z]+)\)\s*</div>')
+_CDC_TYPE_RE = _re.compile(r'<div class="type[^"]*">\s*([^<]+?)\s*</div>')
+_CDC_NOTES_RE = _re.compile(r'<div class="notes[^"]*">\s*([^<]+?)\s*</div>')
+_CDC_H3_RE = _re.compile(r'<h3[^>]*>([\s\S]+?)</h3>')
+_CDC_IMG_RE = _re.compile(r'<img\s+src="(https://referentiel-photos\.cdc-habitat\.fr/[^"]+)"')
+_CDC_TIP_RE = _re.compile(r'tooltipBubble[\s\S]{0,400}?<p>([^<]+)</p>', _re.IGNORECASE)
+_CDC_BANNER_RE = _re.compile(r'<div class="banner-band[^"]*">\s*([^<]+?)\s*</div>')
+_CDC_SURFACE_RE = _re.compile(r"(\d+(?:[.,]\d+)?)\s*m[²2]")
+_CDC_PIECES_RE = _re.compile(r"(\d+)\s*pi[èe]ces?", _re.IGNORECASE)
+_CDC_PAGES_RE = _re.compile(r"/page-(\d+)")
+
+
+def _cdc_category(tooltip: str) -> str:
+    if not tooltip: return ""
+    t = tooltip.lower()
+    if "intermédiaire" in t or "intermediaire" in t: return "intermediaire"
+    if "loyer libre" in t: return "libre"
+    if "social" in t or ("plafonds" in t and "ressources" in t): return "social"
+    return ""
+
+
+def _cdc_card_to_listing(card_html: str) -> Optional[Listing]:
+    href_m = _CDC_HREF_RE.search(card_html)
+    if not href_m: return None
+    full_url, _region, _dept_slug, ville_slug, raw_id = href_m.groups()
+    price_m = _CDC_PRICE_RE.search(card_html)
+    if not price_m: return None
+    raw_price = price_m.group(1).replace(" ", "").replace(" ", "").replace(".", "").replace(",", ".")
+    try: price = int(round(float(raw_price)))
+    except ValueError: return None
+
+    h3_m = _CDC_H3_RE.search(card_html)
+    h3_clean = _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", " ", h3_m.group(1))).strip() if h3_m else ""
+    typ_m = _CDC_TYPE_RE.search(card_html)
+    housing_type = typ_m.group(1).strip() if typ_m else ""
+    notes_m = _CDC_NOTES_RE.search(card_html)
+    notes = notes_m.group(1).strip() if notes_m else ""
+    loc_m = _CDC_LOC_RE.search(card_html)
+    if loc_m:
+        city = loc_m.group(1).strip().title()
+        zip_ = loc_m.group(2).strip()
+        location = f"{city} ({zip_})"
+    else:
+        location = ville_slug.replace("-", " ").title()
+
+    surface = None
+    if (sm := _CDC_SURFACE_RE.search(h3_clean)):
+        try: surface = int(round(float(sm.group(1).replace(",", "."))))
+        except ValueError: pass
+    typology = None
+    if (pm := _CDC_PIECES_RE.search(h3_clean)): typology = f"{pm.group(1)} pièces"
+    elif "studio" in h3_clean.lower(): typology = "Studio"
+    tip_m = _CDC_TIP_RE.search(card_html)
+    category = _cdc_category(tip_m.group(1) if tip_m else "")
+    banners = [b.strip() for b in _CDC_BANNER_RE.findall(card_html)]
+    seen_img = set()
+    images = []
+    for m in _CDC_IMG_RE.finditer(card_html):
+        u = m.group(1)
+        if u not in seen_img:
+            seen_img.add(u)
+            images.append(u)
+
+    title_parts = [p for p in (housing_type or None, typology, f"{surface} m²" if surface else None, location) if p]
+    title = " · ".join(title_parts) or h3_clean[:120] or "Logement CDC Habitat"
+    description_bits = [housing_type, typology, f"{surface} m²" if surface else "", notes, location] + banners
+    description = " · ".join([d for d in description_bits if d]).strip()
+    hint = "bailleur" if not category else f"bailleur:{category}"
+    housing_norm = "appartement" if housing_type.lower().startswith("appart") else (
+        "maison" if "maison" in housing_type.lower() else housing_type.lower())
+    return Listing(
+        lbc_id=f"cdc_{raw_id}", title=title[:200], description=description[:500],
+        price=price, location=location[:120], seller_name="CDC Habitat",
+        url=full_url, seller_type_hint=hint, source="cdc_habitat",
+        images=images, surface=surface, housing_type=housing_norm,
+    )
+
+
+def _cdc_split_articles(html: str) -> list[str]:
+    """Split into residenceCard articles, dropping JS template literals."""
+    out = []
+    parts = html.split('<article class="residenceCard"')
+    for part in parts[1:]:
+        end = part.find("</article>")
+        if end == -1: continue
+        body = part[:end]
+        if "$(content).html()" in body:  # JS template, not real card
+            continue
+        out.append(body)
+    return out
+
+
+async def _search_cdc_habitat(search_url: str, max_results: int) -> list[Listing]:
+    """CDC Habitat — public sister of Inli. ~44 IDF listings ≤1100€,
+    62% intermediate (sweet spot alternant SNCF). Server-rendered, no anti-bot."""
+    from curl_cffi.requests import AsyncSession
+    PRICE_CAP = 1100
+    MAX_PAGES = 30
+    base = search_url.rstrip("/")
+    listings = []
+    seen = set()
+    async with AsyncSession(impersonate="chrome120", timeout=25) as session:
+        async def _fetch(url):
+            try:
+                r = await session.get(url, allow_redirects=True)
+                if r.status_code != 200: return None
+                if "/page-" in url and "/page-" not in str(r.url): return None
+                return r.text
+            except Exception:
+                return None
+        first = await _fetch(base)
+        if not first:
+            logger.warning("[CDC] page 1 fetch failed")
+            return []
+        page_nums = [int(n) for n in _CDC_PAGES_RE.findall(first)] or [1]
+        last_page = min(max(max(page_nums), 1), MAX_PAGES)
+        page_htmls = [first]
+        if last_page >= 2:
+            extra = await asyncio.gather(*(_fetch(f"{base}/page-{p}") for p in range(2, last_page + 1)))
+            page_htmls.extend(extra)
+        for html in page_htmls:
+            if not html: continue
+            for card in _cdc_split_articles(html):
+                lst = _cdc_card_to_listing(card)
+                if not lst or lst.lbc_id in seen: continue
+                seen.add(lst.lbc_id)
+                if lst.price and lst.price <= PRICE_CAP:
+                    listings.append(lst)
+                    if len(listings) >= max_results: break
+            if len(listings) >= max_results: break
+    listings = listings[:max_results]
+    logger.info("[CDC] Parsed %d listings <=%d€ CC across IDF", len(listings), PRICE_CAP)
+    return listings
+
+
 async def _search_roomlala_with_playwright(search_url: str, max_results: int) -> list[Listing]:
     return await _search_via_generic(
         search_url, max_results,
@@ -3684,6 +4337,9 @@ async def _laforet_enrich_descriptions(listings: list[Listing]) -> None:
                 txt = _re.sub(r"\n{3,}", "\n\n", txt).strip()
                 if len(txt) > 80:
                     lst.description = txt[:1500]
+                # Agency phone: <a href="tel:0155269393"> in every Laforêt detail page
+                if (ph_m := _re.search(r'href="tel:(0\d{9})"', r.text)):
+                    lst.phone = ph_m.group(1)
             except Exception:
                 pass
 
@@ -4039,6 +4695,10 @@ def _is_laforet(url: str) -> bool:
     return "laforet.com" in url
 
 
+def _is_inli(url: str) -> bool:
+    return "inli.fr" in url
+
+
 def _is_guyhoquet(url: str) -> bool:
     return "guy-hoquet.com" in url or "guyhoquet.com" in url
 
@@ -4048,6 +4708,221 @@ def _is_guyhoquet(url: str) -> bool:
 # same window don't re-hit the same sources. Saves ~30s on repeat campaigns.
 _SCRAPE_CACHE: dict[tuple, tuple[float, list]] = {}
 _SCRAPE_CACHE_TTL_SEC = 300  # 5 minutes
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# LBC Sentinel — sub-60s API poller for change detection
+# ════════════════════════════════════════════════════════════════════════════
+# curl_cffi with safari17_0 fingerprint bypasses DataDome at low volume.
+# Verified: 12 polls/min, 0 failures, 95-122ms latency.
+# Auto-fallback to Camoufox (existing scrape) if 403/429.
+
+from typing import Callable, Awaitable
+
+try:
+    from curl_cffi import requests as _ccffi
+    _CCFFI_AVAILABLE = True
+except ImportError:
+    _CCFFI_AVAILABLE = False
+
+_LBC_API_URL = "https://api.leboncoin.fr/finder/search"
+_LBC_API_KEY = "ba0c2dad52b3ec"
+_LBC_UAS = [
+    "leboncoin/8.10.0.0.0 iOS/17.0",
+    "leboncoin/8.10.5.0.0 iOS/17.4",
+    "leboncoin/8.11.2.0.0 iOS/17.5",
+    "leboncoin/8.11.0.0.0 iOS/17.4.1",
+    "leboncoin/8.10.5.0.0 Android/14",
+]
+_lbc_sentinel_last_id: Optional[str] = None
+_lbc_sentinel_banned_until: float = 0.0
+_lbc_sentinel_consec_fails: int = 0
+
+
+def _lbc_default_filters() -> dict:
+    return {
+        "category": {"id": "10"},
+        "enums": {"real_estate_type": ["1", "2"], "furnished": ["1"]},
+        "ranges": {"price": {"max": 1100}, "square": {"min": 25}},
+        "location": {
+            "locations": [
+                {"locationType": "city", "label": city} for city in [
+                    "Paris", "Boulogne-Billancourt", "Neuilly-sur-Seine",
+                    "Levallois-Perret", "Clichy", "Issy-les-Moulineaux",
+                    "Montrouge", "Malakoff", "Vanves", "Ivry-sur-Seine",
+                    "Le Kremlin-Bicêtre", "Charenton-le-Pont", "Saint-Mandé",
+                    "Vincennes", "Montreuil", "Bagnolet", "Pantin",
+                    "Saint-Ouen", "Aubervilliers", "Alfortville",
+                    "Maisons-Alfort", "Saint-Maur-des-Fossés",
+                ]
+            ]
+        },
+    }
+
+
+async def _lbc_sentinel_poll() -> Optional[str]:
+    """Returns latest list_id (str) or None on failure / cooldown."""
+    global _lbc_sentinel_consec_fails, _lbc_sentinel_banned_until
+    if not _CCFFI_AVAILABLE:
+        return None
+    if time.time() < _lbc_sentinel_banned_until:
+        return None
+    headers = {
+        "api_key": _LBC_API_KEY,
+        "User-Agent": random.choice(_LBC_UAS),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Connection": "close",
+    }
+    body = {
+        "limit": 1, "limit_alu": 1, "sort_by": "time", "sort_order": "desc",
+        "filters": _lbc_default_filters(),
+    }
+    try:
+        def _do():
+            return _ccffi.post(_LBC_API_URL, headers=headers, json=body,
+                              impersonate="safari17_0", timeout=10)
+        r = await asyncio.to_thread(_do)
+    except Exception as exc:
+        _lbc_sentinel_consec_fails += 1
+        if _lbc_sentinel_consec_fails >= 5:
+            _lbc_sentinel_banned_until = time.time() + 30 * 60
+            logger.error("[SENTINEL] 5 consec failures → 30-min cooldown")
+        return None
+    if r.status_code in (403, 429):
+        _lbc_sentinel_consec_fails += 1
+        is_dd = "captcha-delivery" in (r.text or "")[:200]
+        logger.warning("[SENTINEL] %d (DataDome=%s) consec=%d", r.status_code, is_dd, _lbc_sentinel_consec_fails)
+        if _lbc_sentinel_consec_fails >= 3:
+            _lbc_sentinel_banned_until = time.time() + 60 * 60
+            logger.error("[SENTINEL] flagged → 1h cooldown, fallback to Camoufox")
+        return None
+    if r.status_code != 200:
+        return None
+    _lbc_sentinel_consec_fails = 0
+    try:
+        ads = (r.json() or {}).get("ads") or []
+    except Exception:
+        return None
+    if not ads:
+        return None
+    lid = ads[0].get("list_id")
+    return str(lid) if lid is not None else None
+
+
+async def _lbc_sentinel_loop(
+    on_change: Callable[[str], Awaitable[None]],
+    base_interval_sec: int = 60,
+    jitter_sec: int = 15,
+) -> None:
+    """Background loop: poll every base_interval ± jitter, fire on_change(new_id)."""
+    global _lbc_sentinel_last_id
+    logger.info("[SENTINEL] starting LBC poller — %ds±%ds", base_interval_sec, jitter_sec)
+    seed = await _lbc_sentinel_poll()
+    if seed is not None:
+        _lbc_sentinel_last_id = seed
+        logger.info("[SENTINEL] seeded last_id=%s", seed)
+    while True:
+        try:
+            wait = base_interval_sec + random.uniform(-jitter_sec, jitter_sec)
+            await asyncio.sleep(max(15.0, wait))
+            new_id = await _lbc_sentinel_poll()
+            if new_id is None:
+                continue
+            if _lbc_sentinel_last_id is None:
+                _lbc_sentinel_last_id = new_id
+                continue
+            if new_id != _lbc_sentinel_last_id:
+                logger.info("[SENTINEL] CHANGE: %s → %s", _lbc_sentinel_last_id, new_id)
+                _lbc_sentinel_last_id = new_id
+                try:
+                    await on_change(new_id)
+                except Exception as exc:
+                    logger.exception("[SENTINEL] on_change crashed: %s", exc)
+        except asyncio.CancelledError:
+            logger.info("[SENTINEL] cancelled")
+            raise
+        except Exception as exc:
+            logger.exception("[SENTINEL] iteration crashed: %s", exc)
+            await asyncio.sleep(30)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAP Sentinel — sub-60s SERP polling for change detection
+# ════════════════════════════════════════════════════════════════════════════
+# No native API/RSS. SERP HTML is the only viable source. curl_cffi chrome120
+# bypasses Cloudflare at low rate. Set-diff against previous IDs detects new.
+_PAP_SENTINEL_STATE: dict[str, set[str]] = {}
+_PAP_SENTINEL_URL = "https://www.pap.fr/annonce/locations-paris-75-g439"
+_PAP_ID_RE = _re.compile(r"-r(\d{6,10})")
+_PAP_UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
+
+async def _pap_sentinel_poll(state_key: str = "default") -> Optional[str]:
+    """Returns the highest-numerical NEW listing ID, or None."""
+    if not _CCFFI_AVAILABLE:
+        return None
+    headers = {
+        "User-Agent": random.choice(_PAP_UAS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.5",
+        "Cache-Control": "no-cache",
+    }
+    def _do():
+        try:
+            r = _ccffi.get(_PAP_SENTINEL_URL, headers=headers,
+                          impersonate="chrome120", timeout=10)
+            return r.text if r.status_code == 200 else None
+        except Exception:
+            return None
+    html = await asyncio.to_thread(_do)
+    if not html:
+        return None
+    seen_set: set[str] = set()
+    ids: list[str] = []
+    for m in _PAP_ID_RE.finditer(html):
+        pid = m.group(1)
+        if pid not in seen_set:
+            seen_set.add(pid)
+            ids.append(pid)
+    if not ids:
+        return None
+    current = set(ids)
+    previous = _PAP_SENTINEL_STATE.get(state_key)
+    _PAP_SENTINEL_STATE[state_key] = current
+    if previous is None:
+        logger.info("[PAP-SENTINEL] seeded with %d IDs", len(current))
+        return None
+    new_ids = current - previous
+    if not new_ids:
+        return None
+    newest = max(new_ids, key=lambda x: int(x))
+    logger.info("[PAP-SENTINEL] %d new listing(s), newest=r%s", len(new_ids), newest)
+    return newest
+
+
+async def _pap_sentinel_loop(on_change: Callable[[str], Awaitable[None]],
+                             interval_sec: int = 75) -> None:
+    """PAP background sentinel loop, fires on_change(new_id) on detect."""
+    logger.info("[PAP-SENTINEL] starting — %ds interval", interval_sec)
+    await asyncio.sleep(random.uniform(0, 30))  # stagger
+    while True:
+        try:
+            new_id = await _pap_sentinel_poll()
+            if new_id:
+                try: await on_change(new_id)
+                except Exception as exc:
+                    logger.exception("[PAP-SENTINEL] on_change crashed: %s", exc)
+            await asyncio.sleep(interval_sec + random.uniform(-10, 10))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("[PAP-SENTINEL] iteration crashed: %s", exc)
+            await asyncio.sleep(60)
 
 
 async def search_listings(search_url: str, max_results: int = 50) -> list[Listing]:
@@ -4106,6 +4981,14 @@ async def search_listings(search_url: str, max_results: int = 50) -> list[Listin
         listings = await _search_laforet_with_playwright(search_url, max_results)
     elif _is_guyhoquet(search_url):
         listings = await _search_guyhoquet_with_playwright(search_url, max_results)
+    elif _is_inli(search_url):
+        listings = await _search_inli(search_url, max_results)
+    elif _is_gensdeconfiance(search_url):
+        listings = await _search_gensdeconfiance(search_url, max_results)
+    elif _is_cdc_habitat(search_url):
+        listings = await _search_cdc_habitat(search_url, max_results)
+    elif _is_fnaim(search_url):
+        listings = await _search_fnaim(search_url, max_results)
     elif config.USE_APIFY:
         logger.info("[APIFY] Scraping search (max %d): %s", max_results, search_url)
         items = await _run_actor(config.APIFY_SEARCH_ACTOR, {
