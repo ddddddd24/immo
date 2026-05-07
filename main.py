@@ -2652,6 +2652,38 @@ def main() -> None:
                     })
                 n = database.upsert_listings_batch(rows)
                 logger.info("[SENTINEL] persisted %d/%d LBC listings", n, len(clean))
+                # Score newly-fetched listings (LLM batch) so push alerts can match
+                # score>=7 criteria. Without this, sentinel-scraped listings have
+                # score=None and never trigger a push.
+                if config.ENABLE_SCORING and clean:
+                    try:
+                        import preferences as _prefs
+                        cap = _prefs.HARD_PRICE_CAP
+                        ids = [l.lbc_id for l in clean if l.lbc_id]
+                        already = set()
+                        if ids:
+                            with database._conn() as conn:
+                                placeholders = ",".join("?" * len(ids))
+                                for r2 in conn.execute(
+                                    f"SELECT lbc_id FROM listings WHERE lbc_id IN ({placeholders}) AND score IS NOT NULL",
+                                    ids,
+                                ).fetchall():
+                                    already.add(r2[0])
+                        to_score = [l for l in clean
+                                   if l.lbc_id not in already
+                                   and (l.price is None or l.price <= cap)]
+                        if to_score:
+                            from agent import score_listings_batch
+                            results = await score_listings_batch(to_score, batch_size=5)
+                            for lst, res in zip(to_score, results):
+                                avail = res.get("available_from")
+                                database.set_listing_score(
+                                    lst.lbc_id, res["score"], res["reason"],
+                                    available_from=avail,
+                                )
+                            logger.info("[SENTINEL] scored %d new LBC listings", len(to_score))
+                    except Exception as exc:
+                        logger.warning("[SENTINEL] scoring failed: %s", exc)
                 # Trigger push for newly-persisted IDs
                 if config.ENABLE_PUSH_ALERTS and n > 0 and _sentinel_bot_ref[0]:
                     fake_ctx = type("C", (), {"bot": _sentinel_bot_ref[0]})()
@@ -2691,6 +2723,35 @@ def main() -> None:
                     })
                 n = database.upsert_listings_batch(rows)
                 logger.info("[PAP-SENTINEL] persisted %d/%d", n, len(clean))
+                if config.ENABLE_SCORING and clean:
+                    try:
+                        import preferences as _prefs
+                        cap = _prefs.HARD_PRICE_CAP
+                        ids = [l.lbc_id for l in clean if l.lbc_id]
+                        already = set()
+                        if ids:
+                            with database._conn() as conn:
+                                placeholders = ",".join("?" * len(ids))
+                                for r2 in conn.execute(
+                                    f"SELECT lbc_id FROM listings WHERE lbc_id IN ({placeholders}) AND score IS NOT NULL",
+                                    ids,
+                                ).fetchall():
+                                    already.add(r2[0])
+                        to_score = [l for l in clean
+                                   if l.lbc_id not in already
+                                   and (l.price is None or l.price <= cap)]
+                        if to_score:
+                            from agent import score_listings_batch
+                            results = await score_listings_batch(to_score, batch_size=5)
+                            for lst, res in zip(to_score, results):
+                                avail = res.get("available_from")
+                                database.set_listing_score(
+                                    lst.lbc_id, res["score"], res["reason"],
+                                    available_from=avail,
+                                )
+                            logger.info("[PAP-SENTINEL] scored %d", len(to_score))
+                    except Exception as exc:
+                        logger.warning("[PAP-SENTINEL] scoring failed: %s", exc)
                 if config.ENABLE_PUSH_ALERTS and n > 0 and _sentinel_bot_ref[0]:
                     fake_ctx = type("C", (), {"bot": _sentinel_bot_ref[0]})()
                     await _check_and_push_alerts([r["lbc_id"] for r in rows], fake_ctx)
