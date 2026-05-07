@@ -90,7 +90,7 @@ def _render_listings() -> str:
                l.url, l.scraped_at, l.published_at, l.phone, l.score, l.score_reason,
                l.housing_type, l.roommate_count, l.available_from, l.dedup_of
         FROM listings l
-        WHERE l.price IS NOT NULL AND l.price <= 1100
+        WHERE l.price IS NOT NULL AND l.price <= 1050
           AND l.housing_type NOT IN ('coliving', 'chambre', 'residence')
           AND (
             l.housing_type != 'coloc'
@@ -437,7 +437,7 @@ def _render_listings_mobile() -> str:
                l.housing_type, l.roommate_count, l.available_from, l.description,
                (SELECT c.status FROM contacts c WHERE c.listing_id = l.id ORDER BY c.id DESC LIMIT 1) as status
         FROM listings l
-        WHERE l.price IS NOT NULL AND l.price <= 1100
+        WHERE l.price IS NOT NULL AND l.price <= 1050
           AND l.housing_type NOT IN ('coliving', 'chambre', 'residence')
           AND (
             l.housing_type != 'coloc'

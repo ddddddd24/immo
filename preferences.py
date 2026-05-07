@@ -153,7 +153,7 @@ LIVING_AS = "couple_from_2026_09"   # Illan solo until sept 2026, then 2-person
 
 
 # ─── Hard price cap (above this → score=0, dealbreaker) ─────────────────────
-HARD_PRICE_CAP = 1100  # euros CC. Hard rule: nothing above survives scoring.
+HARD_PRICE_CAP = 1050  # euros CC. Hard rule: nothing above survives scoring.
 SOFT_BUDGET_CAP = 1000  # Above this score is reduced but not zero.
 
 # ─── Move-in date latest acceptable ──────────────────────────────────────────
