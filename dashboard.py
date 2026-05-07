@@ -88,8 +88,7 @@ def _render_listings() -> str:
     raw_listings = _query("""
         SELECT l.lbc_id, l.source, l.title, l.price, l.surface, l.location,
                l.url, l.scraped_at, l.published_at, l.phone, l.score, l.score_reason,
-               l.housing_type, l.roommate_count, l.available_from,
-               (SELECT c.status FROM contacts c WHERE c.listing_id = l.id ORDER BY c.id DESC LIMIT 1) as status
+               l.housing_type, l.roommate_count, l.available_from, l.dedup_of
         FROM listings l
         WHERE l.price IS NOT NULL AND l.price <= 1100
           AND l.housing_type NOT IN ('coliving', 'chambre', 'residence')
@@ -99,29 +98,14 @@ def _render_listings() -> str:
           )
           -- Hide dealbreakers (score=0). NULL = not yet scored, keep visible.
           AND (l.score IS NULL OR l.score > 0)
-          -- Stale filter: hide listings not seen in last 3 days (probably gone)
-          AND datetime(l.scraped_at) > datetime('now', '-3 days')
-        ORDER BY l.id ASC
+          -- Cross-source dedup: only show primaries
+          AND (l.dedup_of IS NULL OR l.dedup_of = '')
+        ORDER BY l.id DESC
         LIMIT 10000
     """)
 
-    # Cross-site dedup: same (price, surface, zip-or-city) across sites
-    # (LBC + SeLoger + Bien'ici listing the same property) → keep oldest only.
-    import re as _re
-    seen_keys: set = set()
-    listings = []
-    for l in raw_listings:
-        # Fingerprint: (price, surface, zip code OR first 8 chars city)
-        zm = _re.search(r"\b(\d{5})\b", l["location"] or "")
-        zip_or_city = zm.group(1) if zm else (l["location"] or "")[:8].lower()
-        key = (l["price"], l["surface"], zip_or_city) if l["surface"] else None
-        if key and key in seen_keys:
-            continue
-        if key:
-            seen_keys.add(key)
-        listings.append(l)
-    # Reverse to newest-first for display
-    listings = listings[::-1]
+    # SQL dedup_of already handles cross-source dedup.
+    listings = list(raw_listings)
     s = _stats()
     sources = sorted({l["source"] for l in listings if l["source"]})
     housing_types = sorted({l["housing_type"] for l in listings if l["housing_type"]})
@@ -144,11 +128,10 @@ def _render_listings() -> str:
             "url": l["url"] or "",
             "score": l["score"],
             "score_reason": l["score_reason"] or "",
-            "status": l["status"] or "",
             "published": ((l["published_at"] or "")[7:17] if (l["published_at"] or "").startswith("scrape:") else (l["published_at"] or "")[:10]),
             "published_is_scrape": (l["published_at"] or "").startswith("scrape:"),
-            "phone": l["phone"],  # None=unknown, ""=no phone, "#blocked"=site policy, else number
-            "available_from": l["available_from"] or "",  # YYYY-MM, "" if unknown
+            "phone": l["phone"],
+            "available_from": l["available_from"] or "",
             "housing_type": ht,
             "housing_display": ht_display,
         })
@@ -226,6 +209,7 @@ def _render_listings() -> str:
     <label>Prix max <input id="f-maxprice" type="number" placeholder="1000" /></label>
     <label>m² min <input id="f-minsurface" type="number" placeholder="20" /></label>
     <label>Recherche <input id="f-search" type="text" placeholder="titre / ville…" style="width:180px" /></label>
+    <label><input id="f-phone-only" type="checkbox" /> 📞 Avec tél seulement</label>
     <span class="filter-count" id="count">{len(row_data)} annonces</span>
   </div>
 
@@ -239,7 +223,6 @@ def _render_listings() -> str:
         <th data-sort="price" class="num">Prix <span class="sort-arrow"></span></th>
         <th data-sort="surface" class="num">m² <span class="sort-arrow"></span></th>
         <th data-sort="score" class="num">Score <span class="sort-arrow"></span></th>
-        <th data-sort="status">Statut <span class="sort-arrow"></span></th>
         <th data-sort="published">Publié <span class="sort-arrow"></span></th>
         <th data-sort="available_from">🗝 Libre <span class="sort-arrow"></span></th>
         <th data-sort="phone">📞 <span class="sort-arrow"></span></th>
@@ -252,10 +235,10 @@ def _render_listings() -> str:
 <script>
   const ROWS = {rows_json};
   const SOURCE_EMOJI = {json.dumps(SOURCE_EMOJI)};
-  const STATUS_COLOR = {json.dumps(STATUS_COLOR)};
+  const OFF_RADAR_SOURCES = new Set(['studapart','parisattitude','lodgis','immojeune','locservice','entreparticuliers','ladresse','century21','wizi','laforet','guyhoquet','kley','inli','icf','actionlogement','gensdeconfiance','cdc_habitat','fnaim']);
 
   let sortKey = "published";
-  let sortDir = -1;  // -1 desc, 1 asc
+  let sortDir = -1;
 
   function render() {{
     const src = document.getElementById('f-source').value;
@@ -263,12 +246,16 @@ def _render_listings() -> str:
     const maxPrice = parseInt(document.getElementById('f-maxprice').value) || null;
     const minSurface = parseInt(document.getElementById('f-minsurface').value) || null;
     const search = (document.getElementById('f-search').value || '').toLowerCase();
+    const phoneOnly = document.getElementById('f-phone-only').checked;
 
     let rows = ROWS.filter(r => {{
       if (src && r.source !== src) return false;
       if (type && r.housing_type !== type) return false;
       if (maxPrice && (r.price === null || r.price > maxPrice)) return false;
       if (minSurface && (r.surface === null || r.surface < minSurface)) return false;
+      if (phoneOnly) {{
+        if (!r.phone || r.phone === '#blocked') return false;
+      }}
       if (search) {{
         const blob = (r.title + ' ' + r.location).toLowerCase();
         if (!blob.includes(search)) return false;
@@ -298,34 +285,59 @@ def _render_listings() -> str:
       return s;
     }};
 
+    // Score tooltip parser: "PV=X Z=Y(zone) C=Z(min) F=W — note" → labeled multiline
+    const buildScoreTooltip = (reason, finalScore) => {{
+      if (!reason) return '';
+      const m = /PV=([\d.]+)\s+Z=([\d.]+)(?:\(([^)]+)\))?\s+C=([\d.]+)(?:\(([^)]+)\))?\s+F=([\d.]+)(?:\s+—\s+(.+))?/.exec(reason);
+      if (!m) return reason;
+      const [_, pv, zs, zone, cs, commute, fs, note] = m;
+      const lines = [
+        `📊 Détail score ${{finalScore}}/10:`, '',
+        `💰 Prix/Valeur (35%): ${{pv}}/10`,
+        `📍 Zone (30%): ${{zs}}/10` + (zone ? ` — ${{zone}}` : ''),
+        `🚇 Trajet (25%): ${{cs}}/10` + (commute ? ` — ${{commute}}` : ''),
+        `✨ Features (10%): ${{fs}}/10`,
+      ];
+      if (note) lines.push('', `📝 ${{note}}`);
+      return lines.join(String.fromCharCode(10));
+    }};
+
     const tbody = document.getElementById('tbody');
     tbody.innerHTML = rows.map(r => {{
       const emoji = SOURCE_EMOJI[r.source] || '⚪';
-      const statusBadge = r.status
-        ? `<span class="badge" style="background:${{STATUS_COLOR[r.status] || '#475569'}}">${{r.status}}</span>`
-        : '<span style="color:#475569">—</span>';
       const score = r.score
-        ? `<span class="score" title="${{escape(r.score_reason)}}">${{r.score}}/10</span>`
+        ? `<span class="score" title="${{escape(buildScoreTooltip(r.score_reason, r.score))}}">${{r.score}}/10</span>`
         : '<span style="color:#475569">—</span>';
       const surface = r.surface ? r.surface + 'm²' : '<span style="color:#475569">—</span>';
       const price = r.price ? r.price + '€' : '<span style="color:#475569">—</span>';
       const typeBadge = r.housing_display
         ? `<span style="font-size:0.75rem;color:#cbd5e1;background:#334155;padding:2px 6px;border-radius:6px">${{escape(r.housing_display)}}</span>`
         : '<span style="color:#475569">—</span>';
+      // 🔥 NEW: published_at < 6h ago
+      const pubMs = r.published ? new Date(r.published.length > 7 ? r.published : r.published + '-01').getTime() : 0;
+      const isNew = pubMs > Date.now() - 6 * 3600 * 1000;
+      const newBadge = isNew ? '<span style="background:#ef4444;color:white;padding:1px 5px;border-radius:4px;font-size:0.7rem;font-weight:600;margin-right:4px">🔥 NEW</span>' : '';
+      // 💎 OFF-RADAR: source not covered by Jinka
+      const offRadarBadge = OFF_RADAR_SOURCES.has(r.source) ? '<span style="background:#8b5cf6;color:white;padding:1px 5px;border-radius:4px;font-size:0.7rem;font-weight:600;margin-right:4px" title="Source hors Jinka — moins de concurrence">💎</span>' : '';
+      // tel: clickable phone (strip non-digits for href)
+      const phoneCell = r.phone === '#blocked'
+        ? '🚫'
+        : (r.phone === '' || r.phone === null
+            ? '⚪'
+            : `<a href="tel:${{escape(r.phone.replace(/[^+\\d]/g, ''))}}" style="color:#22c55e;text-decoration:none;font-weight:600">📞 ${{escape(r.phone)}}</a>`);
       return `<tr>
         <td><span class="src">${{emoji}} ${{escape(r.source)}}</span></td>
-        <td><a href="${{escape(r.url)}}" target="_blank">${{escape(r.title.slice(0, 60))}}</a></td>
+        <td>${{newBadge}}${{offRadarBadge}}<a href="${{escape(r.url)}}" target="_blank">${{escape(r.title.slice(0, 60))}}</a></td>
         <td>${{typeBadge}}</td>
         <td>${{escape(r.location.slice(0, 30))}}</td>
         <td class="num"><b>${{price}}</b></td>
         <td class="num">${{surface}}</td>
         <td class="num">${{score}}</td>
-        <td>${{statusBadge}}</td>
-        <td style="color:#64748b;font-size:0.75rem" title="${{r.published_is_scrape ? 'Date de scraping (ce site ne partage pas la date de publication)' : 'Date de publication réelle'}}">${{r.published ? (r.published_is_scrape ? '⏱ ' : '📅 ') + escape(r.published) : ''}}</td>
-        <td style="font-size:0.75rem" title="${{r.available_from ? 'Disponible à partir de ' + escape(formatAvail(r.available_from)) : 'Date de disponibilité non précisée dans l\\'annonce'}}">${{r.available_from ? '🗝 ' + escape(formatAvail(r.available_from)) : '<span style=\"color:#475569\">—</span>'}}</td>
-        <td title="${{r.phone === '#blocked' ? 'Site ne partage pas le téléphone' : (r.phone === '' || r.phone === null ? 'Pas de téléphone dans l\\'annonce' : escape(r.phone))}}">${{r.phone === '#blocked' ? '🚫' : (r.phone === '' || r.phone === null ? '⚪' : '📞 ' + escape(r.phone))}}</td>
+        <td style="color:#64748b;font-size:0.75rem" title="${{r.published_is_scrape ? 'Date de scraping (estimation)' : 'Date de publication réelle'}}">${{r.published ? (r.published_is_scrape ? '⏱ ' : '📅 ') + escape(r.published) : ''}}</td>
+        <td style="font-size:0.75rem" title="${{r.available_from ? 'Disponible à partir de ' + escape(formatAvail(r.available_from)) : 'Date de disponibilité non précisée'}}">${{r.available_from ? '🗝 ' + escape(formatAvail(r.available_from)) : '<span style=\"color:#475569\">—</span>'}}</td>
+        <td title="${{r.phone === '#blocked' ? 'Site ne partage pas le téléphone' : (r.phone === '' || r.phone === null ? 'Pas de téléphone' : 'Tap pour appeler')}}">${{phoneCell}}</td>
       </tr>`;
-    }}).join('') || '<tr><td colspan="11" class="empty">Aucune annonce ne matche les filtres.</td></tr>';
+    }}).join('') || '<tr><td colspan="10" class="empty">Aucune annonce ne matche les filtres.</td></tr>';
 
     document.querySelectorAll('th').forEach(th => {{
       th.classList.remove('asc', 'desc');
@@ -344,6 +356,7 @@ def _render_listings() -> str:
   ['f-source', 'f-type', 'f-maxprice', 'f-minsurface', 'f-search'].forEach(id => {{
     document.getElementById(id).addEventListener('input', render);
   }});
+  document.getElementById('f-phone-only').addEventListener('change', render);
 
   render();
 </script>
