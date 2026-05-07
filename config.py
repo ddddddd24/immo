@@ -102,16 +102,18 @@ DEFAULT_SEARCH_BIENICI_URL: str = os.getenv(
     "?prix-max=1100&surface-min=14",
 )
 
-# Default Logic-Immo search URL (Paris, max 1100€).
-# Re-enabled 2026-05-03: scraper now uses Camoufox + the React testid scheme
-# (data-base attribute holds the URL-encoded detail URL). The classified-search
-# endpoint with Aviv geo id (AD08FR31096 = Paris) returns ~25 listings.
+# Default Logic-Immo search URL (IDF entier, max 1100€).
+# 2026-05-05 : `AD08FR12` = Île-de-France region (was AD08FR31096 = Paris seul).
+# Live curl_cffi probe is 403-blocked by DataDome, but the scraper goes through
+# Camoufox + the React testid scheme (data-base attribute holds the URL-encoded
+# detail URL). Aviv geo IDs follow `AD0{level}FR{insee}` — `AD08` is region tier,
+# Paris ville is `AD0{?}FR75056` etc.
 DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
     "LOGICIMMO_SEARCH_URL",
     "https://www.logic-immo.com/classified-search"
     "?distributionTypes=Rent"
     "&estateTypes=House,Apartment"
-    "&locations=AD08FR31096"
+    "&locations=AD08FR12"
     "&priceMax=1100",
 )
 
@@ -121,9 +123,13 @@ DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
 # the others are disabled by default until proper parsers are written.
 # Studapart — public listings via Camoufox (stealth Playwright gets
 # fingerprinted and served an SEO fallback page).
+# 2026-05-05 : passé à `ile-de-france` (couvrait juste Paris-75 avant).
+# Live probe HTTP 200 avec listings pour 75/77/78/91/92/93/94/95.
+# NOTE: l'API interne réplique côté scraper utilise un template capturé une
+# fois via Camoufox — l'URL ici sert de seed page pour la capture initiale.
 DEFAULT_SEARCH_STUDAPART_URL: str = os.getenv(
     "STUDAPART_SEARCH_URL",
-    "https://www.studapart.com/fr/logement-etudiant-paris",
+    "https://www.studapart.com/fr/logement-etudiant-ile-de-france",
 )
 
 # Paris Attitude — public listings, ~40 per page on the index URL.
@@ -141,22 +147,35 @@ DEFAULT_SEARCH_LODGIS_URL: str = os.getenv(
 )
 
 # ImmoJeune — student housing aggregator.
+# 2026-05-05 — pas d'URL IDF/région : le site n'indexe que des slugs de ville
+# (paris-75, lyon-69, etc.). `/logement-etudiant/ile-de-france.html` et
+# `/logement-etudiant/region-11.html` retournent HTTP 404. Reste donc Paris-75
+# uniquement. Faute d'aggrégat IDF, on garde la cible historique.
 DEFAULT_SEARCH_IMMOJEUNE_URL: str = os.getenv(
     "IMMOJEUNE_SEARCH_URL",
     "https://www.immojeune.com/logement-etudiant/paris-75.html",
 )
 
 # LocService — owner-direct rentals, French-market.
+# 2026-05-05 — pas d'URL IDF aggrégée (`/ile-de-france/...` 404, `/region-11/`
+# slug renvoie l'Aude). En revanche chaque département IDF a son propre slug
+# (`paris-75`, `hauts-de-seine-92`, etc.). Le scraper a été modifié pour
+# itérer les 8 départements IDF en parallèle ; cette URL sert de fallback
+# si la sentinelle dept-iter détecte une URL custom.
 DEFAULT_SEARCH_LOCSERVICE_URL: str = os.getenv(
     "LOCSERVICE_SEARCH_URL",
     "https://www.locservice.fr/paris-75/location-appartement.html",
 )
 
-# EntreParticuliers — particulier-à-particulier. 12 listings per arrondissement
-# page, the scraper iterates Paris 75001-75020 in parallel.
+# EntreParticuliers — particulier-à-particulier.
+# 2026-05-05 — Le scraper a été élargi de "20 arrondissements Paris" à "8
+# départements IDF" (75/77/78/91/92/93/94/95). Chaque page dept renvoie ~12
+# listings sous le pattern `/annonces-immobilieres/appartement/location/{slug}/{slug2}/ref-{id}`
+# (le path canonique URL d'index est en /location/appartement/{dept}-{nn}).
+# Pre-existing regex bug (1-segment vs 2-segment slug) corrigé en passant.
 DEFAULT_SEARCH_ENTREPARTICULIERS_URL: str = os.getenv(
     "ENTREPARTICULIERS_SEARCH_URL",
-    "https://www.entreparticuliers.com/annonces-immobilieres/appartement/location/paris-75",
+    "https://www.entreparticuliers.com/annonces-immobilieres/location/appartement/paris-75",
 )
 
 # L'Adresse (agency network) — 40 listings/page on IDF search.
@@ -165,31 +184,48 @@ DEFAULT_SEARCH_LADRESSE_URL: str = os.getenv(
     "https://www.ladresse.com/recherche/location/appartement/ile-de-france",
 )
 
-# Century 21 (agency network) — paginates 9 pages on Paris search.
+# Century 21 (agency network) — paginates 9 pages.
+# 2026-05-05 — Le site n'a pas d'URL région (toutes les variantes
+# `r-ile-de-france`, `d-ile-de-france`, `v-ile-de-france` retournent HTTP 410).
+# Seul le pattern `v-{ville}` fonctionne. Le scraper a été élargi pour itérer
+# 12 villes IDF clés (Paris, Versailles, Nanterre, Créteil, Cergy, Meaux, etc.)
+# en parallèle. Cette URL sert de seed Paris ; les autres villes sont
+# hardcoded dans le scraper.
 DEFAULT_SEARCH_CENTURY21_URL: str = os.getenv(
     "CENTURY21_SEARCH_URL",
     "https://www.century21.fr/annonces/f/location/v-paris/",
 )
 
-# Wizi.io — managed-rental aggregator. Public API at app.wizi.eu/api/public,
-# small inventory (~15-30 listings Paris).
+# Wizi.io — managed-rental aggregator. Public API at app.wizi.eu/api/public.
+# 2026-05-05 — L'API n'a pas de filtre région ; elle utilise lat/lon comme
+# *centroïde de tri* (par distance). Avec Paris (48.8566, 2.3522), les premiers
+# ~80 résultats paginés sont en IDF (75/77/78/91/92/93/94/95) avant de
+# déborder sur le national. On garde donc le centroïde Paris : c'est déjà
+# le couvercle IDF naturel. Le param `city=Paris` est purement un label UI
+# côté SPA (le backend ignore ce paramètre).
 DEFAULT_SEARCH_WIZI_URL: str = os.getenv(
     "WIZI_SEARCH_URL",
     "https://desk.wizi.eu/#/app/search?city=Paris&lat=48.856614&long=2.3522219",
 )
 
 # Laforêt (agency network) — server-rendered, GTM data attrs embedded.
+# 2026-05-05 — passé Paris-only → IDF entier via la route `/region/`. Live
+# probe: HTTP 200, ~2567 annonces dans la titre Laforêt, listings depuis
+# 75/77/78/91/92/93/94/95. Le scraper applique le cap de 1100€ client-side
+# car `filter[max]=N` casse le scope région.
 DEFAULT_SEARCH_LAFORET_URL: str = os.getenv(
     "LAFORET_SEARCH_URL",
-    "https://www.laforet.com/ville/location-appartement-paris-75000",
+    "https://www.laforet.com/region/location-appartement-ile-de-france",
 )
 
 # Guy Hoquet (agency network) — XHR endpoint with Laravel session filters.
-# Search URL is just the parent page; the scraper hits /biens/result with
-# the city slug paris-75056_c4 and price_max parsed from priceMax query.
+# 2026-05-05 — Bascule Paris → IDF region. Live probe via /biens/search-localization
+# avec q=ile-de-france retourne `{slug:"11_c1", region_code:"11"}`. Le scraper
+# utilise désormais `_GH_IDF_SLUG = "11_c1"` (au lieu de paris-75056_c4) ;
+# cette URL n'est qu'un référent SPA. Listings vérifiés depuis 92/77/91/93/94.
 DEFAULT_SEARCH_GUYHOQUET_URL: str = os.getenv(
     "GUYHOQUET_SEARCH_URL",
-    "https://www.guy-hoquet.com/annonces/location/paris/?priceMax=1100",
+    "https://www.guy-hoquet.com/annonces/location/ile-de-france/?priceMax=1100",
 )
 
 # Inli (CDC Habitat — logement intermédiaire IDF). Off-radar — paginates

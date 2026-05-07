@@ -991,6 +991,31 @@ async def _check_and_push_alerts(
             )
 
 
+def _publish_static_dashboard() -> None:
+    """Regenerate public/index.html + git commit/push to GitHub Pages.
+    Sync function (subprocess), called via asyncio.to_thread."""
+    import subprocess
+    from pathlib import Path
+    import generate_static
+    generate_static.main()
+    public_dir = Path("public")
+    env = os.environ.copy()
+    env.setdefault("GIT_AUTHOR_EMAIL", "dashboard@immo.local")
+    env.setdefault("GIT_AUTHOR_NAME", "immo-dashboard")
+    env.setdefault("GIT_COMMITTER_EMAIL", "dashboard@immo.local")
+    env.setdefault("GIT_COMMITTER_NAME", "immo-dashboard")
+    try:
+        subprocess.run(["git", "add", "."], cwd=public_dir, check=True, env=env, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"update {datetime.utcnow().isoformat(timespec='seconds')}Z"],
+            cwd=public_dir, env=env, capture_output=True,
+        )
+        subprocess.run(["git", "push", "origin", "HEAD"], cwd=public_dir,
+                       check=True, env=env, capture_output=True, timeout=30)
+    except Exception as exc:
+        logger.warning("Static publish git step failed: %s", exc)
+
+
 async def _run_campaign_body(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     source: str | None = None, tier: str = "all",
@@ -2578,32 +2603,6 @@ def main() -> None:
         write_timeout=30,
         connection_pool_size=8,
     )
-    def _publish_static_dashboard() -> None:
-        """Regenerate public/index.html + git commit/push to GitHub Pages.
-        Sync function (subprocess), called via asyncio.to_thread."""
-        import subprocess
-        from pathlib import Path
-        # 1. Regenerate the HTML
-        import generate_static
-        generate_static.main()
-        # 2. Git commit + push (only if changes)
-        public_dir = Path("public")
-        env = os.environ.copy()
-        env.setdefault("GIT_AUTHOR_EMAIL", "dashboard@immo.local")
-        env.setdefault("GIT_AUTHOR_NAME", "immo-dashboard")
-        env.setdefault("GIT_COMMITTER_EMAIL", "dashboard@immo.local")
-        env.setdefault("GIT_COMMITTER_NAME", "immo-dashboard")
-        try:
-            subprocess.run(["git", "add", "."], cwd=public_dir, check=True, env=env, capture_output=True)
-            # commit returns 1 if no changes; tolerate
-            subprocess.run(
-                ["git", "commit", "-m", f"update {datetime.utcnow().isoformat(timespec='seconds')}Z"],
-                cwd=public_dir, env=env, capture_output=True,
-            )
-            subprocess.run(["git", "push", "origin", "HEAD"], cwd=public_dir, check=True, env=env, capture_output=True, timeout=30)
-        except Exception as exc:
-            logger.warning("Static publish git step failed: %s", exc)
-
     # LBC sentinel state — global so /sentinel commands can manage it
     _sentinel_task: asyncio.Task | None = None
     _sentinel_scrape_lock = asyncio.Lock()

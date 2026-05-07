@@ -3804,20 +3804,36 @@ async def _search_locservice_with_playwright(search_url: str, max_results: int) 
 # ─── EntreParticuliers / L'Adresse / Century 21 (3 new agency/p2p sites) ─────
 
 async def _search_entreparticuliers(search_url: str, max_results: int) -> list[Listing]:
-    """EntreParticuliers — 12 listings per arrondissement page. We loop
-    Paris 75001-75020 in parallel for full coverage (~240 listings).
-    `search_url` is ignored — we use the per-arrondissement pattern."""
-    base = "https://www.entreparticuliers.com/annonces-immobilieres/appartement/location"
-    pages = [f"{base}/paris-{i:05d}" for i in range(75001, 75021)]
+    """EntreParticuliers — 12 listings per dept page. 2026-05-05 update :
+    we loop the 8 IDF *departments* (75/77/78/91/92/93/94/95) in parallel —
+    each dept URL renders 12 unique recent listings.
+    `search_url` is ignored — we use the per-dept index URL pattern.
+
+    Note the live href pattern is `/appartement/location/{city-slug}/{listing-slug}/ref-{id}`
+    (TWO slug segments before /ref-), which the previous single-segment regex
+    failed to match. Fixed inline.
+    """
+    base = "https://www.entreparticuliers.com/annonces-immobilieres/location/appartement"
+    idf_depts = [
+        "paris-75",
+        "seine-et-marne-77",
+        "yvelines-78",
+        "essonne-91",
+        "hauts-de-seine-92",
+        "seine-saint-denis-93",
+        "val-de-marne-94",
+        "val-d-oise-95",
+    ]
+    pages = [f"{base}/{slug}" for slug in idf_depts]
     htmls = await _fetch_pages_curl_cffi(pages)
     listings: list[Listing] = []
     seen: set[str] = set()
     for html in htmls:
         if not html:
             continue
-        # JSON-LD ref pattern: href="/annonces-immobilieres/appartement/location/{slug}/ref-{id}"
+        # ref pattern: href="/annonces-immobilieres/appartement/location/{city-slug}/{listing-slug}/ref-{id}"
         for m in _re.finditer(
-            r'href="(/annonces-immobilieres/appartement/location/([a-z0-9-]+)/ref-(\d+))"',
+            r'href="(/annonces-immobilieres/appartement/location/([a-z0-9-]+)/[a-z0-9-]+/ref-(\d+))"',
             html,
         ):
             href, slug, rid = m.group(1), m.group(2), m.group(3)
@@ -3856,7 +3872,7 @@ async def _search_entreparticuliers(search_url: str, max_results: int) -> list[L
                 break
         if len(listings) >= max_results:
             break
-    logger.info("[ENTREPARTICULIERS] Parsed %d listings (20 arr.)", len(listings))
+    logger.info("[ENTREPARTICULIERS] Parsed %d listings (8 IDF depts)", len(listings))
     return listings
 
 
@@ -4876,6 +4892,10 @@ async def _laforet_enrich_descriptions(listings: list[Listing]) -> None:
 # is the fallback when Cloudflare returns a challenge.
 
 _GH_PARIS_SLUG = "paris-75056_c4"  # from /biens/search-localization?q=paris (id=41)
+# 2026-05-05 — IDF region slug (location_type=1, region_code=11). Verified live
+# against /biens/search-localization?q=ile-de-france. Returns mixed-IDF listings
+# (92, 77, 91, 93, 94, 78, 95).
+_GH_IDF_SLUG = "11_c1"
 _GH_ITEM_RE = _re.compile(
     r'<div\s+class="[^"]*resultat-item[^"]*"\s+data-id="(\d+)">(.*?)</div>\s*</a>\s*</div>',
     _re.DOTALL,
@@ -4950,7 +4970,7 @@ def _gh_parse_html(html_fragment: str, max_results: int) -> list[Listing]:
     return listings
 
 
-def _gh_build_api_url(page: int, *, location_slug: str = _GH_PARIS_SLUG,
+def _gh_build_api_url(page: int, *, location_slug: str = _GH_IDF_SLUG,
                      transaction: int = 2, price_max: int = 1100) -> str:
     """Build the JSON XHR URL the front-end calls when filters are applied."""
     return (
