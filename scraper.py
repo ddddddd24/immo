@@ -1461,7 +1461,7 @@ async def _search_bienici_with_playwright(search_url: str, max_results: int) -> 
                     "filterType": "rent",
                     "propertyType": ["flat", "house"],
                     "maxPrice": MAX_BUDGET,
-                    "minArea": 20,
+                    "minArea": 14,
                     "isFurnished": True,
                     "onTheMarket": [True],
                     "zoneIdsByTypes": {"zoneIds": [_BIENICI_IDF_ZONE_ID]},

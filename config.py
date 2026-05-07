@@ -62,11 +62,11 @@ DEFAULT_SEARCH_URL: str = (
     "https://www.leboncoin.fr/recherche"
     "?category=10"
     "&real_estate_type=1,2"
-    "&price=min-1000"
-    "&furnished=1"
-    "&square=25-max"
-    "&locations=Paris,Boulogne-Billancourt,Neuilly-sur-Seine,Levallois-Perret,Clichy,"
-    "Issy-les-Moulineaux,Montrouge,Malakoff,Vanves,Ivry-sur-Seine,"
+    "&price=min-1100"
+    # Saint-Denis added (commute target, was missing → 0 listings dept 93).
+    # Asnières + Courbevoie added (92 west, missing).
+    "&locations=Paris,Saint-Denis,Boulogne-Billancourt,Neuilly-sur-Seine,Levallois-Perret,Clichy,"
+    "Asni%C3%A8res-sur-Seine,Courbevoie,Issy-les-Moulineaux,Montrouge,Malakoff,Vanves,Ivry-sur-Seine,"
     "Le%20Kremlin-Bic%C3%AAtre,Charenton-le-Pont,Saint-Mand%C3%A9,Vincennes,"
     "Montreuil,Bagnolet,Pantin,Saint-Ouen,Aubervilliers,"
     "Alfortville,Maisons-Alfort,Saint-Maur-des-Foss%C3%A9s"
@@ -88,15 +88,18 @@ DEFAULT_SEARCH_SELOGER_URL: str = os.getenv(
 # Default PAP.fr search URL (Paris + IDF, meublé, 25m²+, max 1000€)
 DEFAULT_SEARCH_PAP_URL: str = os.getenv(
     "PAP_SEARCH_URL",
-    "https://www.pap.fr/annonce/locations-appartement-paris-75g439-ile-de-france-g439"
-    "?loyer-max=1000&surface-min=25&ameublement=meuble",
+    # Was: paris-75g439 (Paris only). Now IDF entier (g439) → couvre 75/77/78/91/92/93/94/95
+    # Filter relâché : surface-min retiré (couvre 14-24m² aussi pour transition couple)
+    "https://www.pap.fr/annonce/locations-ile-de-france-g439"
+    "?loyer-max=1100&ameublement=meuble",
 )
 
-# Default Bien'ici search URL (Paris IDF, meublé, 25m²+, max 1000€)
+# Default Bien'ici search URL (Paris IDF, meublé, 14m²+, max 1000€)
+# Filter relâché : surface-min 25→14 pour catch sub-25m² listings (Charenton 14m² case)
 DEFAULT_SEARCH_BIENICI_URL: str = os.getenv(
     "BIENICI_SEARCH_URL",
     "https://www.bienici.com/recherche/location/paris-ile-de-france"
-    "?prix-max=1000&surface-min=25&meuble=true",
+    "?prix-max=1000&surface-min=14&meuble=true",
 )
 
 # Default Logic-Immo search URL (Paris, max 1100€).
