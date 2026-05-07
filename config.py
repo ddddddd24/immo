@@ -57,30 +57,34 @@ SELOGER_PASSWORD: str = os.getenv("SELOGER_PASSWORD", "")
 APIFY_SEARCH_ACTOR: str = "ecomscrape/leboncoin-product-search-scraper"
 APIFY_SEND_ACTOR: str = "saswave/leboncoin-action-automation-scraper"
 
-# Default LeBonCoin search URL
+# Default LeBonCoin search URL — IDF entier via region code r_12.
+# Verified 2026-05-07 (Camoufox warm context, 60 listings):
+#   dept distrib  {'75': 4, '77': 1, '78': 7, '91': 18, '92': 7, '93': 7, '94': 6, '95': 10}
+# Single region token covers all 8 départements (75/77/78/91/92/93/94/95) and
+# replaces the previous hand-curated city allowlist that kept missing
+# edge communes (Saint-Denis, Asnières, Courbevoie, Saint-Maur, etc.).
 DEFAULT_SEARCH_URL: str = (
     "https://www.leboncoin.fr/recherche"
     "?category=10"
     "&real_estate_type=1,2"
     "&price=min-1100"
-    # Saint-Denis added (commute target, was missing → 0 listings dept 93).
-    # Asnières + Courbevoie added (92 west, missing).
-    "&locations=Paris,Saint-Denis,Boulogne-Billancourt,Neuilly-sur-Seine,Levallois-Perret,Clichy,"
-    "Asni%C3%A8res-sur-Seine,Courbevoie,Issy-les-Moulineaux,Montrouge,Malakoff,Vanves,Ivry-sur-Seine,"
-    "Le%20Kremlin-Bic%C3%AAtre,Charenton-le-Pont,Saint-Mand%C3%A9,Vincennes,"
-    "Montreuil,Bagnolet,Pantin,Saint-Ouen,Aubervilliers,"
-    "Alfortville,Maisons-Alfort,Saint-Maur-des-Foss%C3%A9s"
+    "&locations=r_12"
 )
 
-# Default SeLoger search URL (Paris, meublé, 25m²+, max 1000€)
-# ⚠️  Copie l'URL depuis ton navigateur après avoir fait une recherche SeLoger avec tes critères
+# Default SeLoger search URL — IDF entier (8 départements).
+# Replaces the previous transit isochrone (STRTFR4409045 = 60min Transit), which
+# biased toward Paris + inner ring and missed départements 77/78/91/95.
+# locations payload is base64-encoded JSON: {"placeIds":["AD08FR75","AD08FR77",
+# "AD08FR78","AD08FR91","AD08FR92","AD08FR93","AD08FR94","AD08FR95"]} — one
+# admin-division ID per IDF département (AD08FR{depcode}).
+# priceMax bumped 1000→1100 to match LBC default and budget headroom.
 DEFAULT_SEARCH_SELOGER_URL: str = os.getenv(
     "SELOGER_SEARCH_URL",
     "https://www.seloger.com/classified-search"
     "?distributionTypes=Rent"
     "&estateTypes=House,Apartment"
-    "&locations=eyJwbGFjZUlkcyI6WyJTVFJURlI0NDA5MDQ1Il0sImR1cmF0aW9uIjoiNjAiLCJtb2RlIjoiVHJhbnNpdCJ9"
-    "&priceMax=1000"
+    "&locations=eyJwbGFjZUlkcyI6WyJBRDA4RlI3NSIsIkFEMDhGUjc3IiwiQUQwOEZSNzgiLCJBRDA4RlI5MSIsIkFEMDhGUjkyIiwiQUQwOEZSOTMiLCJBRDA4RlI5NCIsIkFEMDhGUjk1Il19"
+    "&priceMax=1100"
     "&projectTypes=Stock"
     "&spaceMin=25",
 )
