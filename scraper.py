@@ -175,12 +175,25 @@ def _to_int_safe(value) -> Optional[int]:
 # them once a zip is present).
 _IDF_CITY_ZIP: dict[str, str] = {
     # 92 — Hauts-de-Seine
+    "antony": "92160",
     "asnieres-sur-seine": "92600", "asnieres": "92600",
+    "bagneux": "92220",
+    "bois-colombes": "92270",
     "boulogne-billancourt": "92100", "boulogne": "92100",
+    "bourg-la-reine": "92340",
+    "chatenay-malabry": "92290",
+    "chatillon": "92320",
+    "chaville": "92370",
+    "clamart": "92140",
     "clichy": "92110",
     "colombes": "92700",
     "courbevoie": "92400",
+    "fontenay-aux-roses": "92260",
+    "garches": "92380",
+    "gennevilliers": "92230",
     "issy-les-moulineaux": "92130", "issy": "92130",
+    "la-garenne-colombes": "92250",
+    "le-plessis-robinson": "92350", "plessis-robinson": "92350",
     "levallois-perret": "92300", "levallois": "92300",
     "malakoff": "92240",
     "meudon": "92190",
@@ -190,55 +203,111 @@ _IDF_CITY_ZIP: dict[str, str] = {
     "puteaux": "92800",
     "rueil-malmaison": "92500", "rueil": "92500",
     "saint-cloud": "92210",
+    "sceaux": "92330",
+    "sevres": "92310",
     "suresnes": "92150",
     "vanves": "92170",
+    "villeneuve-la-garenne": "92390",
     # 93 — Seine-Saint-Denis
     "aubervilliers": "93300",
+    "aulnay-sous-bois": "93600",
     "bagnolet": "93170",
+    "le-blanc-mesnil": "93150", "blanc-mesnil": "93150",
     "bobigny": "93000",
+    "bondy": "93140",
+    "le-bourget": "93350",
+    "clichy-sous-bois": "93390",
+    "drancy": "93700",
     "epinay-sur-seine": "93800", "epinay": "93800",
+    "gagny": "93220",
     "ile-saint-denis": "93450", "l-ile-saint-denis": "93450",
+    "le-pre-saint-gervais": "93310", "pre-saint-gervais": "93310",
+    "le-raincy": "93340", "raincy": "93340",
     "les-lilas": "93260",
+    "les-pavillons-sous-bois": "93320", "pavillons-sous-bois": "93320",
+    "livry-gargan": "93190",
+    "montfermeil": "93370",
     "montreuil": "93100",
+    "neuilly-plaisance": "93360",
+    "neuilly-sur-marne": "93330",
     "noisy-le-grand": "93160",
     "noisy-le-sec": "93130",
     "pantin": "93500",
     "pierrefitte-sur-seine": "93380", "pierrefitte": "93380",
+    "romainville": "93230",
+    "rosny-sous-bois": "93110",
     "saint-denis": "93200",
     "saint-ouen": "93400", "saint-ouen-sur-seine": "93400",
+    "sevran": "93270",
     "stains": "93240",
+    "tremblay-en-france": "93290",
+    "villemomble": "93250",
     "villepinte": "93420",
     "villetaneuse": "93430",
     # 94 — Val-de-Marne
     "alfortville": "94140",
     "arcueil": "94110",
+    "boissy-saint-leger": "94470",
+    "bonneuil-sur-marne": "94380",
+    "bry-sur-marne": "94360",
     "cachan": "94230",
     "champigny-sur-marne": "94500", "champigny": "94500",
     "charenton-le-pont": "94220", "charenton": "94220",
+    "chennevieres-sur-marne": "94430",
+    "choisy-le-roi": "94600",
     "creteil": "94000",
     "fontenay-sous-bois": "94120",
+    "fresnes": "94260",
     "gentilly": "94250",
     "ivry-sur-seine": "94200", "ivry": "94200",
     "joinville-le-pont": "94340", "joinville": "94340",
     "kremlin-bicetre": "94270", "le-kremlin-bicetre": "94270",
+    "le-perreux-sur-marne": "94170", "perreux-sur-marne": "94170", "le-perreux": "94170",
+    "limeil-brevannes": "94450",
     "maisons-alfort": "94700",
     "nogent-sur-marne": "94130", "nogent": "94130",
+    "orly": "94310",
     "saint-mande": "94160",
     "saint-maur-des-fosses": "94100", "saint-maur": "94100",
+    "saint-maurice": "94410",
+    "sucy-en-brie": "94370",
+    "thiais": "94320",
+    "valenton": "94460",
+    "villejuif": "94800",
+    "villeneuve-saint-georges": "94190",
     "vincennes": "94300",
     "vitry-sur-seine": "94400", "vitry": "94400",
-    # 95 — Val-d'Oise (sample)
+    # 95 — Val-d'Oise
     "argenteuil": "95100",
+    "bezons": "95870",
     "cergy": "95000",
+    "deuil-la-barre": "95170",
+    "eaubonne": "95600",
+    "enghien-les-bains": "95880",
+    "ermont": "95120",
+    "franconville": "95130",
+    "garges-les-gonesse": "95140",
+    "gonesse": "95500",
+    "herblay-sur-seine": "95220", "herblay": "95220",
+    "montmorency": "95160",
     "pontoise": "95300",
+    "saint-gratien": "95210",
+    "sannois": "95110",
     "sarcelles": "95200",
-    # 77/78/91 sample (rare hits — keep zips so dept dealbreaker fires)
-    "versailles": "78000",
-    "saint-quentin-en-yvelines": "78280",
+    "soisy-sous-montmorency": "95230",
+    "taverny": "95150",
+    "villiers-le-bel": "95400",
+    # 77/78/91 (carriers — most are dealbreakers but need zip to be caught)
+    "carrieres-sous-poissy": "78955",
+    "chelles": "77500",
     "evry-courcouronnes": "91000", "evry": "91000",
     "massy": "91300",
     "meaux": "77100",
     "melun": "77000",
+    "palaiseau": "91120",
+    "saint-quentin-en-yvelines": "78280",
+    "trappes": "78190",
+    "versailles": "78000",
 }
 
 # Strip accents / punctuation for table lookups — listings often arrive as
@@ -1400,16 +1469,20 @@ async def _search_pap_with_playwright(search_url: str, max_results: int) -> list
     logger.info("[PAP] Fetched %d pages", len([h for h in htmls if h]))
 
     listings: list[Listing] = []
+    seen_ids: set[str] = set()
     for html in htmls:
         if not html:
             continue
         soup = BeautifulSoup(html, "html.parser")
         items = soup.find_all(class_=_re2.compile("search-list-item"))
         for item in items:
-            if (l := _parse_pap_listing(item)):
-                listings.append(l)
-                if len(listings) >= max_results:
-                    break
+            l = _parse_pap_listing(item)
+            if not l or l.lbc_id in seen_ids:
+                continue
+            seen_ids.add(l.lbc_id)
+            listings.append(l)
+            if len(listings) >= max_results:
+                break
         if len(listings) >= max_results:
             break
 
