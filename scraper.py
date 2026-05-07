@@ -3673,18 +3673,29 @@ def _locservice_card_to_listing(card) -> Optional[Listing]:
 
     text = _re2.sub(r"\s+", " ", card.get_text(" ", strip=True))
 
-    # Title — first text up to the location marker "Paris XX (75XXX)"
-    title_m = _re2.search(r"^(.+?)\s+Paris\s+\d{1,2}\s*\(", text)
+    # Title — first text up to the location marker.
+    # IDF formats seen:
+    #   "Appartement T2 ... | Paris 17 (75017) | ..."  → Paris arr.
+    #   "Studio meublé ... | Boulogne-Billancourt (92100) | ..."  → IDF city
+    title_m = (
+        _re2.search(r"^(.+?)\s+Paris\s+\d{1,2}\s*\(", text)
+        or _re2.search(r"^(.+?)\s+[A-ZÉÈÀ][\w\-' ]+?\s*\(\d{5}\)", text)
+    )
     title = title_m.group(1).strip() if title_m else (text[:80] if text else "Appartement")
 
+    # Location: prefer "Paris XX, 75XXX"; else "{City}, {Zip}"; else just zip
     location = ""
     loc_m = _re2.search(r"(Paris\s+\d{1,2})\s*\((\d{5})\)", text)
     if loc_m:
         location = f"{loc_m.group(1)}, {loc_m.group(2)}"
     else:
-        zip_m = _re2.search(r"\b(\d{5})\b", text)
-        if zip_m:
-            location = zip_m.group(1)
+        city_m = _re2.search(r"\b([A-ZÉÈÀ][\w\-' ]+?)\s*\((\d{5})\)", text)
+        if city_m:
+            location = f"{city_m.group(1).strip()}, {city_m.group(2)}"
+        else:
+            zip_m = _re2.search(r"\b(\d{5})\b", text)
+            if zip_m:
+                location = zip_m.group(1)
 
     # Description — text after the price up to ~500 chars
     desc_m = _re2.search(r"€\s*/\s*mois\s*(.+?)$", text)
@@ -3744,12 +3755,42 @@ def _locservice_enrich_detail(html: str) -> dict:
 
 async def _search_locservice_with_playwright(search_url: str, max_results: int) -> list[Listing]:
     """LocService — plain httpx + parallel detail enrichment. Detail page
-    has 'non meublé' / 'Xème étage' / 'pas d'ascenseur' as plain text."""
+    has 'non meublé' / 'Xème étage' / 'pas d'ascenseur' as plain text.
+
+    2026-05-05 — IDF coverage : LocService n'a pas d'URL aggrégée IDF mais
+    chaque département a son slug. On itère donc les 8 départements IDF
+    (75/77/78/91/92/93/94/95) chacun sur 4 pages de listings (`-p2`, `-p3`,
+    `-p4`). `search_url` est utilisé comme template — si non-LocService, on
+    fallback sur Paris.
+    """
     from bs4 import BeautifulSoup
 
-    base, _, ext = search_url.rpartition(".html")
-    pages = [search_url] + [f"{base}-p{n}.html" for n in range(2, 11) if base]
-    logger.info("[LOCSERVICE] Fetching %d pages via httpx", len(pages))
+    # IDF dept slugs for /(slug)/location-appartement.html
+    _IDF_SLUGS = [
+        "paris-75",
+        "seine-et-marne-77",
+        "yvelines-78",
+        "essonne-91",
+        "hauts-de-seine-92",
+        "seine-saint-denis-93",
+        "val-de-marne-94",
+        "val-d-oise-95",
+    ]
+
+    pages: list[str] = []
+    if "locservice.fr" in search_url:
+        # Build full IDF coverage : for each dept, page 1 + pages 2..4
+        for slug in _IDF_SLUGS:
+            base_dept = f"https://www.locservice.fr/{slug}/location-appartement"
+            pages.append(f"{base_dept}.html")
+            for n in range(2, 5):  # 3 extra pages per dept = 4 pages × 8 depts = 32
+                pages.append(f"{base_dept}-p{n}.html")
+    else:
+        # Fallback for direct call with custom URL
+        base, _, ext = search_url.rpartition(".html")
+        pages = [search_url] + [f"{base}-p{n}.html" for n in range(2, 11) if base]
+    logger.info("[LOCSERVICE] Fetching %d pages via httpx (IDF: %d depts)",
+                len(pages), len(_IDF_SLUGS) if "locservice.fr" in search_url else 1)
     htmls = await _fetch_pages_httpx(pages)
 
     listings: list[Listing] = []
@@ -3932,8 +3973,42 @@ async def _search_ladresse(search_url: str, max_results: int) -> list[Listing]:
 
 
 async def _search_century21(search_url: str, max_results: int) -> list[Listing]:
-    """Century 21 — paginates /page-N/, ~10 listings/page, 9 pages typically."""
-    pages = [search_url] + [f"{search_url.rstrip('/')}/page-{n}/" for n in range(2, 10)]
+    """Century 21 — paginates /page-N/, ~10 listings/page, 9 pages typically.
+
+    2026-05-05 — IDF coverage : Century 21 n'a pas d'URL région IDF (les
+    variantes `r-`, `d-`, `v-ile-de-france` retournent toutes HTTP 410).
+    On itère donc les 12 villes IDF clés où Century 21 a une agence active
+    (Paris + 11 villes proches couvrant les 7 autres départements).
+    Si `search_url` n'est pas Century 21, on fallback sur Paris.
+    """
+    # Major IDF cities with active C21 agencies (verified live, returns 200 + listings)
+    _IDF_CITIES = [
+        "paris",            # 75
+        "creteil",          # 94
+        "versailles",       # 78
+        "nanterre",         # 92
+        "cergy",            # 95
+        "meaux",            # 77
+        "saint-maur-des-fosses",  # 94
+        "noisy-le-grand",   # 93
+        "antony",           # 92
+        "vitry-sur-seine",  # 94
+        "argenteuil",       # 95
+        "evry-courcouronnes",  # 91
+    ]
+
+    pages: list[str] = []
+    if "century21.fr" in search_url:
+        for city in _IDF_CITIES:
+            base = f"https://www.century21.fr/annonces/f/location/v-{city}/"
+            pages.append(base)
+            # 2 additional pages per city (most have <30 listings)
+            for n in range(2, 4):
+                pages.append(f"{base}page-{n}/")
+    else:
+        pages = [search_url] + [f"{search_url.rstrip('/')}/page-{n}/" for n in range(2, 10)]
+    logger.info("[CENTURY21] Fetching %d pages (IDF: %d cities)",
+                len(pages), len(_IDF_CITIES) if "century21.fr" in search_url else 1)
     htmls = await _fetch_pages_curl_cffi(pages)
     listings: list[Listing] = []
     seen: set[str] = set()
@@ -3962,12 +4037,20 @@ async def _search_century21(search_url: str, max_results: int) -> list[Listing]:
             # Title hint: nearby text
             title_m = _re.search(r"(Appartement|Studio|Maison|Loft)\b[^<]{0,80}", ctx)
             title = title_m.group(0).strip() if title_m else "Appartement"
+            # Extract location: look for "(XXXXX)" zipcode in the surrounding ctx,
+            # or city slug in the page title. Falls back to "Paris" if nothing.
+            zip_m = _re.search(r"\((\d{5})\)", ctx)
+            city_in_title_m = _re.search(r"<title>[^<]*?à\s+([\w\-' ]+?)\s*\(\d", html)
+            if zip_m:
+                location = (city_in_title_m.group(1).strip() + ", " if city_in_title_m else "") + zip_m.group(1)
+            else:
+                location = city_in_title_m.group(1).strip() if city_in_title_m else "Paris"
             listings.append(Listing(
                 lbc_id=f"c21_{rid}",
                 title=title[:200],
                 description="",
                 price=price,
-                location="Paris",
+                location=location,
                 seller_name="Century 21",
                 url=url,
                 seller_type_hint="pro",
