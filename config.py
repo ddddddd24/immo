@@ -98,8 +98,8 @@ DEFAULT_SEARCH_PAP_URL: str = os.getenv(
 # Filter relâché : surface-min 25→14 pour catch sub-25m² listings (Charenton 14m² case)
 DEFAULT_SEARCH_BIENICI_URL: str = os.getenv(
     "BIENICI_SEARCH_URL",
-    "https://www.bienici.com/recherche/location/paris-ile-de-france"
-    "?prix-max=1000&surface-min=14&meuble=true",
+    "https://www.bienici.com/recherche/location/ile-de-france"
+    "?prix-max=1100&surface-min=14",
 )
 
 # Default Logic-Immo search URL (Paris, max 1100€).
