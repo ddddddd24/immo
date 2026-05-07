@@ -85,12 +85,12 @@ DEFAULT_SEARCH_SELOGER_URL: str = os.getenv(
     "&spaceMin=25",
 )
 
-# Default PAP.fr search URL (Paris + IDF, meublé, 25m²+, max 1000€)
+# Default PAP.fr search URL (IDF entier, meublé, max 1100€)
 DEFAULT_SEARCH_PAP_URL: str = os.getenv(
     "PAP_SEARCH_URL",
-    # Was: paris-75g439 (Paris only). Now IDF entier (g439) → couvre 75/77/78/91/92/93/94/95
-    # Filter relâché : surface-min retiré (couvre 14-24m² aussi pour transition couple)
-    "https://www.pap.fr/annonce/locations-ile-de-france-g439"
+    # Region code IDF = g471 (g439 était Paris-only malgré le slug "ile-de-france").
+    # Couvre 75/77/78/91/92/93/94/95. Pas de surface-min → catch sub-25m² (14-24m²).
+    "https://www.pap.fr/annonce/locations-ile-de-france-g471"
     "?loyer-max=1100&ameublement=meuble",
 )
 
