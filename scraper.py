@@ -1056,6 +1056,162 @@ async def _pap_enrich_detail(html: str) -> dict:
     return out
 
 
+async def _fetch_pap_single(url: str) -> Optional[Listing]:
+    """Fetch a single PAP detail page (curl_cffi → JSON-LD + regex).
+
+    Used by `/add` flow: user pastes a PAP URL, we extract title/price/surface/
+    location/description/photos/phone. Falls back to a minimal Listing on
+    parse error so the user at least gets the URL persisted.
+    """
+    from curl_cffi.requests import AsyncSession
+    import json as _json
+
+    pid_m = _re.search(r"-r(\d+)(?:[/?#]|$)", url)
+    if not pid_m:
+        logger.warning("[PAP single] no id in url: %s", url)
+        return None
+    pap_id = f"pap_{pid_m.group(1)}"
+
+    html = ""
+    try:
+        async with AsyncSession(impersonate="chrome120", timeout=20) as session:
+            r = await session.get(url, allow_redirects=True)
+            if r.status_code == 200:
+                html = r.text
+            else:
+                logger.warning("[PAP single] HTTP %s on %s", r.status_code, url[:80])
+    except Exception as exc:
+        logger.warning("[PAP single] fetch failed: %s", exc)
+
+    if not html:
+        return None
+
+    # JSON-LD first (structured)
+    title = ""
+    description = ""
+    price: Optional[int] = None
+    surface: Optional[int] = None
+    city = ""
+    zip_c = ""
+    images: list[str] = []
+    for block in _re.findall(
+        r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL
+    ):
+        try:
+            data = _json.loads(block)
+        except Exception:
+            continue
+        # Some pages wrap in a list
+        if isinstance(data, list):
+            data = next((d for d in data if isinstance(d, dict)), {})
+        if not isinstance(data, dict):
+            continue
+        if not description:
+            description = (data.get("description") or "").strip()
+        if not title:
+            title = (data.get("name") or "").strip()
+        offers = data.get("offers")
+        if isinstance(offers, dict):
+            try:
+                if price is None:
+                    price = int(float(offers.get("price")))
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(offers, list):
+            for o in offers:
+                if isinstance(o, dict) and o.get("price") and price is None:
+                    try:
+                        price = int(float(o["price"]))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+        addr = data.get("address") or {}
+        if isinstance(addr, dict):
+            city = city or (addr.get("addressLocality") or "")
+            zip_c = zip_c or (addr.get("postalCode") or "")
+        img = data.get("image")
+        if isinstance(img, list):
+            images.extend(u for u in img if isinstance(u, str))
+        elif isinstance(img, str):
+            images.append(img)
+        addl = data.get("additionalProperty")
+        if isinstance(addl, list):
+            for prop in addl:
+                if not isinstance(prop, dict):
+                    continue
+                name = (prop.get("name") or "").lower()
+                val = prop.get("value")
+                if name == "surface" and surface is None:
+                    try: surface = int(float(val))
+                    except (TypeError, ValueError): pass
+
+    # Fallback regex for price if JSON-LD missed
+    if price is None:
+        text = _re.sub(r"<[^>]+>", " ", html)
+        if (m := _re.search(r"([\d][\d\s\xa0\.]*)\s*€", text)):
+            try:
+                price = int(m.group(1).replace(".", "").replace("\xa0", "").replace(" ", ""))
+            except ValueError:
+                pass
+
+    # Fallback regex for surface
+    if surface is None:
+        if (m := _re.search(r"(\d{1,3})(?:[,.]\d+)?\s*m²", html)):
+            try: surface = int(m.group(1))
+            except ValueError: pass
+
+    location = f"{city} ({zip_c})" if city and zip_c else (city or zip_c)
+
+    if not title:
+        if surface and location:
+            title = f"Appartement {surface}m² — {location}"
+        else:
+            title = "Annonce PAP"
+
+    enrich = await _pap_enrich_detail(html)
+    phone = enrich.get("phone")
+    if surface is None and enrich.get("surface"):
+        surface = enrich["surface"]
+
+    avail = enrich.get("available_yyyy_mm")
+    tags = []
+    if (fl := enrich.get("floor")) is not None:
+        tags.append(f"[ÉTAGE: {fl}]")
+    if enrich.get("elevator") is True:
+        tags.append("[ASCENSEUR: oui]")
+    elif enrich.get("elevator") is False:
+        tags.append("[ASCENSEUR: non]")
+    if enrich.get("furnished") is True:
+        tags.append("[MEUBLÉ: oui]")
+    if avail:
+        tags.append(f"[DISPO: {avail}]")
+    if tags:
+        description = (description + "\n" + " ".join(tags)).strip()
+
+    seen = set()
+    uniq_imgs: list[str] = []
+    for u in images:
+        if u and u not in seen:
+            seen.add(u)
+            uniq_imgs.append(u)
+
+    return Listing(
+        lbc_id=pap_id,
+        title=title[:200],
+        description=description,
+        price=_parse_price(price),
+        location=location,
+        seller_name="Particulier",
+        url=url,
+        seller_type_hint="particulier",
+        source="pap",
+        images=uniq_imgs,
+        surface=surface,
+        phone=phone,
+        available_from=avail,
+    )
+
+
 async def _search_pap_with_playwright(search_url: str, max_results: int) -> list[Listing]:
     """PAP scraper — curl_cffi search + parallel detail enrichment.
     Search page gives basic info; detail page (JSON-LD + regex) gives
@@ -1432,6 +1588,63 @@ async def _bienici_fetch_detail(client, ad_id: str) -> dict:
     except Exception as exc:
         logger.debug("Bien'ici detail fetch %s failed: %s", ad_id, exc)
     return {}
+
+
+async def _fetch_bienici_single(url: str) -> Optional[Listing]:
+    """Fetch a single Bien'ici detail page via the realEstateAd.json API.
+
+    URL formats seen:
+      • https://www.bienici.com/annonce/location/<id>...
+      • https://www.bienici.com/annonce/<id>
+    We extract the id, hit the detail API, and reuse `_bienici_ad_to_listing`.
+    """
+    import httpx as _httpx
+    m = _re.search(r"/annonce/(?:[a-z]+/)?([a-zA-Z0-9_-]{6,})", url)
+    if not m:
+        logger.warning("[BIENICI single] no id in url: %s", url)
+        return None
+    ad_id = m.group(1)
+    try:
+        async with _httpx.AsyncClient(headers={"User-Agent": _HTTPX_UA}, timeout=20) as client:
+            detail = await _bienici_fetch_detail(client, ad_id)
+    except Exception as exc:
+        logger.warning("[BIENICI single] fetch failed: %s", exc)
+        return None
+    if not detail:
+        return None
+    listing = _bienici_ad_to_listing(detail)
+    if not listing:
+        return None
+    # Override URL with the canonical user-pasted one (strip query/hash)
+    listing.url = url.split("?")[0].split("#")[0]
+    crd = detail.get("contactRelativeData") or {}
+    ph = crd.get("phoneToDisplay")
+    if isinstance(ph, str) and ph.strip():
+        listing.phone = ph.strip()
+    return listing
+
+
+def _generic_id_from_url(url: str) -> str:
+    """Build a stable lbc_id for an unrecognised source. Hash-based so re-adding
+    the same URL upserts the same row instead of duplicating."""
+    import hashlib as _hl
+    h = _hl.sha1(url.encode("utf-8")).hexdigest()[:12]
+    return f"manual_{h}"
+
+
+def _fetch_generic_minimal(url: str) -> Listing:
+    """Last-resort fallback: persist a near-empty Listing carrying just the URL.
+    User can still click through from the dashboard / Telegram alert."""
+    return Listing(
+        lbc_id=_generic_id_from_url(url),
+        title="Annonce ajoutée manuellement",
+        description="",
+        price=0,
+        location="",
+        seller_name="",
+        url=url,
+        source="manual",
+    )
 
 
 async def _search_bienici_with_playwright(search_url: str, max_results: int) -> list[Listing]:
@@ -3964,11 +4177,21 @@ async def _search_fnaim(search_url: str, max_results: int) -> list[Listing]:
         return out
 
     per_dept = await asyncio.gather(*(_scrape_dept(slug) for slug in _FNAIM_IDF_DEPT_SLUGS))
-    for batch in per_dept:
-        listings.extend(batch)
+    # Round-robin interleave so every département is represented even when
+    # max_results is small. Iterating linearly used to drop 92-95 entirely
+    # because 75+77 alone fill the quota.
+    from itertools import zip_longest
+    for tup in zip_longest(*per_dept):
+        for lst in tup:
+            if lst is None: continue
+            listings.append(lst)
+            if len(listings) >= max_results: break
         if len(listings) >= max_results: break
     listings = listings[:max_results]
-    logger.info("[FNAIM] Parsed %d listings ≤%d€/mois IDF", len(listings), PRICE_CAP)
+    per_dept_counts = [len(b) for b in per_dept]
+    logger.info("[FNAIM] Parsed %d listings ≤%d€/mois IDF (per-dept raw: %s)",
+                len(listings), PRICE_CAP,
+                dict(zip(_FNAIM_IDF_DEPT_SLUGS, per_dept_counts)))
     return listings
 
 
@@ -5006,9 +5229,22 @@ async def search_listings(search_url: str, max_results: int = 50) -> list[Listin
 
 
 async def fetch_single_listing(url: str) -> Optional[Listing]:
-    """Fetch a single listing. Source auto-detected from URL."""
+    """Fetch a single listing. Source auto-detected from URL.
+
+    Dispatch order:
+      • SeLoger  → curl_cffi/Camoufox SSR parse
+      • PAP      → curl_cffi + JSON-LD/regex (`_fetch_pap_single`)
+      • Bien'ici → realEstateAd.json API (`_fetch_bienici_single`)
+      • LBC (and Apify when enabled) → __NEXT_DATA__ via Playwright
+    Returns None if the source-specific path failed; callers (e.g. /add) may
+    then fall back to `_fetch_generic_minimal(url)` to still persist the URL.
+    """
     if _is_seloger(url):
         return await _fetch_seloger_single_with_playwright(url)
+    if _is_pap(url):
+        return await _fetch_pap_single(url)
+    if _is_bienici(url):
+        return await _fetch_bienici_single(url)
 
     if config.USE_APIFY:
         logger.info("[APIFY] Fetching single listing: %s", url)
