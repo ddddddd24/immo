@@ -162,6 +162,148 @@ def _to_int_safe(value) -> Optional[int]:
         return None
 
 
+# ─── Geocoding helpers — city/arr → ZIP ──────────────────────────────────────
+# `is_critical_zone()` and dashboard filters key off a 5-digit zip embedded in
+# `Listing.location`. Several scrapers (inli, lodgis card view, wizi list view,
+# laforet 75xxx-only, parisattitude) used to ship listings with city-only
+# strings, hiding 2500+ rows from dept-based filtering. Helpers below normalise
+# any (city, arrondissement, raw zip) tuple into a "City, ZZZZZ" suffix.
+
+# Major IDF communes — 92/93/94/95 within or near our preferred zones, plus a
+# handful of common 77/78/91 fallbacks so we don't drop those listings entirely
+# (the dept-prefix dealbreaker in preferences.is_critical_zone takes care of
+# them once a zip is present).
+_IDF_CITY_ZIP: dict[str, str] = {
+    # 92 — Hauts-de-Seine
+    "asnieres-sur-seine": "92600", "asnieres": "92600",
+    "boulogne-billancourt": "92100", "boulogne": "92100",
+    "clichy": "92110",
+    "colombes": "92700",
+    "courbevoie": "92400",
+    "issy-les-moulineaux": "92130", "issy": "92130",
+    "levallois-perret": "92300", "levallois": "92300",
+    "malakoff": "92240",
+    "meudon": "92190",
+    "montrouge": "92120",
+    "nanterre": "92000",
+    "neuilly-sur-seine": "92200", "neuilly": "92200",
+    "puteaux": "92800",
+    "rueil-malmaison": "92500", "rueil": "92500",
+    "saint-cloud": "92210",
+    "suresnes": "92150",
+    "vanves": "92170",
+    # 93 — Seine-Saint-Denis
+    "aubervilliers": "93300",
+    "bagnolet": "93170",
+    "bobigny": "93000",
+    "epinay-sur-seine": "93800", "epinay": "93800",
+    "ile-saint-denis": "93450", "l-ile-saint-denis": "93450",
+    "les-lilas": "93260",
+    "montreuil": "93100",
+    "noisy-le-grand": "93160",
+    "noisy-le-sec": "93130",
+    "pantin": "93500",
+    "pierrefitte-sur-seine": "93380", "pierrefitte": "93380",
+    "saint-denis": "93200",
+    "saint-ouen": "93400", "saint-ouen-sur-seine": "93400",
+    "stains": "93240",
+    "villepinte": "93420",
+    "villetaneuse": "93430",
+    # 94 — Val-de-Marne
+    "alfortville": "94140",
+    "arcueil": "94110",
+    "cachan": "94230",
+    "champigny-sur-marne": "94500", "champigny": "94500",
+    "charenton-le-pont": "94220", "charenton": "94220",
+    "creteil": "94000",
+    "fontenay-sous-bois": "94120",
+    "gentilly": "94250",
+    "ivry-sur-seine": "94200", "ivry": "94200",
+    "joinville-le-pont": "94340", "joinville": "94340",
+    "kremlin-bicetre": "94270", "le-kremlin-bicetre": "94270",
+    "maisons-alfort": "94700",
+    "nogent-sur-marne": "94130", "nogent": "94130",
+    "saint-mande": "94160",
+    "saint-maur-des-fosses": "94100", "saint-maur": "94100",
+    "vincennes": "94300",
+    "vitry-sur-seine": "94400", "vitry": "94400",
+    # 95 — Val-d'Oise (sample)
+    "argenteuil": "95100",
+    "cergy": "95000",
+    "pontoise": "95300",
+    "sarcelles": "95200",
+    # 77/78/91 sample (rare hits — keep zips so dept dealbreaker fires)
+    "versailles": "78000",
+    "saint-quentin-en-yvelines": "78280",
+    "evry-courcouronnes": "91000", "evry": "91000",
+    "massy": "91300",
+    "meaux": "77100",
+    "melun": "77000",
+}
+
+# Strip accents / punctuation for table lookups — listings often arrive as
+# "Saint-Maur" / "saint maur" / "SAINT-MAUR" / "Saint Maur des Fossés".
+_ACCENT_MAP = str.maketrans(
+    "àâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ",
+    "aaaeeeeiioouuucAAAEEEEIIOOUUUC",
+)
+
+
+def _normalize_city_key(city: str) -> str:
+    """Normalize city name for _IDF_CITY_ZIP lookup: lowercase, no accents,
+    spaces/apostrophes → hyphens, strip 'le/la/les' prefix variants."""
+    if not city:
+        return ""
+    s = city.strip().translate(_ACCENT_MAP).lower()
+    s = _re.sub(r"[''`]", "-", s)
+    s = _re.sub(r"\s+", "-", s)
+    s = _re.sub(r"-+", "-", s).strip("-")
+    return s
+
+
+def _paris_arrondissement_to_zip(label: str) -> Optional[str]:
+    """Map a Paris arrondissement label → 5-digit zip.
+    Accepts: 'Paris 1', 'Paris 1°', 'Paris 1er', 'Paris 12eme', 'Paris 12ème',
+    'paris-12', '1er arrondissement', etc. Returns None if no match."""
+    if not label:
+        return None
+    blob = label.translate(_ACCENT_MAP).lower()
+    # Plain "paris" with no number → ambiguous, skip
+    m = _re.search(r"paris[\s\-]*(\d{1,2})\b", blob)
+    if not m:
+        m = _re.search(r"\b(\d{1,2})\s*(?:er|eme|e|°)?\s*arrondissement", blob)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except ValueError:
+        return None
+    if 1 <= n <= 20:
+        return f"750{n:02d}"
+    return None
+
+
+def _zip_for_location(text: str) -> Optional[str]:
+    """Resolve a free-form location string → 5-digit zip.
+
+    Order: explicit 5-digit match → Paris arrondissement → IDF city table.
+    Used by inli/lodgis when the source surfaces only a city name."""
+    if not text:
+        return None
+    # Already-embedded zip? Re-use it.
+    zm = _re.search(r"\b(\d{5})\b", text)
+    if zm:
+        return zm.group(1)
+    if (z := _paris_arrondissement_to_zip(text)):
+        return z
+    # Try every word group as a city key (handles "Studio Saint-Denis 25m²")
+    for token in _re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\-' ]{2,40}", text):
+        key = _normalize_city_key(token)
+        if key in _IDF_CITY_ZIP:
+            return _IDF_CITY_ZIP[key]
+    return None
+
+
 def detect_housing_type(title: str, description: str = "") -> tuple[str, Optional[int]]:
     """Classify a listing by housing type. Returns (type, roommate_count).
 
@@ -1087,6 +1229,7 @@ async def _fetch_pap_single(url: str) -> Optional[Listing]:
         return None
 
     # JSON-LD first (structured)
+    import html as _htmllib
     title = ""
     description = ""
     price: Optional[int] = None
@@ -1162,6 +1305,12 @@ async def _fetch_pap_single(url: str) -> Optional[Listing]:
 
     location = f"{city} ({zip_c})" if city and zip_c else (city or zip_c)
 
+    # Unescape HTML entities (&nbsp;, &amp;, &eacute;, …) that JSON-LD can carry
+    if title:
+        title = _re.sub(r"\s+", " ", _htmllib.unescape(title)).strip()
+    if description:
+        description = _htmllib.unescape(description).strip()
+
     if not title:
         if surface and location:
             title = f"Appartement {surface}m² — {location}"
@@ -1220,13 +1369,35 @@ async def _search_pap_with_playwright(search_url: str, max_results: int) -> list
     from curl_cffi.requests import AsyncSession
     import re as _re2
 
+    # PAP pagination quirks:
+    #   - pages 2+ live under /pagination/ (NOT /annonce/), and
+    #   - return 403 unless we send Referer + cookies from page 1.
+    # So: fetch page 1 first via curl_cffi, then pages 2..N within the same
+    # AsyncSession (cookies preserved) and an explicit Referer header.
     url_no_query, _, query = search_url.partition("?")
-    pages = [search_url] + [
-        f"{url_no_query}-{n}{('?' + query) if query else ''}"
-        for n in range(2, 16)
-    ]
-    logger.info("[PAP] Fetching %d pages via curl_cffi", len(pages))
-    htmls = await _fetch_pages_curl_cffi(pages)
+    pag_base = url_no_query.replace("/annonce/", "/pagination/", 1)
+    htmls: list[Optional[str]] = []
+    async with AsyncSession(impersonate="chrome120", timeout=15) as session:
+        try:
+            r1 = await session.get(search_url, allow_redirects=True)
+            htmls.append(r1.text if r1.status_code == 200 else None)
+        except Exception as exc:
+            logger.warning("[PAP] page 1 fetch failed: %s", exc)
+            htmls.append(None)
+        # Pages 2..15 — stop at first empty (no more results)
+        for n in range(2, 16):
+            url = f"{pag_base}-{n}{('?' + query) if query else ''}"
+            try:
+                r = await session.get(url, headers={"Referer": search_url}, allow_redirects=True)
+                if r.status_code != 200:
+                    break
+                if "search-list-item" not in r.text:
+                    break
+                htmls.append(r.text)
+            except Exception as exc:
+                logger.warning("[PAP] page %d fetch failed: %s", n, exc)
+                break
+    logger.info("[PAP] Fetched %d pages", len([h for h in htmls if h]))
 
     listings: list[Listing] = []
     for html in htmls:
@@ -2903,7 +3074,10 @@ def _frame_to_listing(frame: dict) -> Optional[Listing]:
         try: arr_label = f"Paris {int(zip_code[3:])}"
         except ValueError: pass
 
-    location = f"{borough}, {arr_label}" if borough else arr_label
+    # Embed the 5-digit zip so is_critical_zone() and dashboard dept-filters
+    # can match. Without it, 1900+ PA listings were invisible to dept queries.
+    base_loc = f"{borough}, {arr_label}" if borough else arr_label
+    location = f"{base_loc}, {zip_code}" if zip_code else base_loc
     title = f"{type_label} {int(surface)}m² {borough}".strip() if surface else f"{type_label} {borough}".strip()
     # PA listing URLs auto-redirect from a stub slug — saves us from constructing
     # the canonical slug from boroughLabel.
@@ -3054,16 +3228,25 @@ def _lodgis_card_to_listing(card) -> Optional[Listing]:
     sm = _re2.search(r"(\d+)(?:[,.]\d+)?\s*m²", text)
     surface = sm.group(1) if sm else ""
 
-    # Location: "Paris X°" + neighborhood preceding €
+    # Location: "Paris X°" + neighborhood preceding €. Lodgis card text never
+    # carries an explicit zip, so we synthesise it from the arrondissement
+    # number (Paris 1° → 75001) — required for is_critical_zone() to match.
     arr_m = _re2.search(r"Paris\s+(\d{1,2})\s*°?", text)
     location = ""
     if arr_m:
+        try:
+            arr_n = int(arr_m.group(1))
+        except ValueError:
+            arr_n = 0
+        zip_code = f"750{arr_n:02d}" if 1 <= arr_n <= 20 else ""
         # Try to find neighborhood — usually the segment right before "€"
         neighborhood_m = _re2.search(r"\|\s*([^|€]+?)\s*\|\s*€", text)
         if neighborhood_m:
-            location = f"{neighborhood_m.group(1).strip()}, Paris {arr_m.group(1)}"
+            location = f"{neighborhood_m.group(1).strip()}, Paris {arr_n}"
         else:
-            location = f"Paris {arr_m.group(1)}"
+            location = f"Paris {arr_n}"
+        if zip_code:
+            location = f"{location}, {zip_code}"
 
     # Title — first non-empty segment
     title_parts = [p.strip() for p in text.split("|") if p.strip()]
@@ -3771,12 +3954,21 @@ async def _search_wizi(search_url: str, max_results: int) -> list[Listing]:
                             if doc_id:
                                 images.append(f"https://app.wizi.eu/api/public/documents/{doc_id}.{ext}")
                     pub = (it.get("publish_at") or it.get("created_at") or "").replace(" ", "T") or None
+                    # Wizi /search omits postalCode (only /flats/{id} returns
+                    # it). Title often includes "Paris 15ème" → derive zip; the
+                    # enrich pass below upgrades it to the canonical postalCode
+                    # when the detail call succeeds.
+                    item_city = it.get("city") or city
+                    init_loc = item_city
+                    z = _zip_for_location(title) or _zip_for_location(item_city)
+                    if z:
+                        init_loc = f"{item_city}, {z}"
                     listings.append(Listing(
                         lbc_id=f"wizi_{flat_id}",
                         title=title[:200],
-                        description=f"{(it.get('city') or city)} - {surface or '?'}m²",
+                        description=f"{item_city} - {surface or '?'}m²",
                         price=price,
-                        location=(it.get("city") or city),
+                        location=init_loc,
                         seller_name="Wizi",
                         url=f"https://desk.wizi.eu/#/app/flat/{flat_id}",
                         seller_type_hint="agency",
@@ -3813,9 +4005,18 @@ async def _search_wizi(search_url: str, max_results: int) -> list[Listing]:
                         )
                     if r.status_code != 200:
                         return
-                    desc = (r.json() or {}).get("description") or ""
+                    payload = r.json() or {}
+                    desc = payload.get("description") or ""
                     if isinstance(desc, str) and len(desc) > 80:
                         lst.description = desc.replace("\r\n", "\n").strip()[:1500]
+                    # Authoritative zip — overrides any title-derived guess.
+                    pc = str(payload.get("postalCode") or "").strip()
+                    if _re.fullmatch(r"\d{5}", pc):
+                        det_city = (payload.get("city") or "").strip() or lst.location
+                        # Replace existing zip if any; otherwise append.
+                        loc_no_zip = _re.sub(r",?\s*\b\d{5}\b\s*", "", lst.location).strip(", ")
+                        base = loc_no_zip or det_city
+                        lst.location = f"{base}, {pc}"
                 except Exception:
                     pass
         await asyncio.gather(*(_enrich(l) for l in listings), return_exceptions=True)
@@ -3873,6 +4074,11 @@ def _inli_card_to_listing(card_html: str) -> Optional[Listing]:
     if not location:
         location = slug_city.replace("-", " ").title()
     location = _re.sub(r"\s+", " ", location)
+    # Inli card text is "Paris 12eme" or a plain commune name — embed a zip so
+    # is_critical_zone() can flag 77/78/91/95 results and dept-filters work.
+    if (zip_code := _zip_for_location(location) or _zip_for_location(slug_city)):
+        if zip_code not in location:
+            location = f"{location}, {zip_code}"
     title_parts = [p for p in (typology, f"{surface} m²" if surface else None, location) if p]
     title = " · ".join(title_parts) or raw_details[:120] or "Logement Inli"
     images = [m.group(1) for m in _INLI_IMG_RE.finditer(card_html)
@@ -4408,7 +4614,18 @@ def _laforet_parse_html(html: str, max_results: int) -> list[Listing]:
 
         zipcode = fields["zip"]
         city    = (fields["city"] or "").title() or "Paris"
-        location = f"{city} {zipcode[-2:]}" if zipcode.startswith("75") and len(zipcode) == 5 else city
+        # Always embed the 5-digit zip when present (was Paris-only before),
+        # so non-75 listings stay visible to is_critical_zone() and
+        # dashboard dept-prefix filters.
+        if zipcode and len(zipcode) == 5:
+            if zipcode.startswith("75"):
+                location = f"{city} {zipcode[-2:]}, {zipcode}"
+            else:
+                location = f"{city}, {zipcode}"
+        else:
+            # Fallback: try the city table (rare — Laforêt usually fills zip).
+            z = _zip_for_location(city)
+            location = f"{city}, {z}" if z else city
 
         # Title — prefer the GTM item-name; enrich with criteria for clarity
         title = fields["name"] or f"Appartement {fields['rooms']} pièces"

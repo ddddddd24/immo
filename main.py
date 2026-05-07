@@ -336,6 +336,126 @@ async def cmd_simulate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ─── /add — manually inject a listing the search/SERP missed ─────────────────
+
+async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Take any listing URL (LBC, PAP, SeLoger, Bien'ici, …), fetch the detail
+    page, persist it, optionally score it, and ping a high-score notif.
+
+    Use case: user spotted an annonce on a site whose SERP/filters didn't
+    surface it. `/add <url>` makes it appear in the dashboard like any
+    auto-scraped listing.
+    """
+    if not ctx.args:
+        await _reply(
+            update,
+            "Usage : `/add <url>`\n"
+            "Exemple : `/add https://www.pap.fr/annonces/appartement-...-r123456789`",
+        )
+        return
+
+    url = ctx.args[0].strip()
+    if not url.startswith(("http://", "https://")):
+        await _reply(update, "❌ URL invalide (doit commencer par http(s)://).")
+        return
+
+    await _reply(update, "🔍 Récupération de l'annonce…")
+
+    # 1. Fetch detail (source auto-detected)
+    listing = None
+    try:
+        listing = await fetch_single_listing(url)
+    except Exception as exc:
+        logger.warning("[/add] fetch_single_listing crashed for %s: %s", url, exc)
+
+    # 2. Generic fallback: persist the URL even if parse failed
+    if listing is None:
+        from scraper import _fetch_generic_minimal
+        listing = _fetch_generic_minimal(url)
+        await _reply(
+            update,
+            "⚠️ Impossible d'extraire les détails — annonce enregistrée avec l'URL seule.",
+        )
+
+    # 3. Detect housing type from title/description (matches campaign flow)
+    from scraper import detect_housing_type
+    htype, n_room = detect_housing_type(listing.title or "", listing.description or "")
+    if htype:
+        listing.housing_type = htype
+    if n_room is not None:
+        listing.roommate_count = n_room
+
+    # 4. Persist via the batch upsert (one-row "batch")
+    row = {
+        "lbc_id": listing.lbc_id,
+        "title": listing.title,
+        "price": listing.price,
+        "location": listing.location,
+        "seller_name": listing.seller_name,
+        "seller_type": "",
+        "url": listing.url,
+        "source": listing.source,
+        "surface": listing.surface,
+        "housing_type": getattr(listing, "housing_type", "") or "",
+        "roommate_count": getattr(listing, "roommate_count", None),
+        "published_at": getattr(listing, "published_at", None),
+        "phone": getattr(listing, "phone", None),
+        "description": listing.description or "",
+        "available_from": getattr(listing, "available_from", None),
+    }
+    try:
+        database.upsert_listings_batch([row])
+    except Exception as exc:
+        logger.error("[/add] upsert failed: %s", exc)
+        await _reply(update, f"❌ Échec de l'enregistrement DB : `{exc}`")
+        return
+
+    # 4b. Cross-source dedup — flag this row as a duplicate of an existing
+    # primary if price/surface/location match a listing already in DB.
+    try:
+        database.apply_dedup_for_batch([row])
+    except Exception as exc:
+        logger.warning("[/add] dedup pass failed for %s: %s", listing.lbc_id, exc)
+
+    # 5. Optional scoring (DeepSeek) when enabled
+    score: int | None = None
+    reason: str = ""
+    if config.ENABLE_SCORING and listing.price and listing.price > 0:
+        try:
+            result = await score_listing(listing)
+            score = int(result.get("score", 0))
+            reason = (result.get("reason") or "")[:200]
+            database.set_listing_score(listing.lbc_id, score, reason)
+        except Exception as exc:
+            logger.warning("[/add] scoring failed for %s: %s", listing.lbc_id, exc)
+
+    # 6. Build summary message
+    surface_str = f"{listing.surface}m²" if listing.surface else "?m²"
+    price_str = f"{listing.price}€" if listing.price else "?€"
+    src_emoji = _SOURCE_EMOJI_PUSH.get(listing.source, "⚪")
+    title_short = (listing.title or "")[:80]
+    summary = (
+        f"✅ *Ajoutée* {src_emoji}\n"
+        f"📍 _{_escape_md(title_short)}_\n"
+        f"🏷 {surface_str} · *{price_str}*"
+    )
+    if listing.location:
+        summary += f"\n🌐 {_escape_md(listing.location)}"
+    if score is not None:
+        summary += f"\n⭐ score *{score}/10*"
+        if reason:
+            summary += f" — _{_escape_md(reason)}_"
+    summary += f"\n🔗 {listing.url}"
+    await _reply(update, summary)
+
+    # 7. Push high-score notif (uses the same path as the campaign push alerts)
+    if score is not None and score >= config.INTEREST_THRESHOLD:
+        try:
+            await _check_and_push_alerts([listing.lbc_id], ctx)
+        except Exception as exc:
+            logger.warning("[/add] push alert failed: %s", exc)
+
+
 # ─── Inline keyboard callbacks ────────────────────────────────────────────────
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2534,9 +2654,8 @@ def main() -> None:
                 n = database.upsert_listings_batch(rows)
                 logger.info("[SENTINEL] persisted %d/%d LBC listings", n, len(clean))
                 # Trigger push for newly-persisted IDs
-                if config.ENABLE_PUSH_ALERTS and n > 0:
-                    # Need a real ctx with bot — use the global app's bot
-                    fake_ctx = type("C", (), {"bot": _app.bot})()
+                if config.ENABLE_PUSH_ALERTS and n > 0 and _sentinel_bot_ref[0]:
+                    fake_ctx = type("C", (), {"bot": _sentinel_bot_ref[0]})()
                     await _check_and_push_alerts([r["lbc_id"] for r in rows], fake_ctx)
             except Exception as exc:
                 logger.warning("[SENTINEL] triggered scrape failed: %s", exc)
@@ -2626,6 +2745,7 @@ def main() -> None:
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("simulate", cmd_simulate))
+    app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("campagne", cmd_campagne))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("envoyer", cmd_envoyer))
