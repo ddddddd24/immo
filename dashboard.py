@@ -112,12 +112,24 @@ def _render_listings() -> str:
 
     # Build the rows once on the server; client-side JS handles sort/filter.
     row_data = []
+    # Fraud detection (lazy import — degrade gracefully if module not ready)
+    try:
+        import database as _db_fraud
+        _has_fraud = True
+    except Exception:
+        _has_fraud = False
     for l in listings:
         ht = l["housing_type"] or ""
         if ht in ("coloc", "coliving") and l["roommate_count"]:
             ht_display = f"{ht} {l['roommate_count']}p"
         else:
             ht_display = ht
+        is_fraud, fraud_reason = (False, "")
+        if _has_fraud:
+            try:
+                is_fraud, fraud_reason = _db_fraud.is_suspicious_listing(l)
+            except Exception:
+                pass
         row_data.append({
             "id": l["lbc_id"],
             "source": l["source"] or "",
@@ -134,6 +146,8 @@ def _render_listings() -> str:
             "available_from": l["available_from"] or "",
             "housing_type": ht,
             "housing_display": ht_display,
+            "is_fraud": is_fraud,
+            "fraud_reason": fraud_reason,
         })
 
     rows_json = json.dumps(row_data)
@@ -152,6 +166,10 @@ def _render_listings() -> str:
 <title>🏠 Annonces — Dashboard Immo</title>
 <style>
   * {{ box-sizing: border-box; }}
+  @keyframes pulse {{
+    0%, 100% {{ opacity: 1; }}
+    50% {{ opacity: 0.6; }}
+  }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }}
   .header {{ background: #1e293b; padding: 16px 32px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }}
   .header h1 {{ margin: 0; font-size: 1.4rem; }}
@@ -285,6 +303,37 @@ def _render_listings() -> str:
       return s;
     }};
 
+    // Best-time-to-call: 🟢🟡🔴 based on source type + current local time
+    const bestTimeToCall = (source) => {{
+      const PARTICULIERS = new Set(['leboncoin','pap','locservice','entreparticuliers','gensdeconfiance','bienici']);
+      const AGENCES = new Set(['fnaim','foncia','century21','laforet','guyhoquet','ladresse','seloger','logicimmo','wizi']);
+      const RESIDENCES = new Set(['studapart','immojeune','kley','inli','cdc_habitat','lodgis','parisattitude']);
+      const now = new Date();
+      const h = now.getHours();
+      const isWeekend = (now.getDay() === 0 || now.getDay() === 6);
+      let level = 'red', label = 'Pas le bon moment';
+      if (PARTICULIERS.has(source)) {{
+        if (isWeekend) {{
+          if (h >= 10 && h < 12) {{ level = 'green'; label = 'Bon moment (WE matin)'; }}
+          else if (h >= 9 && h < 18) {{ level = 'yellow'; label = 'Acceptable'; }}
+          else {{ level = 'red'; label = 'Trop tôt/tard'; }}
+        }} else {{
+          if (h >= 19 && h < 21) {{ level = 'green'; label = 'Bon moment (sem soir)'; }}
+          else if (h >= 12 && h < 22) {{ level = 'yellow'; label = 'Acceptable'; }}
+          else {{ level = 'red'; label = 'Trop tôt/tard'; }}
+        }}
+      }} else if (AGENCES.has(source)) {{
+        if ((h >= 10 && h < 12) || (h >= 14 && h < 17)) {{ level = 'green'; label = 'Bon moment (heures bureau)'; }}
+        else if (h >= 9 && h < 18 && !isWeekend) {{ level = 'yellow'; label = 'Acceptable'; }}
+        else {{ level = 'red'; label = isWeekend ? 'WE = agences fermées' : 'Hors horaires bureau'; }}
+      }} else if (RESIDENCES.has(source)) {{
+        if (!isWeekend && ((h >= 9 && h < 12) || (h >= 14 && h < 18))) {{ level = 'green'; label = 'Bon moment'; }}
+        else if (!isWeekend && h >= 8 && h < 19) {{ level = 'yellow'; label = 'Acceptable'; }}
+        else {{ level = 'red'; label = 'Hors horaires'; }}
+      }}
+      const emoji = level === 'green' ? '🟢' : level === 'yellow' ? '🟡' : '🔴';
+      return {{level, label, emoji}};
+    }};
     // Score tooltip parser: "PV=X Z=Y(zone) C=Z(min) F=W — note" → labeled multiline
     const buildScoreTooltip = (reason, finalScore) => {{
       if (!reason) return '';
@@ -319,15 +368,20 @@ def _render_listings() -> str:
       const newBadge = isNew ? '<span style="background:#ef4444;color:white;padding:1px 5px;border-radius:4px;font-size:0.7rem;font-weight:600;margin-right:4px">🔥 NEW</span>' : '';
       // 💎 OFF-RADAR: source not covered by Jinka
       const offRadarBadge = OFF_RADAR_SOURCES.has(r.source) ? '<span style="background:#8b5cf6;color:white;padding:1px 5px;border-radius:4px;font-size:0.7rem;font-weight:600;margin-right:4px" title="Source hors Jinka — moins de concurrence">💎</span>' : '';
-      // tel: clickable phone (strip non-digits for href)
-      const phoneCell = r.phone === '#blocked'
-        ? '🚫'
-        : (r.phone === '' || r.phone === null
-            ? '⚪'
-            : `<a href="tel:${{escape(r.phone.replace(/[^+\\d]/g, ''))}}" style="color:#22c55e;text-decoration:none;font-weight:600">📞 ${{escape(r.phone)}}</a>`);
+      // ⚠️ SCAM SUSPECT — animated red, top priority
+      const scamBadge = r.is_fraud ? `<span style="background:#dc2626;color:white;padding:2px 6px;border-radius:4px;font-size:0.7rem;font-weight:700;margin-right:4px;animation:pulse 1.5s infinite" title="${{escape(r.fraud_reason || 'Annonce suspecte')}}">⚠️ SCAM</span>` : '';
+      // tel: clickable phone + best-time-to-call indicator
+      let phoneCell;
+      if (r.phone === '#blocked') {{ phoneCell = '🚫'; }}
+      else if (r.phone === '' || r.phone === null) {{ phoneCell = '⚪'; }}
+      else {{
+        const t = bestTimeToCall(r.source);
+        const cleanTel = escape(r.phone.replace(/[^+\\d]/g, ''));
+        phoneCell = `<span title="${{escape(t.label)}}">${{t.emoji}}</span> <a href="tel:${{cleanTel}}" style="color:#22c55e;text-decoration:none;font-weight:600">📞 ${{escape(r.phone)}}</a>`;
+      }}
       return `<tr>
         <td><span class="src">${{emoji}} ${{escape(r.source)}}</span></td>
-        <td>${{newBadge}}${{offRadarBadge}}<a href="${{escape(r.url)}}" target="_blank">${{escape(r.title.slice(0, 60))}}</a></td>
+        <td>${{scamBadge}}${{newBadge}}${{offRadarBadge}}<a href="${{escape(r.url)}}" target="_blank">${{escape(r.title.slice(0, 60))}}</a></td>
         <td>${{typeBadge}}</td>
         <td>${{escape(r.location.slice(0, 30))}}</td>
         <td class="num"><b>${{price}}</b></td>
