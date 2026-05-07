@@ -20,7 +20,9 @@ import dashboard
 def main() -> None:
     out_dir = Path("public")
     out_dir.mkdir(parents=True, exist_ok=True)
-    html = dashboard._render_listings()
+    # GitHub Pages → mobile-first PWA (installed on phone).
+    # localhost dashboard keeps the dense table view via _render_listings().
+    html = dashboard._render_listings_mobile()
     (out_dir / "index.html").write_text(html, encoding="utf-8")
 
     # Also drop a contacts page (less critical, but useful)

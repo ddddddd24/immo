@@ -85,6 +85,280 @@ def _render_listings() -> str:
     #  - prix ≤ 1100€
     #  - exclure coloc/coliving avec >2 occupants
     #  - exclure résidence étudiante / chambre / coliving (type)
+    raw_listings = _query("""
+        SELECT l.lbc_id, l.source, l.title, l.price, l.surface, l.location,
+               l.url, l.scraped_at, l.published_at, l.phone, l.score, l.score_reason,
+               l.housing_type, l.roommate_count, l.available_from,
+               (SELECT c.status FROM contacts c WHERE c.listing_id = l.id ORDER BY c.id DESC LIMIT 1) as status
+        FROM listings l
+        WHERE l.price IS NOT NULL AND l.price <= 1100
+          AND l.housing_type NOT IN ('coliving', 'chambre', 'residence')
+          AND (
+            l.housing_type != 'coloc'
+            OR (l.roommate_count IS NOT NULL AND l.roommate_count <= 2)
+          )
+          -- Hide dealbreakers (score=0). NULL = not yet scored, keep visible.
+          AND (l.score IS NULL OR l.score > 0)
+          -- Stale filter: hide listings not seen in last 3 days (probably gone)
+          AND datetime(l.scraped_at) > datetime('now', '-3 days')
+        ORDER BY l.id ASC
+        LIMIT 10000
+    """)
+
+    # Cross-site dedup: same (price, surface, zip-or-city) across sites
+    # (LBC + SeLoger + Bien'ici listing the same property) → keep oldest only.
+    import re as _re
+    seen_keys: set = set()
+    listings = []
+    for l in raw_listings:
+        # Fingerprint: (price, surface, zip code OR first 8 chars city)
+        zm = _re.search(r"\b(\d{5})\b", l["location"] or "")
+        zip_or_city = zm.group(1) if zm else (l["location"] or "")[:8].lower()
+        key = (l["price"], l["surface"], zip_or_city) if l["surface"] else None
+        if key and key in seen_keys:
+            continue
+        if key:
+            seen_keys.add(key)
+        listings.append(l)
+    # Reverse to newest-first for display
+    listings = listings[::-1]
+    s = _stats()
+    sources = sorted({l["source"] for l in listings if l["source"]})
+    housing_types = sorted({l["housing_type"] for l in listings if l["housing_type"]})
+
+    # Build the rows once on the server; client-side JS handles sort/filter.
+    row_data = []
+    for l in listings:
+        ht = l["housing_type"] or ""
+        if ht in ("coloc", "coliving") and l["roommate_count"]:
+            ht_display = f"{ht} {l['roommate_count']}p"
+        else:
+            ht_display = ht
+        row_data.append({
+            "id": l["lbc_id"],
+            "source": l["source"] or "",
+            "title": l["title"] or "",
+            "price": l["price"],
+            "surface": l["surface"],
+            "location": l["location"] or "",
+            "url": l["url"] or "",
+            "score": l["score"],
+            "score_reason": l["score_reason"] or "",
+            "status": l["status"] or "",
+            "published": ((l["published_at"] or "")[7:17] if (l["published_at"] or "").startswith("scrape:") else (l["published_at"] or "")[:10]),
+            "published_is_scrape": (l["published_at"] or "").startswith("scrape:"),
+            "phone": l["phone"],  # None=unknown, ""=no phone, "#blocked"=site policy, else number
+            "available_from": l["available_from"] or "",  # YYYY-MM, "" if unknown
+            "housing_type": ht,
+            "housing_display": ht_display,
+        })
+
+    rows_json = json.dumps(row_data)
+    source_filter = ['<option value="">Toutes</option>'] + [
+        f'<option value="{_esc(s)}">{SOURCE_EMOJI.get(s, "⚪")} {_esc(s)}</option>'
+        for s in sources
+    ]
+    type_filter = ['<option value="">Tous types</option>'] + [
+        f'<option value="{_esc(t)}">{_esc(t)}</option>' for t in housing_types
+    ]
+
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>🏠 Annonces — Dashboard Immo</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }}
+  .header {{ background: #1e293b; padding: 16px 32px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }}
+  .header h1 {{ margin: 0; font-size: 1.4rem; }}
+  .nav {{ display: flex; gap: 8px; }}
+  .nav a {{ padding: 6px 12px; background: #0f172a; border-radius: 8px; color: #94a3b8; text-decoration: none; font-size: 0.85rem; border: 1px solid #334155; }}
+  .nav a:hover, .nav a.active {{ background: #2563eb; color: white; border-color: #2563eb; }}
+  .content {{ padding: 20px 32px; }}
+  .stats {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }}
+  .stat {{ background: #1e293b; border-radius: 10px; padding: 10px 16px; }}
+  .stat .label {{ font-size: 0.7rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }}
+  .stat .value {{ font-size: 1.5rem; font-weight: 700; margin-top: 2px; }}
+  .filters {{ background: #1e293b; border-radius: 10px; padding: 14px 18px; margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }}
+  .filters label {{ font-size: 0.8rem; color: #94a3b8; }}
+  .filters input, .filters select {{ background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 5px 10px; font-size: 0.85rem; }}
+  .filters input[type="number"] {{ width: 90px; }}
+  .filters select {{ min-width: 160px; }}
+  .filter-count {{ margin-left: auto; color: #94a3b8; font-size: 0.85rem; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; background: #1e293b; border-radius: 10px; overflow: hidden; }}
+  th {{ text-align: left; padding: 10px 12px; color: #cbd5e1; font-weight: 600; background: #0f172a; cursor: pointer; user-select: none; border-bottom: 2px solid #334155; }}
+  th:hover {{ background: #1e293b; }}
+  th .sort-arrow {{ display: inline-block; width: 10px; color: #475569; }}
+  th.asc .sort-arrow::after {{ content: "▲"; color: #3b82f6; }}
+  th.desc .sort-arrow::after {{ content: "▼"; color: #3b82f6; }}
+  td {{ padding: 8px 12px; border-bottom: 1px solid #263348; vertical-align: top; }}
+  tr:hover td {{ background: #263348; }}
+  a {{ color: #60a5fa; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.7rem; color: white; }}
+  .src {{ font-size: 0.75rem; color: #94a3b8; }}
+  .score {{ display: inline-block; padding: 2px 6px; border-radius: 6px; background: #fbbf24; color: #1f2937; font-weight: 600; font-size: 0.75rem; }}
+  .empty {{ padding: 40px; text-align: center; color: #64748b; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🏠 Annonces — {len(row_data)} en base</h1>
+  <div class="nav">
+    <a href="index.html" class="active">📋 Annonces</a>
+    <a href="contacts.html">✉️ Contacts</a>
+  </div>
+</div>
+<div class="content">
+  <div class="stats">
+    <div class="stat"><div class="label">Total</div><div class="value">{s['listings']}</div></div>
+    <div class="stat"><div class="label">En attente</div><div class="value" style="color:#9ca3af">{s['pending']}</div></div>
+    <div class="stat"><div class="label">Envoyés</div><div class="value" style="color:#3b82f6">{s['sent']}</div></div>
+    <div class="stat"><div class="label">Réponses</div><div class="value" style="color:#f59e0b">{s['responded']}</div></div>
+    <div class="stat"><div class="label">Positives</div><div class="value" style="color:#10b981">{s['positive']}</div></div>
+    <div class="stat"><div class="label">Visites</div><div class="value" style="color:#a78bfa">{s['visits']}</div></div>
+  </div>
+
+  <div class="filters">
+    <label>Source <select id="f-source">{"".join(source_filter)}</select></label>
+    <label>Type <select id="f-type">{"".join(type_filter)}</select></label>
+    <label>Prix max <input id="f-maxprice" type="number" placeholder="1000" /></label>
+    <label>m² min <input id="f-minsurface" type="number" placeholder="20" /></label>
+    <label>Recherche <input id="f-search" type="text" placeholder="titre / ville…" style="width:180px" /></label>
+    <span class="filter-count" id="count">{len(row_data)} annonces</span>
+  </div>
+
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th data-sort="source">Source <span class="sort-arrow"></span></th>
+        <th data-sort="title">Annonce <span class="sort-arrow"></span></th>
+        <th data-sort="housing_type">Type <span class="sort-arrow"></span></th>
+        <th data-sort="location">Ville <span class="sort-arrow"></span></th>
+        <th data-sort="price" class="num">Prix <span class="sort-arrow"></span></th>
+        <th data-sort="surface" class="num">m² <span class="sort-arrow"></span></th>
+        <th data-sort="score" class="num">Score <span class="sort-arrow"></span></th>
+        <th data-sort="status">Statut <span class="sort-arrow"></span></th>
+        <th data-sort="published">Publié <span class="sort-arrow"></span></th>
+        <th data-sort="available_from">🗝 Libre <span class="sort-arrow"></span></th>
+        <th data-sort="phone">📞 <span class="sort-arrow"></span></th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<script>
+  const ROWS = {rows_json};
+  const SOURCE_EMOJI = {json.dumps(SOURCE_EMOJI)};
+  const STATUS_COLOR = {json.dumps(STATUS_COLOR)};
+
+  let sortKey = "published";
+  let sortDir = -1;  // -1 desc, 1 asc
+
+  function render() {{
+    const src = document.getElementById('f-source').value;
+    const type = document.getElementById('f-type').value;
+    const maxPrice = parseInt(document.getElementById('f-maxprice').value) || null;
+    const minSurface = parseInt(document.getElementById('f-minsurface').value) || null;
+    const search = (document.getElementById('f-search').value || '').toLowerCase();
+
+    let rows = ROWS.filter(r => {{
+      if (src && r.source !== src) return false;
+      if (type && r.housing_type !== type) return false;
+      if (maxPrice && (r.price === null || r.price > maxPrice)) return false;
+      if (minSurface && (r.surface === null || r.surface < minSurface)) return false;
+      if (search) {{
+        const blob = (r.title + ' ' + r.location).toLowerCase();
+        if (!blob.includes(search)) return false;
+      }}
+      return true;
+    }});
+
+    rows.sort((a, b) => {{
+      const va = a[sortKey], vb = b[sortKey];
+      if (va === null && vb === null) return 0;
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      if (typeof va === 'number') return (va - vb) * sortDir;
+      return String(va).localeCompare(String(vb)) * sortDir;
+    }});
+
+    document.getElementById('count').textContent = rows.length + ' annonces';
+
+    const escape = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    // YYYY-MM-DD → DD/MM/YYYY ; YYYY-MM → MM/YYYY
+    const formatAvail = s => {{
+      if (!s) return '';
+      const m1 = /^(\d{{4}})-(\d{{2}})-(\d{{2}})$/.exec(s);
+      if (m1) return `${{m1[3]}}/${{m1[2]}}/${{m1[1]}}`;
+      const m2 = /^(\d{{4}})-(\d{{2}})$/.exec(s);
+      if (m2) return `${{m2[2]}}/${{m2[1]}}`;
+      return s;
+    }};
+
+    const tbody = document.getElementById('tbody');
+    tbody.innerHTML = rows.map(r => {{
+      const emoji = SOURCE_EMOJI[r.source] || '⚪';
+      const statusBadge = r.status
+        ? `<span class="badge" style="background:${{STATUS_COLOR[r.status] || '#475569'}}">${{r.status}}</span>`
+        : '<span style="color:#475569">—</span>';
+      const score = r.score
+        ? `<span class="score" title="${{escape(r.score_reason)}}">${{r.score}}/10</span>`
+        : '<span style="color:#475569">—</span>';
+      const surface = r.surface ? r.surface + 'm²' : '<span style="color:#475569">—</span>';
+      const price = r.price ? r.price + '€' : '<span style="color:#475569">—</span>';
+      const typeBadge = r.housing_display
+        ? `<span style="font-size:0.75rem;color:#cbd5e1;background:#334155;padding:2px 6px;border-radius:6px">${{escape(r.housing_display)}}</span>`
+        : '<span style="color:#475569">—</span>';
+      return `<tr>
+        <td><span class="src">${{emoji}} ${{escape(r.source)}}</span></td>
+        <td><a href="${{escape(r.url)}}" target="_blank">${{escape(r.title.slice(0, 60))}}</a></td>
+        <td>${{typeBadge}}</td>
+        <td>${{escape(r.location.slice(0, 30))}}</td>
+        <td class="num"><b>${{price}}</b></td>
+        <td class="num">${{surface}}</td>
+        <td class="num">${{score}}</td>
+        <td>${{statusBadge}}</td>
+        <td style="color:#64748b;font-size:0.75rem" title="${{r.published_is_scrape ? 'Date de scraping (ce site ne partage pas la date de publication)' : 'Date de publication réelle'}}">${{r.published ? (r.published_is_scrape ? '⏱ ' : '📅 ') + escape(r.published) : ''}}</td>
+        <td style="font-size:0.75rem" title="${{r.available_from ? 'Disponible à partir de ' + escape(formatAvail(r.available_from)) : 'Date de disponibilité non précisée dans l\\'annonce'}}">${{r.available_from ? '🗝 ' + escape(formatAvail(r.available_from)) : '<span style=\"color:#475569\">—</span>'}}</td>
+        <td title="${{r.phone === '#blocked' ? 'Site ne partage pas le téléphone' : (r.phone === '' || r.phone === null ? 'Pas de téléphone dans l\\'annonce' : escape(r.phone))}}">${{r.phone === '#blocked' ? '🚫' : (r.phone === '' || r.phone === null ? '⚪' : '📞 ' + escape(r.phone))}}</td>
+      </tr>`;
+    }}).join('') || '<tr><td colspan="11" class="empty">Aucune annonce ne matche les filtres.</td></tr>';
+
+    document.querySelectorAll('th').forEach(th => {{
+      th.classList.remove('asc', 'desc');
+      if (th.dataset.sort === sortKey) th.classList.add(sortDir === 1 ? 'asc' : 'desc');
+    }});
+  }}
+
+  document.querySelectorAll('th[data-sort]').forEach(th => {{
+    th.addEventListener('click', () => {{
+      const key = th.dataset.sort;
+      if (sortKey === key) sortDir = -sortDir;
+      else {{ sortKey = key; sortDir = (key === 'price' ? 1 : -1); }}
+      render();
+    }});
+  }});
+  ['f-source', 'f-type', 'f-maxprice', 'f-minsurface', 'f-search'].forEach(id => {{
+    document.getElementById(id).addEventListener('input', render);
+  }});
+
+  render();
+</script>
+</body>
+</html>"""
+
+
+# ─── /contacts — preserved from original (messages tab) ──────────────────────
+
+
+def _render_listings_mobile() -> str:
+    # Filtres adaptés au profil Illan + Iqleema (couple, max 1100€) :
+    #  - prix ≤ 1100€
+    #  - exclure coloc/coliving avec >2 occupants
+    #  - exclure résidence étudiante / chambre / coliving (type)
     # Cross-source dedup is applied at PERSIST time (see
     # database.apply_dedup_for_batch) — duplicates carry `dedup_of != NULL`
     # and are filtered out by the SQL clause below. Earliest-seen variant
@@ -1083,6 +1357,7 @@ def _render_listings() -> str:
 
 
 # ─── /contacts — preserved from original (messages tab) ──────────────────────
+
 
 def _render_contacts() -> str:
     contacts = _query("""
