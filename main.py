@@ -69,6 +69,8 @@ def _lower_priority() -> None:
 
 _lower_priority()
 
+_BOT_STARTED_AT = time.time()
+
 # ─── Campaign state ───────────────────────────────────────────────────────────
 
 _campaign_lock = asyncio.Lock()
@@ -2879,6 +2881,26 @@ def main() -> None:
         )
     else:
         logger.warning("[stale-cleanup] JobQueue unavailable — periodic check disabled")
+
+    # Daily healthcheck — proves the bot is alive every morning at 09:00.
+    # If you don't get one, the host is down.
+    from datetime import time as _dtime
+    async def _healthcheck_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            n_total = database.count_listings() if hasattr(database, "count_listings") else None
+            uptime_h = (time.time() - _BOT_STARTED_AT) / 3600
+            extra = f"\nListings DB: {n_total}" if n_total is not None else ""
+            await ctx.bot.send_message(
+                chat_id=config.TELEGRAM_CHAT_ID,
+                text=f"🟢 Bot alive — uptime {uptime_h:.1f}h{extra}",
+            )
+        except Exception as exc:
+            logger.warning("[healthcheck] failed: %s", exc)
+
+    if app.job_queue is not None:
+        app.job_queue.run_daily(
+            _healthcheck_job, time=_dtime(hour=9, minute=0), name="healthcheck",
+        )
 
     logger.info("Bot starting…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
