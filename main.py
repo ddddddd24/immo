@@ -45,6 +45,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _lower_priority() -> None:
+    """Reduce process footprint so the bot doesn't disturb interactive apps.
+
+    BELOW_NORMAL priority + CPU affinity to cores 0-3 (out of 12 on a 5600X).
+    Child processes (Camoufox/Playwright/Firefox/Chromium) inherit both on
+    Windows, so this propagates automatically.
+    """
+    try:
+        import psutil
+        p = psutil.Process(os.getpid())
+        if sys.platform == "win32":
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            ncpu = psutil.cpu_count(logical=True) or 4
+            p.cpu_affinity(list(range(min(4, ncpu))))
+        else:
+            p.nice(10)
+        logger.info("[hygiene] priority=BELOW_NORMAL, affinity=%s", p.cpu_affinity())
+    except Exception as e:
+        logger.warning("[hygiene] could not lower priority: %s", e)
+
+
+_lower_priority()
+
 # ─── Campaign state ───────────────────────────────────────────────────────────
 
 _campaign_lock = asyncio.Lock()

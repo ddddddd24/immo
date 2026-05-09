@@ -8,12 +8,32 @@ Two tabs:
   /contacts      → Contacts/messages tab (preserved from original)
 """
 import json
+import os
 import sqlite3
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 import config
+
+
+def _lower_priority() -> None:
+    """Run the dashboard at BELOW_NORMAL priority on cores 0-3."""
+    try:
+        import psutil
+        p = psutil.Process(os.getpid())
+        if sys.platform == "win32":
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            ncpu = psutil.cpu_count(logical=True) or 4
+            p.cpu_affinity(list(range(min(4, ncpu))))
+        else:
+            p.nice(10)
+    except Exception:
+        pass
+
+
+_lower_priority()
 
 _DB = config.DB_PATH
 
@@ -1555,7 +1575,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def run(port: int = 5000):
-    server = HTTPServer(("localhost", port), _Handler)
+    server = HTTPServer(("0.0.0.0", port), _Handler)
     print(f"Dashboard running at http://localhost:{port}")
     print("  /          → annonces (filtres + tri)")
     print("  /contacts  → contacts + visites")
