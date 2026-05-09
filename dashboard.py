@@ -98,6 +98,84 @@ def _stats() -> dict:
     """)[0]
 
 
+def _query_system_metrics(hours: int = 24) -> list[dict]:
+    """Return system_metrics rows from the last `hours` for the chart."""
+    import time as _time
+    cutoff = int(_time.time()) - hours * 3600
+    return _query(
+        """SELECT ts, bot_ram_mb, children_ram_mb, total_ram_mb,
+                  cpu_percent, warm_contexts, children_count
+           FROM system_metrics
+           WHERE ts >= ?
+           ORDER BY ts ASC""",
+        (cutoff,),
+    )
+
+
+def _render_system_stats() -> str:
+    rows = _query_system_metrics(hours=24)
+    latest = rows[-1] if rows else None
+    summary_html = ""
+    if latest:
+        summary_html = f"""
+        <div class="cards">
+          <div class="card"><div class="k">Total RAM</div><div class="v">{latest['total_ram_mb']:.0f} MB</div></div>
+          <div class="card"><div class="k">Bot</div><div class="v">{latest['bot_ram_mb']:.0f} MB</div></div>
+          <div class="card"><div class="k">Camoufox/Browsers</div><div class="v">{latest['children_ram_mb']:.0f} MB</div></div>
+          <div class="card"><div class="k">CPU%</div><div class="v">{latest['cpu_percent']:.1f}%</div></div>
+          <div class="card"><div class="k">Warm contexts</div><div class="v">{latest['warm_contexts']}</div></div>
+          <div class="card"><div class="k">Child processes</div><div class="v">{latest['children_count']}</div></div>
+        </div>
+        """
+    else:
+        summary_html = "<p>Aucune mesure encore — laisse tourner ~5 min.</p>"
+
+    data_json = json.dumps(rows)
+    return f"""<!doctype html>
+<html lang="fr"><head>
+<meta charset="utf-8"/><title>System Stats — immo bot</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+body{{font-family:system-ui,sans-serif;margin:2rem;background:#0f1115;color:#e5e7eb}}
+h1{{margin:0 0 1rem 0}}
+nav a{{color:#60a5fa;margin-right:1rem;text-decoration:none}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin:1.5rem 0}}
+.card{{background:#1f2937;padding:1rem;border-radius:8px}}
+.card .k{{font-size:.85rem;color:#9ca3af}}
+.card .v{{font-size:1.6rem;font-weight:600;margin-top:.25rem}}
+.chart-wrap{{background:#1f2937;padding:1rem;border-radius:8px;margin:1rem 0}}
+canvas{{max-height:280px}}
+</style>
+</head><body>
+<nav><a href="/">← Listings</a><a href="/contacts">Contacts</a><a href="/sys">System</a></nav>
+<h1>System stats — 24h</h1>
+{summary_html}
+
+<div class="chart-wrap"><canvas id="ramChart"></canvas></div>
+<div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
+<div class="chart-wrap"><canvas id="ctxChart"></canvas></div>
+
+<script>
+const data = {data_json};
+const labels = data.map(r => new Date(r.ts*1000).toLocaleTimeString('fr-FR',{{hour:'2-digit',minute:'2-digit'}}));
+const opt = {{responsive:true, maintainAspectRatio:false, scales:{{x:{{ticks:{{color:'#9ca3af'}}}},y:{{ticks:{{color:'#9ca3af'}},beginAtZero:true}}}}, plugins:{{legend:{{labels:{{color:'#e5e7eb'}}}}}}}};
+new Chart(document.getElementById('ramChart'), {{type:'line',data:{{labels,datasets:[
+  {{label:'Bot RAM (MB)',data:data.map(r=>r.bot_ram_mb),borderColor:'#60a5fa',backgroundColor:'rgba(96,165,250,.2)',fill:true,tension:.3}},
+  {{label:'Browsers RAM (MB)',data:data.map(r=>r.children_ram_mb),borderColor:'#f59e0b',backgroundColor:'rgba(245,158,11,.2)',fill:true,tension:.3}},
+  {{label:'Total (MB)',data:data.map(r=>r.total_ram_mb),borderColor:'#ef4444',borderDash:[4,4],fill:false,tension:.3}}
+]}},options:opt}});
+new Chart(document.getElementById('cpuChart'), {{type:'line',data:{{labels,datasets:[
+  {{label:'CPU% (tous process)',data:data.map(r=>r.cpu_percent),borderColor:'#10b981',backgroundColor:'rgba(16,185,129,.2)',fill:true,tension:.3}}
+]}},options:opt}});
+new Chart(document.getElementById('ctxChart'), {{type:'line',data:{{labels,datasets:[
+  {{label:'Warm contexts (Camoufox)',data:data.map(r=>r.warm_contexts),borderColor:'#a78bfa',fill:false,stepped:true}},
+  {{label:'Child processes',data:data.map(r=>r.children_count),borderColor:'#f472b6',fill:false,stepped:true}}
+]}},options:opt}});
+</script>
+</body></html>
+"""
+
+
 # ─── /  — listings browser ────────────────────────────────────────────────────
 
 def _render_listings() -> str:
@@ -1544,8 +1622,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_html(_render_listings())
         elif path in ("/contacts", "/contacts.html"):
             self._send_html(_render_contacts())
+        elif path in ("/sys", "/system", "/system-stats"):
+            self._send_html(_render_system_stats())
         elif path == "/api/stats":
             self._send_json(_stats())
+        elif path == "/api/sys":
+            self._send_json(_query_system_metrics())
         elif path == "/api/listings":
             data = _query("""
                 SELECT lbc_id, source, title, price, surface, location, url,

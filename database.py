@@ -84,6 +84,19 @@ def init_db() -> None:
                 ON contacts(status, sent_at);
             CREATE INDEX IF NOT EXISTS idx_responses_contact
                 ON responses(contact_id);
+
+            CREATE TABLE IF NOT EXISTS system_metrics (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              INTEGER NOT NULL,
+                bot_ram_mb      REAL    NOT NULL,
+                children_ram_mb REAL    NOT NULL,
+                total_ram_mb    REAL    NOT NULL,
+                cpu_percent     REAL    NOT NULL,
+                warm_contexts   INTEGER NOT NULL,
+                children_count  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_system_metrics_ts
+                ON system_metrics(ts);
         """)
     # Migrate existing DBs: add missing columns
     with _conn() as conn:
@@ -1136,3 +1149,48 @@ def is_duplicate(lbc_id: str) -> bool:
             "SELECT dedup_of FROM listings WHERE lbc_id = ?", (lbc_id,)
         ).fetchone()
     return bool(row and row["dedup_of"])
+
+
+# ─── System metrics ───────────────────────────────────────────────────────────
+
+def record_system_metrics(
+    bot_ram_mb: float,
+    children_ram_mb: float,
+    cpu_percent: float,
+    warm_contexts: int,
+    children_count: int,
+    retention_days: int = 7,
+) -> None:
+    """Persist a single (timestamped) snapshot and prune entries older than
+    `retention_days`. Called from the bot's JobQueue every 5 minutes.
+    """
+    import time as _time
+    now = int(_time.time())
+    cutoff = now - retention_days * 86400
+    total = bot_ram_mb + children_ram_mb
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO system_metrics
+               (ts, bot_ram_mb, children_ram_mb, total_ram_mb,
+                cpu_percent, warm_contexts, children_count)
+               VALUES (?,?,?,?,?,?,?)""",
+            (now, bot_ram_mb, children_ram_mb, total, cpu_percent,
+             warm_contexts, children_count),
+        )
+        conn.execute("DELETE FROM system_metrics WHERE ts < ?", (cutoff,))
+
+
+def get_system_metrics(hours: int = 24) -> list[dict]:
+    """Return all snapshots from the last `hours` ordered oldest -> newest."""
+    import time as _time
+    cutoff = int(_time.time()) - hours * 3600
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT ts, bot_ram_mb, children_ram_mb, total_ram_mb,
+                      cpu_percent, warm_contexts, children_count
+               FROM system_metrics
+               WHERE ts >= ?
+               ORDER BY ts ASC""",
+            (cutoff,),
+        ).fetchall()
+    return [dict(r) for r in rows]

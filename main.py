@@ -2882,6 +2882,45 @@ def main() -> None:
     else:
         logger.warning("[stale-cleanup] JobQueue unavailable — periodic check disabled")
 
+    # System metrics — snapshot bot + child browser RAM/CPU every 5 min.
+    # Persisted in SQLite (7-day retention) and exposed at /stats on the dashboard.
+    async def _metrics_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            import psutil
+            bot_proc = psutil.Process(os.getpid())
+            children = bot_proc.children(recursive=True)
+            bot_ram = bot_proc.memory_info().rss / (1024 * 1024)
+            children_ram = sum((c.memory_info().rss for c in children), 0.0) / (1024 * 1024)
+            # cpu_percent over a 1-second sample on the whole tree
+            bot_proc.cpu_percent(None)
+            for c in children:
+                try: c.cpu_percent(None)
+                except Exception: pass
+            await asyncio.sleep(1)
+            cpu = bot_proc.cpu_percent(None)
+            for c in children:
+                try: cpu += c.cpu_percent(None)
+                except Exception: pass
+            try:
+                from scraper import _CAMOUFOX_CTXS
+                warm = len(_CAMOUFOX_CTXS)
+            except Exception:
+                warm = 0
+            database.record_system_metrics(
+                bot_ram_mb=bot_ram,
+                children_ram_mb=children_ram,
+                cpu_percent=cpu,
+                warm_contexts=warm,
+                children_count=len(children),
+            )
+        except Exception as exc:
+            logger.warning("[metrics] failed: %s", exc)
+
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            _metrics_job, interval=300, first=60, name="system_metrics",
+        )
+
     # Daily healthcheck — proves the bot is alive every morning at 09:00.
     # If you don't get one, the host is down.
     from datetime import time as _dtime
