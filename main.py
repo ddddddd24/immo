@@ -2138,8 +2138,13 @@ async def cmd_autostart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         interval = _SOURCE_INTERVAL_S.get(label, DEFAULT_INTERVAL)
         source_key = label_to_key.get(label, label.lower())
         import random as _rand
+        from game_watcher import is_paused
         await asyncio.sleep(_rand.uniform(0, 30))
         while True:
+            # Honor game-watcher: skip cycles while a fullscreen game is up.
+            # In-flight scrapes have already finished by the time we get here.
+            while is_paused():
+                await asyncio.sleep(15)
             t0 = time.time()
             try:
                 logger.info("[auto-loop] %s starting…", label)
@@ -2805,6 +2810,30 @@ def main() -> None:
             logger.info("[SENTINEL] PAP sentinel loop started (75s polling)")
         except Exception as exc:
             logger.warning("[SENTINEL] PAP failed to start: %s", exc)
+        # Game watcher — pauses the per-source loops when a fullscreen game
+        # is foregrounded for >2 min; resumes when normal app for >30 sec.
+        try:
+            from game_watcher import watch_loop as _game_watch_loop
+            async def _notify_pause(proc: str) -> None:
+                try:
+                    await _app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=f"⏸️ Scrapers en pause — jeu détecté ({proc}).",
+                    )
+                except Exception:
+                    pass
+            async def _notify_resume(duration_s: float) -> None:
+                try:
+                    await _app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=f"▶️ Scrapers reprennent — pause {int(duration_s)}s.",
+                    )
+                except Exception:
+                    pass
+            asyncio.create_task(_game_watch_loop(notify_pause=_notify_pause, notify_resume=_notify_resume))
+            logger.info("[GAME-WATCHER] started (poll 10s, pause-after 120s, resume-after 30s)")
+        except Exception as exc:
+            logger.warning("[GAME-WATCHER] failed to start: %s", exc)
 
     async def _post_shutdown(_app):
         import scraper as _scraper_mod

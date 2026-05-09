@@ -8,6 +8,7 @@ beautifulsoup4>=4.12.0
 camoufox>=0.3.0
 lzstring>=1.0.4
 psutil>=5.9.0
+pywin32>=306; sys_platform == "win32"
 
 # Google Sheets sync (optional — comment out if not using)
 gspread>=6.0.0
