@@ -39,6 +39,11 @@ def purge_mock_listings() -> int:
 def init_db() -> None:
     """Create tables if they don't exist."""
     Path(config.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    # Switch to WAL once — it's a database-level setting that persists. WAL
+    # lets readers (dashboard) and writers (bot) operate concurrently without
+    # blocking each other.
+    with _conn() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
     with _conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS listings (
@@ -169,9 +174,14 @@ def init_db() -> None:
 
 @contextmanager
 def _conn():
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # synchronous=NORMAL is safe with WAL and ~3x faster on writes.
+    # busy_timeout lets the dashboard and bot share the DB without spurious
+    # "database is locked" errors when a write collides with a read.
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()

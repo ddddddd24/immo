@@ -19,16 +19,16 @@ import config
 
 
 def _lower_priority() -> None:
-    """Run the dashboard at BELOW_NORMAL priority on cores 0-3."""
+    """Run the dashboard at IDLE priority on cores 0-3."""
     try:
         import psutil
         p = psutil.Process(os.getpid())
         if sys.platform == "win32":
-            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            p.nice(psutil.IDLE_PRIORITY_CLASS)
             ncpu = psutil.cpu_count(logical=True) or 4
             p.cpu_affinity(list(range(min(4, ncpu))))
         else:
-            p.nice(10)
+            p.nice(19)
     except Exception:
         pass
 

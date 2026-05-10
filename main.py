@@ -35,34 +35,43 @@ from profile import PROFILE
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
+        RotatingFileHandler(
+            config.LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3,
+            encoding="utf-8",
+        ),
         logging.StreamHandler(sys.stdout),
     ],
 )
+# Silence Telegram long-poll spam (getUpdates every 10s = 8640/day INFO lines).
+# Real HTTP errors still surface at WARNING+.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
 def _lower_priority() -> None:
     """Reduce process footprint so the bot doesn't disturb interactive apps.
 
-    BELOW_NORMAL priority + CPU affinity to cores 0-3 (out of 12 on a 5600X).
-    Child processes (Camoufox/Playwright/Firefox/Chromium) inherit both on
-    Windows, so this propagates automatically.
+    IDLE priority + CPU affinity to cores 0-3 (out of 12 on a 5600X). IDLE
+    means the process only gets CPU when nothing else needs it — the user
+    never feels micro-lags from the bot. Child processes (Camoufox/Playwright/
+    Firefox/Chromium) inherit both on Windows, so this propagates automatically.
     """
     try:
         import psutil
         p = psutil.Process(os.getpid())
         if sys.platform == "win32":
-            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            p.nice(psutil.IDLE_PRIORITY_CLASS)
             ncpu = psutil.cpu_count(logical=True) or 4
             p.cpu_affinity(list(range(min(4, ncpu))))
         else:
-            p.nice(10)
-        logger.info("[hygiene] priority=BELOW_NORMAL, affinity=%s", p.cpu_affinity())
+            p.nice(19)
+        logger.info("[hygiene] priority=IDLE, affinity=%s", p.cpu_affinity())
     except Exception as e:
         logger.warning("[hygiene] could not lower priority: %s", e)
 
