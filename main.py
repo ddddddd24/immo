@@ -2162,12 +2162,21 @@ async def cmd_autostart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await asyncio.gather(*loops, return_exceptions=True)
 
     _auto_task = asyncio.create_task(_auto_loop())
+    # Persist so /autostart resumes automatically on next bot restart.
+    try:
+        database.set_state("autostart", "1")
+    except Exception as exc:
+        logger.warning("[autostart] failed to persist state: %s", exc)
 
 
 # ─── /autostop ────────────────────────────────────────────────────────────────
 
 async def cmd_autostop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global _auto_task
+    try:
+        database.set_state("autostart", "0")
+    except Exception as exc:
+        logger.warning("[autostop] failed to persist state: %s", exc)
     if _auto_task and not _auto_task.done():
         _auto_task.cancel()
         _auto_task = None
@@ -2619,6 +2628,35 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# ─── Synthetic Update/Context for boot-time autostart resume ─────────────────
+# When the bot restarts and /autostart was active, we need to call cmd_autostart
+# without a real Telegram message to reply to. These shims route reply_text() to
+# bot.send_message() on the configured chat, so the existing handler code works
+# unchanged.
+
+def _make_resume_update(bot, chat_id: int):
+    class _Msg:
+        async def reply_text(self, text: str, **kwargs):
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    class _Chat:
+        id = chat_id
+    class _Update:
+        effective_chat = _Chat()
+        effective_message = _Msg()
+        effective_user = None
+    return _Update()
+
+
+def _make_resume_ctx(bot):
+    class _Ctx:
+        pass
+    c = _Ctx()
+    c.bot = bot
+    c.args = []
+    c.bot_data = {}
+    return c
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -2834,6 +2872,19 @@ def main() -> None:
             logger.info("[GAME-WATCHER] started (poll 10s, pause-after 120s, resume-after 30s)")
         except Exception as exc:
             logger.warning("[GAME-WATCHER] failed to start: %s", exc)
+
+        # Auto-launch /autostart at boot unless the user has explicitly
+        # stopped it (state == "0"). First boot has no state → defaults to "1".
+        # This way launching run_bot.bat is enough — the 12 non-sentinel
+        # sources start scraping without any manual command.
+        try:
+            if database.get_state("autostart", "1") != "0":
+                fake_update = _make_resume_update(_app.bot, config.TELEGRAM_CHAT_ID)
+                fake_ctx = _make_resume_ctx(_app.bot)
+                await cmd_autostart(fake_update, fake_ctx)
+                logger.info("[autostart] auto-launched at boot")
+        except Exception as exc:
+            logger.warning("[autostart] auto-launch failed: %s", exc)
 
     async def _post_shutdown(_app):
         import scraper as _scraper_mod

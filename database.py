@@ -97,6 +97,11 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_system_metrics_ts
                 ON system_metrics(ts);
+
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
     # Migrate existing DBs: add missing columns
     with _conn() as conn:
@@ -1194,3 +1199,23 @@ def get_system_metrics(hours: int = 24) -> list[dict]:
             (cutoff,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ─── Bot state (key/value) ───────────────────────────────────────────────────
+# Survives restarts. Used to persist /autostart so it resumes on reboot.
+
+def set_state(key: str, value: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def get_state(key: str, default: Optional[str] = None) -> Optional[str]:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_state WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
