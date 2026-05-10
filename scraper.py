@@ -2700,7 +2700,12 @@ async def init_camoufox_pool(size: int = 2) -> int:
 
     Returns the number of contexts successfully warmed.
     """
-    sites = list(_NAMED_SITES) + ["_generic"]
+    # Only pre-warm contexts for sites with their own DataDome cookie jar
+    # (LBC, SeLoger, Logic-Immo). The "_generic" context is reserved for
+    # legacy fallback paths (Studapart/Bien'ici/Paris Attitude API failures,
+    # Roomlala) which are rare in practice — most Phase 2 scrapers now use
+    # pure HTTP APIs. Lazy-creating it on demand saves ~270 MB idle RAM.
+    sites = list(_NAMED_SITES)
     n = 0
     for site in sites:
         try:
@@ -2708,7 +2713,7 @@ async def init_camoufox_pool(size: int = 2) -> int:
             n += 1
         except Exception as exc:
             logger.warning("Could not pre-warm Camoufox context for %s: %s", site, exc)
-    logger.info("Camoufox contexts initialized: %d/%d ready", n, len(sites))
+    logger.info("Camoufox contexts initialized: %d/%d ready (_generic lazy)", n, len(sites))
     return n
 
 
