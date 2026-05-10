@@ -26,6 +26,39 @@ _APIFY_BASE = "https://api.apify.com/v2"
 _POLL_INTERVAL = 5
 _MAX_WAIT = 300
 
+# ─── Shared httpx client (singleton) ──────────────────────────────────────────
+# Each scraper creating its own AsyncClient = fresh TLS handshake + DNS lookup
+# + TCP setup per call. A shared pool amortizes those across cycles, especially
+# on paginated sources (FNAIM, Bien'ici, Studapart, CDC Habitat, Inli) and
+# parallel detail-enrichment loops. Closed in shutdown_camoufox_pool().
+_shared_httpx: Optional[httpx.AsyncClient] = None
+
+
+def _get_shared_httpx() -> httpx.AsyncClient:
+    """Return the process-wide AsyncClient, creating it lazily."""
+    global _shared_httpx
+    if _shared_httpx is None or _shared_httpx.is_closed:
+        _shared_httpx = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30.0,
+            ),
+        )
+    return _shared_httpx
+
+
+async def _close_shared_httpx() -> None:
+    global _shared_httpx
+    if _shared_httpx is not None and not _shared_httpx.is_closed:
+        try:
+            await _shared_httpx.aclose()
+        except Exception:
+            pass
+    _shared_httpx = None
+
 # Persistent browser profiles — keeps cookies/session across runs.
 # Per-site dirs to avoid cookie pollution across portals (LBC, PAP, Bien'ici, Logic-Immo).
 def _user_data_dir(site: str) -> str:
@@ -1568,7 +1601,8 @@ async def _apify_request(coro_factory) -> "httpx.Response":
 async def _run_actor(actor_id: str, input_payload: dict) -> list[dict]:
     headers = {"Content-Type": "application/json"}
     params = {"token": config.APIFY_API_KEY}
-    async with httpx.AsyncClient(timeout=30) as client:
+    client = _get_shared_httpx()
+    if True:
         resp = await _apify_request(
             lambda: client.post(
                 f"{_APIFY_BASE}/acts/{actor_id}/runs",
@@ -1849,8 +1883,8 @@ async def _fetch_bienici_single(url: str) -> Optional[Listing]:
         return None
     ad_id = m.group(1)
     try:
-        async with _httpx.AsyncClient(headers={"User-Agent": _HTTPX_UA}, timeout=20) as client:
-            detail = await _bienici_fetch_detail(client, ad_id)
+        client = _get_shared_httpx()
+        detail = await _bienici_fetch_detail(client, ad_id)
     except Exception as exc:
         logger.warning("[BIENICI single] fetch failed: %s", exc)
         return None
@@ -1903,12 +1937,14 @@ async def _search_bienici_with_playwright(search_url: str, max_results: int) -> 
     `search_url` is kept for dispatcher compat but ignored — we use the API
     directly.
     """
-    import httpx, json, urllib.parse
+    import json, urllib.parse
 
     MAX_BUDGET = 1100  # match dashboard hard cap, no need to fetch above-budget
     listings: list[Listing] = []
+    client = _get_shared_httpx()
+    headers = {"User-Agent": _HTTPX_UA}
     try:
-        async with httpx.AsyncClient(headers={"User-Agent": _HTTPX_UA}, timeout=20) as client:
+        if True:  # preserved indentation level for minimal diff
             page = 1
             while True:
                 filters = {
@@ -1924,7 +1960,7 @@ async def _search_bienici_with_playwright(search_url: str, max_results: int) -> 
                     "zoneIdsByTypes": {"zoneIds": [_BIENICI_IDF_ZONE_ID]},
                 }
                 qs = urllib.parse.urlencode({"filters": json.dumps(filters)})
-                r = await client.get(f"{_BIENICI_API}?{qs}")
+                r = await client.get(f"{_BIENICI_API}?{qs}", headers=headers, timeout=20.0)
                 if r.status_code != 200:
                     logger.warning("[BIENICI] API page %d: HTTP %s", page, r.status_code)
                     break
@@ -2539,16 +2575,15 @@ _HTTPX_HEADERS = {
 async def _fetch_pages_httpx(urls: list[str], timeout: int = 15) -> list[Optional[str]]:
     """Fetch a list of URLs in parallel via httpx. Returns HTML strings (or None
     on failure) in the same order as input. Used by SSR sites with no bot block."""
-    import httpx
-    async with httpx.AsyncClient(headers=_HTTPX_HEADERS, timeout=timeout, follow_redirects=True) as client:
-        async def _one(url: str) -> Optional[str]:
-            try:
-                r = await client.get(url)
-                return r.text if r.status_code == 200 else None
-            except Exception as exc:
-                logger.warning("httpx fetch failed for %s: %s", url, exc)
-                return None
-        return await asyncio.gather(*(_one(u) for u in urls))
+    client = _get_shared_httpx()
+    async def _one(url: str) -> Optional[str]:
+        try:
+            r = await client.get(url, headers=_HTTPX_HEADERS, timeout=timeout)
+            return r.text if r.status_code == 200 else None
+        except Exception as exc:
+            logger.warning("httpx fetch failed for %s: %s", url, exc)
+            return None
+    return await asyncio.gather(*(_one(u) for u in urls))
 
 
 async def _fetch_pages_curl_cffi(urls: list[str], timeout: int = 15, impersonate: str = "chrome120") -> list[Optional[str]]:
@@ -2678,12 +2713,14 @@ async def init_camoufox_pool(size: int = 2) -> int:
 
 
 async def shutdown_camoufox_pool() -> None:
-    """Close every warm Camoufox context. Called from main.py on bot shutdown."""
+    """Close every warm Camoufox context + shared httpx client. Called from
+    main.py on bot shutdown."""
     sites = list(_CAMOUFOX_CTXS.keys())
     for site in sites:
         await _close_site_context(site)
     _CAMOUFOX_LOCKS.clear()
-    logger.info("Camoufox contexts shut down")
+    await _close_shared_httpx()
+    logger.info("Camoufox contexts + httpx client shut down")
 
 
 async def _fetch_html_with_camoufox(
@@ -2989,7 +3026,8 @@ async def _search_studapart_with_playwright(search_url: str, max_results: int) -
     seen_ids: set[str] = set()
 
     try:
-        async with _httpx.AsyncClient(headers=headers, timeout=30) as client:
+        client = _get_shared_httpx()
+        if True:
             for attempt in range(8):  # cap pagination loops
                 # Inject must_not.terms.distinctId on every Elasticsearch body in 'data'
                 body_obj = json.loads(base_body)
@@ -3002,7 +3040,8 @@ async def _search_studapart_with_playwright(search_url: str, max_results: int) -
                                     {"terms": {"distinctId": list(seen_ids)}}
                                 )
 
-                r = await client.post(_STUDAPART_API_URL, content=json.dumps(body_obj))
+                r = await client.post(_STUDAPART_API_URL, content=json.dumps(body_obj),
+                                      headers=headers, timeout=30.0)
                 if r.status_code != 200:
                     logger.warning("[STUDAPART] API attempt %d: HTTP %s", attempt + 1, r.status_code)
                     break
@@ -3193,12 +3232,11 @@ async def _search_parisattitude_with_playwright(search_url: str, max_results: in
 
     `search_url` is kept for dispatcher signature compatibility but ignored.
     """
-    import httpx
-
     MAX_BUDGET = 1500  # Cover Illan's 1000€ + margin for "almost in budget" listings
     listings: list[Listing] = []
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        client = _get_shared_httpx()
+        if True:
             page = 1
             while True:
                 body = {
@@ -3208,7 +3246,7 @@ async def _search_parisattitude_with_playwright(search_url: str, max_results: in
                     "mode": 1,
                     "maxBudget": MAX_BUDGET,
                 }
-                r = await client.post(_PA_SEARCH_API, json=body)
+                r = await client.post(_PA_SEARCH_API, json=body, timeout=30.0)
                 if r.status_code != 200:
                     logger.warning("[PARISATTITUDE] API page %d: HTTP %s", page, r.status_code)
                     break
@@ -3419,12 +3457,12 @@ async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> l
     if listings:
         sem = asyncio.Semaphore(10)
         UA = {"User-Agent": _HTTPX_UA}
-        import httpx as _httpx
-        async with _httpx.AsyncClient(headers=UA, timeout=15, follow_redirects=True) as client:
+        client = _get_shared_httpx()
+        if True:
             async def _enrich(lst):
                 async with sem:
                     try:
-                        r = await client.get(lst.url)
+                        r = await client.get(lst.url, headers=UA, timeout=15.0)
                         if r.status_code != 200:
                             return None
                         info = _lodgis_enrich_detail(r.text)
@@ -3602,12 +3640,12 @@ async def _search_immojeune_with_playwright(search_url: str, max_results: int) -
     # Phase 2: detail-page enrichment for icon-based features
     if listings:
         sem = asyncio.Semaphore(10)
-        import httpx as _httpx
-        async with _httpx.AsyncClient(headers={"User-Agent": _HTTPX_UA}, timeout=15, follow_redirects=True) as client:
+        client = _get_shared_httpx()
+        if True:
             async def _enrich(lst):
                 async with sem:
                     try:
-                        r = await client.get(lst.url)
+                        r = await client.get(lst.url, headers={"User-Agent": _HTTPX_UA}, timeout=15.0)
                         if r.status_code != 200:
                             return None
                         info = _immojeune_enrich_detail(r.text)
@@ -3808,12 +3846,12 @@ async def _search_locservice_with_playwright(search_url: str, max_results: int) 
 
     if listings:
         sem = asyncio.Semaphore(10)
-        import httpx as _httpx
-        async with _httpx.AsyncClient(headers={"User-Agent": _HTTPX_UA}, timeout=15, follow_redirects=True) as client:
+        client = _get_shared_httpx()
+        if True:
             async def _enrich(lst):
                 async with sem:
                     try:
-                        r = await client.get(lst.url)
+                        r = await client.get(lst.url, headers={"User-Agent": _HTTPX_UA}, timeout=15.0)
                         if r.status_code != 200: return None
                         info = _locservice_enrich_detail(r.text)
                     except Exception:
