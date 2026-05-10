@@ -74,7 +74,7 @@ async def _pw_get_next_data(url: str, site: str = "leboncoin") -> Optional[dict]
         async with async_playwright() as pw:
             ctx = await pw.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
-                headless=False,
+                headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--window-size=1280,800",
@@ -2246,7 +2246,7 @@ async def _fetch_html_with_stealth(
     async with async_playwright() as pw:
         ctx = await pw.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
-            headless=False,
+            headless=True,
             args=["--disable-blink-features=AutomationControlled", "--window-size=1280,800"],
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
