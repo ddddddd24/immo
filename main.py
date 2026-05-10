@@ -2861,15 +2861,24 @@ def main() -> None:
         # is foregrounded for >2 min; resumes when normal app for >30 sec.
         try:
             from game_watcher import watch_loop as _game_watch_loop
-            async def _notify_pause(proc: str) -> None:
+            async def _notify_pause(reason: str) -> None:
+                # User-active pause is too noisy to push to Telegram (fires
+                # every time the user touches the keyboard for >30s). Only
+                # notify on game pause.
+                if reason != "game":
+                    return
                 try:
                     await _app.bot.send_message(
                         chat_id=config.TELEGRAM_CHAT_ID,
-                        text=f"⏸️ Scrapers en pause — jeu détecté ({proc}).",
+                        text="⏸️ Scrapers en pause — jeu fullscreen détecté.",
                     )
                 except Exception:
                     pass
             async def _notify_resume(duration_s: float) -> None:
+                # Symmetric: only announce resumes for pauses worth knowing
+                # about (>2 min, i.e. probably the game pause we notified on).
+                if duration_s < 120:
+                    return
                 try:
                     await _app.bot.send_message(
                         chat_id=config.TELEGRAM_CHAT_ID,

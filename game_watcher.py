@@ -1,18 +1,25 @@
-"""Pause the scrapers when a fullscreen game is in focus.
+"""Pause the scrapers when a fullscreen game is in focus OR the user is
+actively using the PC (mouse/keyboard input within the last 30 seconds).
 
-Detects fullscreen + borderless-windowed apps (window size == screen size).
-A whitelist of "definitely not a game" processes prevents false positives
-when, e.g., Brave is running YouTube fullscreen.
+Two independent triggers, OR'd together:
+  1. Game pause — fullscreen + borderless-windowed apps (window size ==
+     screen size). Prevents the bot from hogging CPU/GPU during gaming.
+  2. User-active pause — keyboard or mouse input within USER_ACTIVE_S
+     means "user is at the desk", so don't run heavy scrapes that
+     could cause micro-lags. Sentinels (LBC/PAP) keep running, only the
+     auto-loop cycles are gated.
 
 Hysteresis:
-  - Foreground app detected as fullscreen for >120 sec  -> set paused = True
-  - Foreground app NOT fullscreen for >30 sec           -> set paused = False
+  - Foreground app detected as fullscreen for >120 sec  -> game pause
+  - Foreground app NOT fullscreen for >30 sec           -> game resume
+  - Last input <30s ago                                  -> user-active pause
+  - Last input >120s ago                                 -> user-active resume
 
 Scrapers call `is_paused()` before starting a cycle. In-flight scrapes finish
 naturally — we don't kill anything.
 
-Windows-only (uses pywin32). On other platforms `is_paused()` always returns
-False, so the bot behaves normally.
+Windows-only (uses pywin32 + Win32 GetLastInputInfo). On other platforms
+`is_paused()` always returns False, so the bot behaves normally.
 """
 from __future__ import annotations
 
@@ -25,13 +32,16 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # State, read by scrapers via is_paused()
-_paused: bool = False
+_paused_game: bool = False  # fullscreen-game pause
+_paused_user: bool = False  # user-active pause
 _pause_started_at: Optional[float] = None  # epoch when current pause began
 _last_state_change: float = 0.0
 
 # Hysteresis thresholds (seconds)
 PAUSE_AFTER_FULLSCREEN_S = 120
 RESUME_AFTER_NORMAL_S = 30
+USER_ACTIVE_S = 30      # last input within → pause heavy scrapes
+USER_IDLE_S = 120       # last input older than → resume
 POLL_INTERVAL_S = 10
 
 # Process names that look fullscreen but are NOT games
@@ -48,16 +58,43 @@ _WHITELIST = {
 
 def is_paused() -> bool:
     """True iff scrapers should hold off starting new work."""
-    return _paused
+    return _paused_game or _paused_user
 
 
 def get_state() -> dict:
     """Snapshot for /sys dashboard."""
+    paused = is_paused()
     return {
-        "paused": _paused,
-        "pause_seconds": int(time.time() - _pause_started_at) if _paused and _pause_started_at else 0,
+        "paused": paused,
+        "paused_reason": (
+            "game" if _paused_game else ("user-active" if _paused_user else None)
+        ),
+        "pause_seconds": int(time.time() - _pause_started_at) if paused and _pause_started_at else 0,
         "last_change_seconds_ago": int(time.time() - _last_state_change) if _last_state_change else None,
     }
+
+
+def _user_idle_seconds() -> float:
+    """Seconds since last keyboard/mouse input. Returns inf on non-Windows
+    or any API failure (so the user-active pause silently disables)."""
+    if sys.platform != "win32":
+        return float("inf")
+    try:
+        import ctypes
+        from ctypes import Structure, c_uint, byref, sizeof, windll
+
+        class LASTINPUTINFO(Structure):
+            _fields_ = [("cbSize", c_uint), ("dwTime", c_uint)]
+
+        info = LASTINPUTINFO()
+        info.cbSize = sizeof(LASTINPUTINFO)
+        if not windll.user32.GetLastInputInfo(byref(info)):
+            return float("inf")
+        tick_now = windll.kernel32.GetTickCount()
+        # GetTickCount wraps every ~49 days; clamp negative deltas to 0
+        return max(0.0, (tick_now - info.dwTime) / 1000.0)
+    except Exception:
+        return float("inf")
 
 
 def _foreground_process_name() -> str:
@@ -137,44 +174,63 @@ def _should_treat_as_game() -> bool:
 
 
 async def watch_loop(notify_pause=None, notify_resume=None) -> None:
-    """Run forever. Optionally call `notify_pause(proc_name)` /
-    `notify_resume()` (async callables) on state transitions, e.g. to send
-    a Telegram message.
+    """Run forever. Optionally call `notify_pause(reason)` / `notify_resume()`
+    (async callables) on aggregate-state transitions (only fires when
+    is_paused() actually flips), e.g. to send a Telegram message.
     """
-    global _paused, _pause_started_at, _last_state_change
+    global _paused_game, _paused_user, _pause_started_at, _last_state_change
     fullscreen_since: Optional[float] = None
     normal_since: Optional[float] = None
 
     while True:
         try:
-            looks_like_game = _should_treat_as_game()
             now = time.time()
+            was_paused = _paused_game or _paused_user
 
+            # ── Branch 1: fullscreen-game detection (existing logic) ──
+            looks_like_game = _should_treat_as_game()
             if looks_like_game:
                 normal_since = None
                 if fullscreen_since is None:
                     fullscreen_since = now
-                if not _paused and (now - fullscreen_since) >= PAUSE_AFTER_FULLSCREEN_S:
-                    proc = _foreground_process_name()
-                    _paused = True
-                    _pause_started_at = now
-                    _last_state_change = now
-                    logger.info("[game-watcher] PAUSED — fullscreen process=%s", proc)
-                    if notify_pause:
-                        try:
-                            await notify_pause(proc)
-                        except Exception:
-                            pass
+                if not _paused_game and (now - fullscreen_since) >= PAUSE_AFTER_FULLSCREEN_S:
+                    _paused_game = True
+                    logger.info("[game-watcher] GAME pause — process=%s", _foreground_process_name())
             else:
                 fullscreen_since = None
                 if normal_since is None:
                     normal_since = now
-                if _paused and (now - normal_since) >= RESUME_AFTER_NORMAL_S:
+                if _paused_game and (now - normal_since) >= RESUME_AFTER_NORMAL_S:
+                    _paused_game = False
+                    logger.info("[game-watcher] GAME resume")
+
+            # ── Branch 2: user-active detection (new) ──
+            idle_s = _user_idle_seconds()
+            if idle_s < USER_ACTIVE_S:
+                if not _paused_user:
+                    _paused_user = True
+                    logger.info("[game-watcher] USER-active pause (idle=%.0fs)", idle_s)
+            elif idle_s >= USER_IDLE_S:
+                if _paused_user:
+                    _paused_user = False
+                    logger.info("[game-watcher] USER-idle resume (idle=%.0fs)", idle_s)
+            # else: 30 ≤ idle_s < 120 → keep current state (hysteresis band)
+
+            # ── Aggregate transition + Telegram notification ──
+            now_paused = _paused_game or _paused_user
+            if now_paused != was_paused:
+                _last_state_change = now
+                if now_paused:
+                    _pause_started_at = now
+                    reason = "game" if _paused_game else "user-active"
+                    if notify_pause:
+                        try:
+                            await notify_pause(reason)
+                        except Exception:
+                            pass
+                else:
                     duration = now - (_pause_started_at or now)
-                    _paused = False
                     _pause_started_at = None
-                    _last_state_change = now
-                    logger.info("[game-watcher] RESUMED — was paused %.0fs", duration)
                     if notify_resume:
                         try:
                             await notify_resume(duration)
