@@ -915,6 +915,87 @@ async def _search_with_playwright(search_url: str, max_results: int) -> list[Lis
     return listings
 
 
+async def _search_lbc_with_api(search_url: str, max_results: int = 35) -> list[Listing]:
+    """LBC scraper via the mobile API (curl_cffi + safari17_0 fingerprint).
+
+    The web SSR (`www.leboncoin.fr/recherche`) is heavily DataDome-protected;
+    headless Playwright AND Camoufox both started getting 1.5KB challenge
+    pages instead of HTML around 2026-05-10. The mobile API at
+    `api.leboncoin.fr/finder/search` accepts curl_cffi requests with no
+    challenge (verified by the LBC sentinel running 60s polls for weeks
+    with 0 failures).
+
+    Returns the same Listing shape as `_search_with_playwright`: each ad
+    in the JSON response carries `body`, `attributes`, `location`, `owner`,
+    `images`, `first_publication_date` — i.e. everything `_ad_to_listing`
+    consumes. Falls back to the Playwright scraper on 403/429 (DataDome
+    catching up) or on any other error.
+
+    Filters are hardcoded to `_lbc_default_filters()` — the same filter
+    the sentinel uses. URL query params (price/region) on `search_url`
+    are NOT respected; the caller's intent is reflected in DEFAULT_SEARCH_URL
+    which matches the hardcoded filter shape.
+    """
+    if not _CCFFI_AVAILABLE:
+        logger.warning("[LBC-API] curl_cffi unavailable — falling back to Playwright")
+        return await _search_with_playwright(search_url, max_results)
+
+    headers = {
+        "api_key": _LBC_API_KEY,
+        "User-Agent": random.choice(_LBC_UAS),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Connection": "close",
+    }
+    body = {
+        "limit": min(max_results, 100),
+        "limit_alu": min(max_results, 100),
+        "sort_by": "time",
+        "sort_order": "desc",
+        "filters": _lbc_default_filters(),
+    }
+
+    logger.info("[LBC-API] Fetching up to %d listings via mobile API", max_results)
+    t0 = time.time()
+    try:
+        def _do():
+            return _ccffi.post(_LBC_API_URL, headers=headers, json=body,
+                               impersonate="safari17_0", timeout=15)
+        r = await asyncio.to_thread(_do)
+    except Exception as exc:
+        logger.warning("[LBC-API] request raised: %s — falling back to Playwright", exc)
+        return await _search_with_playwright(search_url, max_results)
+
+    if r.status_code in (403, 429):
+        is_dd = "captcha-delivery" in (r.text or "")[:200]
+        logger.warning("[LBC-API] HTTP %d (DataDome=%s) — falling back to Playwright",
+                       r.status_code, is_dd)
+        return await _search_with_playwright(search_url, max_results)
+    if r.status_code != 200:
+        logger.warning("[LBC-API] HTTP %d — falling back to Playwright", r.status_code)
+        return await _search_with_playwright(search_url, max_results)
+
+    try:
+        payload = r.json() or {}
+    except Exception:
+        logger.warning("[LBC-API] non-JSON response — falling back to Playwright")
+        return await _search_with_playwright(search_url, max_results)
+
+    ads = _ensure_list(payload.get("ads"))
+    listings: list[Listing] = []
+    for ad in ads:
+        if not isinstance(ad, dict):
+            continue
+        ad_url = ad.get("url") or f"https://www.leboncoin.fr/ad/locations/{ad.get('list_id')}"
+        l = _ad_to_listing(ad, url=ad_url)
+        if l:
+            listings.append(l)
+
+    logger.info("[LBC-API] Parsed %d/%d listings in %.1fs",
+                len(listings), len(ads), time.time() - t0)
+    return listings
+
+
 async def _fetch_single_with_playwright(lbc_url: str) -> Optional[Listing]:
     logger.info("[PLAYWRIGHT] Fetching single listing: %s", lbc_url)
     data = await _pw_get_next_data(lbc_url)
@@ -3888,15 +3969,12 @@ async def _search_locservice_with_playwright(search_url: str, max_results: int) 
 # ─── EntreParticuliers / L'Adresse / Century 21 (3 new agency/p2p sites) ─────
 
 async def _search_entreparticuliers(search_url: str, max_results: int) -> list[Listing]:
-    """EntreParticuliers — 12 listings per dept page. 2026-05-05 update :
-    we loop the 8 IDF *departments* (75/77/78/91/92/93/94/95) in parallel —
-    each dept URL renders 12 unique recent listings.
-    `search_url` is ignored — we use the per-dept index URL pattern.
-
-    Note the live href pattern is `/appartement/location/{city-slug}/{listing-slug}/ref-{id}`
-    (TWO slug segments before /ref-), which the previous single-segment regex
-    failed to match. Fixed inline.
+    """EntreParticuliers — Angular SSR site. Every listing's full payload (prix,
+    titre, surface, commune, piecesnb, estPro, etc.) lives inside the ng-state
+    JSON blob embedded in the page; the rendered HTML around the href has no
+    prices. We loop the 8 IDF dept URLs and parse each ng-state.
     """
+    import json as _json
     base = "https://www.entreparticuliers.com/annonces-immobilieres/location/appartement"
     idf_depts = [
         "paris-75",
@@ -3912,45 +3990,53 @@ async def _search_entreparticuliers(search_url: str, max_results: int) -> list[L
     htmls = await _fetch_pages_curl_cffi(pages)
     listings: list[Listing] = []
     seen: set[str] = set()
+
+    def _iter_annonces(html: str):
+        m = _re.search(r'<script[^>]+ng-state[^>]*>(.*?)</script>', html, _re.DOTALL)
+        if not m:
+            return
+        try:
+            blob = _json.loads(m.group(1))
+        except _json.JSONDecodeError:
+            return
+        for top_v in (blob or {}).values():
+            if not isinstance(top_v, dict):
+                continue
+            inner = top_v.get("b") or {}
+            for ann in (inner.get("hydra:member") or []):
+                if isinstance(ann, dict) and ann.get("id"):
+                    yield ann
+
     for html in htmls:
         if not html:
             continue
-        # ref pattern: href="/annonces-immobilieres/appartement/location/{city-slug}/{listing-slug}/ref-{id}"
-        for m in _re.finditer(
-            r'href="(/annonces-immobilieres/appartement/location/([a-z0-9-]+)/[a-z0-9-]+/ref-(\d+))"',
-            html,
-        ):
-            href, slug, rid = m.group(1), m.group(2), m.group(3)
+        for ann in _iter_annonces(html):
+            rid = str(ann.get("id"))
             if rid in seen:
                 continue
             seen.add(rid)
-            url = "https://www.entreparticuliers.com" + href
-            # Extract surface from slug if possible (e.g. "studio-de-20m2")
-            surface = None
-            sm = _re.search(r"(\d+)\s*m2", slug)
-            if sm:
-                try: surface = int(sm.group(1))
-                except ValueError: pass
-            # Try to find price near the href in the HTML
-            ctx = html[max(0, m.start() - 500): m.end() + 200]
-            price = None
-            pm = _re.search(r"(\d[\d\s]{1,5})\s*€", ctx)
-            if pm:
-                digits = "".join(c for c in pm.group(1) if c.isdigit())
-                if digits:
-                    try: price = int(digits)
-                    except ValueError: pass
+            # commune may be a string ("Paris (75001)") or a dict — both seen
+            commune = ann.get("commune")
+            if isinstance(commune, dict):
+                location = commune.get("nom") or commune.get("libelle") or ""
+                cp = commune.get("codePostal") or commune.get("cp") or ""
+                if cp:
+                    location = f"{location}, {cp}".strip(", ")
+            else:
+                location = str(commune or "")
+            est_pro = bool(ann.get("estPro"))
+            url = f"https://www.entreparticuliers.com/annonces-immobilieres/appartement/location/ref-{rid}"
             listings.append(Listing(
                 lbc_id=f"ep_{rid}",
-                title=slug.replace("-", " ").capitalize()[:200],
+                title=(ann.get("titre") or "")[:200],
                 description="",
-                price=price,
-                location=slug,  # arrondissement embedded in slug
-                seller_name="Particulier",
+                price=ann.get("prix") if isinstance(ann.get("prix"), int) else None,
+                location=location,
+                seller_name="Pro" if est_pro else "Particulier",
                 url=url,
-                seller_type_hint="particulier",
+                seller_type_hint="pro" if est_pro else "particulier",
                 source="entreparticuliers",
-                surface=surface,
+                surface=ann.get("surface") if isinstance(ann.get("surface"), int) else None,
             ))
             if len(listings) >= max_results:
                 break
@@ -4077,9 +4163,15 @@ async def _search_century21(search_url: str, max_results: int) -> list[Listing]:
             if sm:
                 try: surface = int(sm.group(1))
                 except ValueError: pass
-            # Title hint: nearby text
-            title_m = _re.search(r"(Appartement|Studio|Maison|Loft)\b[^<]{0,80}", ctx)
-            title = title_m.group(0).strip() if title_m else "Appartement"
+            # Title sits in `aria-label="Appartement F3 à louer PARIS"`. The
+            # previous `[^<]{0,80}` regex read past the closing quote and
+            # leaked HTML attribute boundary tokens (`" >`) into the title.
+            title_m = _re.search(r'aria-label="([^"]{4,160})"', ctx)
+            if title_m:
+                title = title_m.group(1).strip()
+            else:
+                tm2 = _re.search(r"(Appartement|Studio|Maison|Loft)\b[^<\"]{0,80}", ctx)
+                title = tm2.group(0).strip() if tm2 else "Appartement"
             # Extract location: look for "(XXXXX)" zipcode in the surrounding ctx,
             # or city slug in the page title. Falls back to "Paris" if nothing.
             zip_m = _re.search(r"\((\d{5})\)", ctx)
@@ -5399,21 +5491,20 @@ _lbc_sentinel_consec_fails: int = 0
 
 
 def _lbc_default_filters() -> dict:
+    # Departments cover petite couronne (Paris + 92/93/94) — encompasses the
+    # 22 inner-ring cities the previous city-label filter listed. The city-label
+    # form was silently ignored by the API (returned France-wide results); the
+    # sentinel never noticed because it only reads list_id for change detection.
     return {
         "category": {"id": "10"},
         "enums": {"real_estate_type": ["1", "2"], "furnished": ["1"]},
         "ranges": {"price": {"max": 1100}, "square": {"min": 25}},
         "location": {
             "locations": [
-                {"locationType": "city", "label": city} for city in [
-                    "Paris", "Boulogne-Billancourt", "Neuilly-sur-Seine",
-                    "Levallois-Perret", "Clichy", "Issy-les-Moulineaux",
-                    "Montrouge", "Malakoff", "Vanves", "Ivry-sur-Seine",
-                    "Le Kremlin-Bicêtre", "Charenton-le-Pont", "Saint-Mandé",
-                    "Vincennes", "Montreuil", "Bagnolet", "Pantin",
-                    "Saint-Ouen", "Aubervilliers", "Alfortville",
-                    "Maisons-Alfort", "Saint-Maur-des-Fossés",
-                ]
+                {"locationType": "department", "department_id": "75", "label": "Paris"},
+                {"locationType": "department", "department_id": "92", "label": "Hauts-de-Seine"},
+                {"locationType": "department", "department_id": "93", "label": "Seine-Saint-Denis"},
+                {"locationType": "department", "department_id": "94", "label": "Val-de-Marne"},
             ]
         },
     }
@@ -5657,7 +5748,9 @@ async def search_listings(search_url: str, max_results: int = 50) -> list[Listin
         })
         listings = [l for l in (_item_to_listing(i) for i in items) if l]
     else:
-        listings = await _search_with_playwright(search_url, max_results)
+        # LBC: mobile API via curl_cffi bypasses DataDome on the web SSR.
+        # Falls back to Playwright internally on 403/429.
+        listings = await _search_lbc_with_api(search_url, max_results)
 
     if listings:
         _SCRAPE_CACHE[cache_key] = (time.time(), listings)

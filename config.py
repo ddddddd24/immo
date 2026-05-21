@@ -71,19 +71,18 @@ DEFAULT_SEARCH_URL: str = (
     "&locations=r_12"
 )
 
-# Default SeLoger search URL — IDF entier (8 départements).
-# Replaces the previous transit isochrone (STRTFR4409045 = 60min Transit), which
-# biased toward Paris + inner ring and missed départements 77/78/91/95.
-# locations payload is base64-encoded JSON: {"placeIds":["AD08FR75","AD08FR77",
-# "AD08FR78","AD08FR91","AD08FR92","AD08FR93","AD08FR94","AD08FR95"]} — one
-# admin-division ID per IDF département (AD08FR{depcode}).
-# priceMax bumped 1000→1100 to match LBC default and budget headroom.
+# Default SeLoger search URL — 60min Transit isochrone from Rue Camille Moke.
+# The 2026-05-07 attempt at switching to per-département placeIds
+# (AD08FR75..AD08FR95) returned 0 listings from SeLoger despite a 200
+# response — that placeId scheme is silently ignored by their backend. The
+# isochrone (STRTFR4409045) returns 30+ listings per page. priceMax kept at
+# 1100 to match LBC budget headroom.
 DEFAULT_SEARCH_SELOGER_URL: str = os.getenv(
     "SELOGER_SEARCH_URL",
     "https://www.seloger.com/classified-search"
     "?distributionTypes=Rent"
     "&estateTypes=House,Apartment"
-    "&locations=eyJwbGFjZUlkcyI6WyJBRDA4RlI3NSIsIkFEMDhGUjc3IiwiQUQwOEZSNzgiLCJBRDA4RlI5MSIsIkFEMDhGUjkyIiwiQUQwOEZSOTMiLCJBRDA4RlI5NCIsIkFEMDhGUjk1Il19"
+    "&locations=eyJwbGFjZUlkcyI6WyJTVFJURlI0NDA5MDQ1Il0sImR1cmF0aW9uIjoiNjAiLCJtb2RlIjoiVHJhbnNpdCJ9"
     "&priceMax=1100"
     "&projectTypes=Stock"
     "&spaceMin=25",
@@ -117,7 +116,11 @@ DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
     "https://www.logic-immo.com/classified-search"
     "?distributionTypes=Rent"
     "&estateTypes=House,Apartment"
-    "&locations=AD08FR12"
+    # Logic-Immo shares the SeLoger backend (Aviv); AD08FR* placeIds silently
+    # return 0 results (verified 2026-05-21 against AD08FR12 and AD08FR75).
+    # Same 60min Transit isochrone we restored on SeLoger returns 25 classifieds
+    # per page / 5856 totalCount.
+    "&locations=eyJwbGFjZUlkcyI6WyJTVFJURlI0NDA5MDQ1Il0sImR1cmF0aW9uIjoiNjAiLCJtb2RlIjoiVHJhbnNpdCJ9"
     "&priceMax=1100",
 )
 

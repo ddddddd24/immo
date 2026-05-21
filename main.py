@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import re
+import socket
 import sys
 import time
 from datetime import datetime
@@ -52,6 +53,35 @@ logging.basicConfig(
 # Real HTTP errors still surface at WARNING+.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+# ─── Single-instance lock ─────────────────────────────────────────────────────
+# Bind an arbitrary localhost port. A second main.py launched in parallel will
+# fail to bind and exit — preventing two Telegram pollers from fighting over
+# getUpdates (which surfaces as `telegram.error.Conflict`). The socket is
+# released by the kernel when the process dies, so there's no stale-lock
+# scenario like with PID files.
+_SINGLE_INSTANCE_PORT = 47823
+_LOCK_SOCKET: socket.socket | None = None
+
+
+def _acquire_single_instance_lock() -> None:
+    global _LOCK_SOCKET
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", _SINGLE_INSTANCE_PORT))
+        s.listen(1)
+        _LOCK_SOCKET = s  # keep reference alive for the lifetime of the process
+    except OSError:
+        logger.error(
+            "Another bot instance is already running (port %d busy). "
+            "Exiting to avoid Telegram getUpdates Conflict.",
+            _SINGLE_INSTANCE_PORT,
+        )
+        sys.exit(1)
+
+
+_acquire_single_instance_lock()
 
 
 def _lower_priority() -> None:
