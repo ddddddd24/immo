@@ -29,7 +29,7 @@ from telegram.request import HTTPXRequest
 
 import config
 import database
-from agent import analyse_listing, format_simulation_text, classify_intent, Listing, score_listing, score_listings_batch, prescreen_listing
+from agent import analyse_listing, format_simulation_text, classify_intent, Listing, score_listing, score_listings_batch, prescreen_listing, regenerate_message_with_tone
 from scraper import search_listings, fetch_single_listing, is_real_offer, is_suspicious
 from messenger import send_message_safe, check_inbox_lbc
 from profile import PROFILE
@@ -523,6 +523,40 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Inline keyboard callbacks ────────────────────────────────────────────────
 
+def _render_draft(row, result, preflight_warn: str, forced_tone: bool) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the (HTML body, inline keyboard) for a Telegram draft preview.
+
+    Used by both the initial 📝 Rédiger reply and the 🔄 Changer de ton
+    in-place edit so the two paths can't drift. `forced_tone=True` swaps
+    "détecté" → "forcé" in the label so the user sees the override took.
+    """
+    lbc_id = row["lbc_id"] if hasattr(row, "__getitem__") else getattr(row, "lbc_id", "")
+    title = (row["title"] if hasattr(row, "__getitem__") else getattr(row, "title", "")) or lbc_id
+    seller_type = result.seller_type if isinstance(result.seller_type, str) else (
+        result.seller_type.value if hasattr(result.seller_type, "value") else str(result.seller_type)
+    )
+    label = "Ton forcé" if forced_tone else "Vendeur détecté"
+    body = (
+        f"📝 <b>Draft pour {title}</b>\n"
+        f"<i>{label} : {seller_type}</i>\n\n"
+        f"<pre>{(result.message or '').strip()}</pre>"
+        f"{preflight_warn}"
+    )
+    # Two rows: send/edit on top, change-tone/cancel below. Keeps the row
+    # narrow enough to read on mobile.
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Envoyer", callback_data=f"send:{lbc_id}"),
+            InlineKeyboardButton("✏️ Modifier", callback_data=f"edit:{lbc_id}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Changer de ton", callback_data=f"toggle_tone:{lbc_id}"),
+            InlineKeyboardButton("❌ Annuler", callback_data=f"ignore:{lbc_id}"),
+        ],
+    ])
+    return body, keyboard
+
+
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -607,17 +641,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         # callbacks (further down in this function) can pick up the draft.
         _set_ttl(ctx.bot_data, f"sim:{lbc_id}", result)
 
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Envoyer", callback_data=f"send:{lbc_id}"),
-            InlineKeyboardButton("✏️ Modifier", callback_data=f"edit:{lbc_id}"),
-            InlineKeyboardButton("❌ Annuler", callback_data=f"ignore:{lbc_id}"),
-        ]])
-        body = (
-            f"📝 <b>Draft pour {row['title'] or lbc_id}</b>\n"
-            f"<i>Vendeur détecté : {result.seller_type.value if hasattr(result.seller_type, 'value') else result.seller_type}</i>\n\n"
-            f"<pre>{(result.message or '').strip()}</pre>"
-            f"{preflight_warn}"
-        )
+        body, keyboard = _render_draft(row, result, preflight_warn, forced_tone=False)
         try:
             await query.message.reply_text(
                 body, parse_mode=ParseMode.HTML, reply_markup=keyboard,
@@ -627,6 +651,57 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             # HTML can fail on weird chars in the draft — fall back to plain.
             await query.message.reply_text(
                 f"📝 Draft :\n\n{result.message}\n\n{preflight_warn.strip()}",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        return
+
+    # ── Push-alert "Changer de ton" callback ────────────────────────────────
+    # Flips seller_type (particulier ↔ agence) and re-generates the draft
+    # with the forced tone, editing the original draft message in place.
+    # Useful when _detect_seller_type guessed wrong (e.g. "Ffm" → "agence"
+    # when it's clearly an initialism for a particulier).
+    if action == "toggle_tone":
+        stored = _get_ttl(ctx.bot_data, f"sim:{lbc_id}")
+        if not stored:
+            await query.message.reply_text(
+                "❌ Session expirée (le draft a plus de 30min). Re-clique 📝 Rédiger sur le push."
+            )
+            return
+        current_type = stored.seller_type if isinstance(stored.seller_type, str) else (
+            stored.seller_type.value if hasattr(stored.seller_type, "value") else str(stored.seller_type)
+        )
+        new_type = "particulier" if current_type == "agence" else "agence"
+        try:
+            await query.edit_message_text(
+                f"🔄 Régénération en ton <b>{new_type}</b>…",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        try:
+            new_message = await regenerate_message_with_tone(stored.listing, new_type)
+        except Exception as exc:
+            logger.warning("[toggle_tone] regenerate failed for %s: %s", lbc_id, exc)
+            await query.message.reply_text(f"❌ Échec régénération : `{exc}`")
+            return
+        # Mutate the AnalysisResult in place — same TTL key, so send/edit/
+        # ignore pick up the new draft transparently.
+        stored.seller_type = new_type
+        stored.message = new_message
+        _set_ttl(ctx.bot_data, f"sim:{lbc_id}", stored)
+
+        row = database.get_listing_by_lbc_id(lbc_id)
+        body, keyboard = _render_draft(row, stored, preflight_warn="", forced_tone=True)
+        try:
+            await query.edit_message_text(
+                body, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            # Plain-text fallback (HTML can fail on weird chars in the new draft)
+            await query.edit_message_text(
+                f"📝 Draft (ton {new_type}) :\n\n{new_message}",
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
             )

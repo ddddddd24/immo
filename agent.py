@@ -157,62 +157,247 @@ def _detect_seller_type(listing: Listing) -> SellerType:
 
 
 # ─── Message generation ───────────────────────────────────────────────────────
+#
+# Drafts are produced in 2 tones (particulier / agence). The agence tone
+# branches further on the seller_name to distinguish "gros réseau" (Foncia,
+# ORPI, Century 21, Laforêt, Guy Hoquet, Nestenn, FNAIM…) from independent
+# agencies — the former want a tight dossier-first message, the latter
+# appreciate more personalization on the bien itself.
+#
+# Anti-hallucination: we pre-extract a list of CONCRETE features that
+# actually appear in the listing's title or description (balcon, métro,
+# rénové, etc.), and pass it to the LLM with the instruction "tu peux
+# mentionner UN détail parmi cette liste". This prevents the model from
+# inventing features that aren't there.
+
+_FEATURE_KEYWORDS = [
+    # (needle to search in lowercased blob, human label to pass to LLM)
+    ("balcon", "le balcon"),
+    ("terrasse", "la terrasse"),
+    ("loggia", "la loggia"),
+    ("jardin", "le jardin"),
+    ("très lumineux", "la luminosité"),
+    ("lumineux", "la luminosité"),
+    ("rénové", "la rénovation récente"),
+    ("refait à neuf", "la rénovation récente"),
+    ("calme", "le calme"),
+    ("sans vis-à-vis", "l'absence de vis-à-vis"),
+    ("parquet", "le parquet"),
+    ("moulures", "les moulures"),
+    ("haussmannien", "le style haussmannien"),
+    ("baie vitrée", "la baie vitrée"),
+    ("vue dégagée", "la vue dégagée"),
+    ("vue sur", "la vue"),
+    ("dernier étage", "le dernier étage"),
+    ("ascenseur", "la présence d'un ascenseur"),
+    ("cave", "la cave"),
+    ("cuisine équipée", "la cuisine équipée"),
+    ("cuisine ouverte", "la cuisine ouverte"),
+    ("dressing", "le dressing"),
+    ("placards", "les placards intégrés"),
+    ("métro", "la proximité du métro"),
+    (" rer ", "la proximité du RER"),
+    ("gare", "la proximité de la gare"),
+    ("tram", "la proximité du tram"),
+    ("commerces", "la proximité des commerces"),
+    ("écoles", "la proximité des écoles"),
+    ("parc", "la proximité d'un parc"),
+    ("résidence sécurisée", "la résidence sécurisée"),
+    ("digicode", "la résidence sécurisée"),
+    ("interphone", "la résidence sécurisée"),
+]
+
+_BIG_CHAIN_HINTS = (
+    "orpi", "century 21", "century21", "foncia", "laforêt", "laforet",
+    "guy hoquet", "nestenn", "stéphane plaza", "stephane plaza",
+    "iad ", "safti", "era ", "l'adresse", "ladresse", "guy-hoquet",
+    "fnaim", "particulier à particulier",
+)
+
+
+def _extract_listing_features(listing: Listing) -> list[str]:
+    """Return concrete features actually present in the listing text. Caps
+    at 6 to keep the prompt tight. Anti-hallucination guard."""
+    blob = f" {(listing.title or '').lower()} {(listing.description or '').lower()} "
+    found: list[str] = []
+    seen: set[str] = set()
+    for needle, label in _FEATURE_KEYWORDS:
+        if needle in blob and label not in seen:
+            seen.add(label)
+            found.append(label)
+            if len(found) >= 6:
+                break
+    return found
+
+
+def _seller_size_hint(seller_name: str) -> str:
+    """'gros_reseau' | 'indep' — branches the agence prompt for tone."""
+    s = (seller_name or "").lower()
+    return "gros_reseau" if any(h in s for h in _BIG_CHAIN_HINTS) else "indep"
+
+
+def _listing_kind(listing: Listing) -> str:
+    """Human-readable kind for the prompt context. Combines housing_type +
+    surface heuristics so the LLM can adapt phrasing (un studio vs un T2
+    appellent des justifications différentes pour un couple)."""
+    ht = (getattr(listing, "housing_type", "") or "").lower()
+    if "studio" in ht or "t1" in ht:
+        return "studio/T1"
+    if "t2" in ht:
+        return "T2"
+    if "t3" in ht or "t4" in ht or "t5" in ht:
+        return "T3+"
+    if "coloc" in ht or "coliving" in ht:
+        return "colocation"
+    if "chambre" in ht:
+        return "chambre"
+    # Fallback on surface
+    surf = getattr(listing, "surface", None) or 0
+    if surf and surf < 25:
+        return "studio/T1"
+    if surf and surf < 40:
+        return "T2"
+    return "appartement"
+
+
+def _avail_hint(listing: Listing) -> str:
+    """If the LLM already extracted a clean YYYY-MM availability date and it
+    falls before our move-in target, give the model an explicit fact to
+    weave in ('le bien est libre dès juin 2026, parfait')."""
+    av = getattr(listing, "available_from", None)
+    if not av or not isinstance(av, str) or len(av) < 7:
+        return ""
+    try:
+        import datetime as _dt
+        ym = av[:7]
+        target = "2026-09"
+        if ym <= target:
+            mois_map = {"01":"janvier","02":"février","03":"mars","04":"avril",
+                        "05":"mai","06":"juin","07":"juillet","08":"août",
+                        "09":"septembre","10":"octobre","11":"novembre","12":"décembre"}
+            label = f"{mois_map.get(ym[5:7],'')} {ym[:4]}".strip()
+            return f"L'annonce indique une disponibilité dès {label}."
+    except Exception:
+        pass
+    return ""
+
 
 _PARTICULIER_SYSTEM = """
-Tu rédiges un message de contact pour une annonce de location sur LeBonCoin.
-Le ton doit être chaleureux, humain, légèrement narratif — comme un vrai message
-d'une personne ordinaire, pas un copier-coller générique.
-Règles strictes :
-- Maximum 150 mots
-- Mentionne UN détail spécifique de l'annonce (ex: le balcon, la terrasse, la localisation, la surface) pour montrer que tu l'as vraiment lue
-- Précise que tu cherches pour septembre 2026
-- Pas de formule robotique ("Je me permets de vous contacter...")
-- Intégrer naturellement ces 3 questions :
-  1. Le bien est-il toujours disponible ?
-  2. Les charges sont-elles comprises dans le prix ?
-  3. Disponible à partir de septembre 2026 ?
-- Ne PAS mentionner de salaire exact ni de chiffres financiers
-- Langue : français
+Tu rédiges un message de contact à un PROPRIÉTAIRE PARTICULIER (LeBonCoin,
+PAP). Le destinataire est un humain ordinaire — pas une agence. Ton :
+chaleureux, sincère, comme un voisin qui sonne pour visiter. PAS une
+lettre de motivation.
+
+═══ INTERDICTIONS STRICTES — toute occurrence est un échec ═══
+1. NE COMMENCE JAMAIS PAR "Je me permets" sous aucune forme. JAMAIS.
+2. Pas une seule des formules : "Pourriez-vous préciser", "envisager",
+   "procurer", "Dans l'attente", "Veuillez agréer", "Auriez-vous
+   l'obligeance".
+3. AUCUN CHIFFRE INVENTÉ. Tu n'as PAS le droit d'écrire un montant de
+   charges, de revenu, de loyer, ou tout autre chiffre financier qui ne
+   serait pas explicitement fourni dans le contexte. Si tu veux demander
+   les charges, formule "Les charges sont-elles comprises dans le loyer ?"
+   et JAMAIS "les charges de XXX € sont-elles comprises dans le loyer de
+   YYY €". Cette règle est non-négociable.
+4. Pas de salaire, pas de revenu chiffré — particulier ne veut pas voir ça.
+
+═══ RÈGLES POSITIVES ═══
+- 90 à 130 mots, vouvoiement courtois mais détendu.
+- Mentionne UN détail concret du bien — UNIQUEMENT depuis la liste
+  'Features vérifiées' du contexte. Si vide → parle de la localisation ou
+  de la surface (réelle, fournie en contexte).
+- Mentionne SNCF (poste stable) + dossier solide avec garant Visale.
+- Vise septembre 2026 (sauf si 'avail_hint' donne une date plus tôt
+  compatible → adapter naturellement, et NE PAS répéter la date deux fois
+  dans le message).
+- 2-3 questions naturelles dans la prose : disponibilité, charges
+  comprises, visite cette semaine.
+- Préférer : "J'aimerais", "Le bien est-il toujours libre ?", "Une visite
+  serait possible cette semaine ?", "Merci d'avance".
+- Signature : juste "Illan" (sans nom de famille).
+- Prose continue, pas de bullets, pas de markdown.
+- Langue : français.
 """.strip()
 
 _AGENCE_SYSTEM = """
-Tu rédiges un message de contact pour une agence immobilière.
-Ton : professionnel mais naturel — pas un formulaire, pas une liste à puces.
-Structure imposée :
-1. Ouvrir sur l'intérêt pour le bien en mentionnant UN détail spécifique de l'annonce (surface, localisation, équipement...) + demander si toujours disponible (1 phrase)
-2. Se présenter en prose fluide : prénom, âge, poste chez SNCF Voyageurs (grande entreprise, stable),
-   revenu mensuel, dossier prêt immédiatement, souhaite emménager en septembre 2026,
-   double revenu dès cette date (compagne pacsée)
-3. Poser les questions pratiques : charges, confirmer disponibilité pour septembre 2026, visite possible ?
-4. Signature simple
-Règles :
-- Maximum 120 mots
-- Tout en prose, pas de tirets ni de bullet points
-- Langue : français
+Tu rédiges un message de contact à une AGENCE IMMOBILIÈRE. Le destinataire
+est un négociateur qui reçoit des dizaines de candidatures/jour — il doit
+voir en 5 secondes que ton dossier est solide.
+
+═══ INTERDICTIONS STRICTES — toute occurrence est un échec ═══
+1. NE COMMENCE JAMAIS PAR "Je me permets" sous aucune forme. JAMAIS.
+2. Pas une seule des formules : "Auriez-vous l'obligeance", "Dans
+   l'attente", "Veuillez agréer", "Bien cordialement", "Je me permets de
+   vous contacter".
+3. AUCUN CHIFFRE INVENTÉ. Tu peux mentionner UNIQUEMENT les chiffres
+   fournis explicitement dans le contexte : 1 850 €/mois (revenu candidat),
+   ~800 €/mois (compagne), ~2 650 €/mois (ressources totales sept 2026), et
+   le loyer affiché de l'annonce. Tu n'as PAS le droit d'inventer un
+   montant de charges. Si tu veux demander les charges, formule "Les
+   charges sont-elles comprises dans le loyer ?" SANS supposer aucun
+   montant. Cette règle est non-négociable.
+
+═══ RÈGLES POSITIVES ═══
+- 100 à 140 mots, vouvoiement pro mais HUMAIN.
+- Prose fluide, PAS de bullets / tirets / numérotation.
+- Structure : (a) intérêt sur le bien + UN détail concret (uniquement
+  depuis 'Features vérifiées') ; (b) présentation : Illan Krief, 26 ans,
+  alternant Product Owner chez SNCF Voyageurs (équivalent CDI pour les
+  dossiers de location), 1 850 €/mois, garant Visale, dossier complet
+  immédiatement disponible ; (c) compagne pacsée qui rejoint en septembre
+  2026 (~800 €/mois → ressources totales ≈ 2 650 €/mois) ; (d) 2-3
+  questions : confirmer dispo, charges comprises ou en sus, fenêtre de
+  visite cette semaine.
+- Adapter si 'avail_hint' donne une date compatible plus tôt.
+- 'seller_size' = 'gros_reseau' → concis + dossier-prêt. 'indep' → un peu
+  plus chaleureux sur le bien.
+- Préférer : "Merci par avance", "Bonne journée", "Cordialement".
+- Signature : "Illan Krief".
+- Langue : français.
 """.strip()
 
 
 def _build_particulier_prompt(listing: Listing) -> str:
+    features = _extract_listing_features(listing)
+    kind = _listing_kind(listing)
+    avail = _avail_hint(listing)
+    feat_str = ("- " + "\n- ".join(features)) if features else "(aucune feature spécifique détectée — parle de la localisation)"
     return (
         f"Contexte sur le locataire :\n{PARTICULIER_CONTEXT}\n\n"
         f"Annonce :\n"
+        f"- Type de bien : {kind}\n"
         f"- Titre : {listing.title}\n"
         f"- Localisation : {listing.location}\n"
-        f"- Loyer : {listing.price} €\n"
-        f"- Description : {listing.description[:400]}\n\n"
-        "Rédige le message de contact."
+        f"- Surface : {getattr(listing, 'surface', None) or '?'} m²\n"
+        f"- Loyer : {listing.price} € (information interne, NE PAS chiffrer dans le message)\n"
+        f"- Vendeur (prénom ou pseudo) : {listing.seller_name or '(inconnu)'}\n"
+        f"- Description (extrait) : {(listing.description or '')[:500]}\n\n"
+        f"Features vérifiées (utiliser UNE de la liste, ne pas inventer) :\n{feat_str}\n\n"
+        + (f"avail_hint : {avail}\n\n" if avail else "")
+        + "Rédige le message de contact en respectant TOUTES les règles du system."
     )
 
 
 def _build_agence_prompt(listing: Listing) -> str:
+    features = _extract_listing_features(listing)
+    kind = _listing_kind(listing)
+    size = _seller_size_hint(listing.seller_name)
+    avail = _avail_hint(listing)
+    feat_str = ("- " + "\n- ".join(features)) if features else "(aucune feature spécifique détectée — parle de la localisation ou du type de bien)"
     return (
-        f"Contexte sur le locataire :\n{AGENCE_CONTEXT}\n\n"
+        f"Contexte sur le candidat :\n{AGENCE_CONTEXT}\n\n"
         f"Annonce :\n"
+        f"- Type de bien : {kind}\n"
         f"- Titre : {listing.title}\n"
         f"- Localisation : {listing.location}\n"
-        f"- Loyer : {listing.price} €\n"
-        f"- Description : {listing.description[:400]}\n\n"
-        "Rédige le message de contact professionnel."
+        f"- Surface : {getattr(listing, 'surface', None) or '?'} m²\n"
+        f"- Loyer : {listing.price} € (chiffre OK à intégrer si pertinent)\n"
+        f"- Agence : {listing.seller_name or '(inconnue)'}\n"
+        f"- Description (extrait) : {(listing.description or '')[:500]}\n\n"
+        f"Features vérifiées (utiliser UNE de la liste, ne pas inventer) :\n{feat_str}\n\n"
+        f"seller_size : {size}\n"
+        + (f"avail_hint : {avail}\n\n" if avail else "\n")
+        + "Rédige le message de contact en respectant TOUTES les règles du system."
     )
 
 
@@ -236,6 +421,17 @@ def _generate_message(listing: Listing, seller_type: SellerType) -> str:
         messages=[{"role": "user", "content": user_prompt}],
     )
     return _first_text(resp).strip()
+
+
+async def regenerate_message_with_tone(
+    listing: "Listing", seller_type: "SellerType"
+) -> str:
+    """Public async wrapper around _generate_message. Used by the Telegram
+    '🔄 Changer de ton' callback to force a tone (particulier ↔ agence)
+    when the auto-detection picked the wrong one. Wrapped in asyncio.to_thread
+    so the sync DeepSeek call doesn't block the bot event loop."""
+    import asyncio as _aio
+    return await _aio.to_thread(_generate_message, listing, seller_type)
 
 
 # ─── Scoring (optional, ENABLE_SCORING=true) ─────────────────────────────────
