@@ -147,7 +147,7 @@ nav a{{color:#60a5fa;margin-right:1rem;text-decoration:none}}
 canvas{{max-height:280px}}
 </style>
 </head><body>
-<nav><a href="/">← Listings</a><a href="/contacts">Contacts</a><a href="/sys">System</a></nav>
+<nav><a href="/">← Listings</a><a href="/today">🔥 Top du jour</a><a href="/contacts">Contacts</a><a href="/sys">System</a></nav>
 <h1>System stats — 24h</h1>
 {summary_html}
 
@@ -172,6 +172,157 @@ new Chart(document.getElementById('ctxChart'), {{type:'line',data:{{labels,datas
   {{label:'Child processes',data:data.map(r=>r.children_count),borderColor:'#f472b6',fill:false,stepped:true}}
 ]}},options:opt}});
 </script>
+</body></html>
+"""
+
+
+# ─── /today  — top 20 of the last 24h ────────────────────────────────────────
+
+def _render_top20_today() -> str:
+    """Curated top-20 feed: highest-scoring listings scraped in the last 24h
+    that pass our budget+coloc+dealbreaker filters. Smaller, scannable page
+    designed for the 30-second 'qu'est-ce qui est sorti aujourd'hui' check —
+    no filters, no sort controls, no pagination."""
+    rows = _query("""
+        SELECT l.lbc_id, l.source, l.title, l.price, l.surface, l.location,
+               l.url, l.scraped_at, l.phone, l.score, l.score_reason,
+               l.housing_type, l.roommate_count, l.available_from, l.dedup_of
+        FROM listings l
+        WHERE l.scraped_at > datetime('now', '-24 hours')
+          AND l.price IS NOT NULL AND l.price <= 1000
+          AND l.score IS NOT NULL AND l.score > 0
+          AND (l.dedup_of IS NULL OR l.dedup_of = '')
+          AND l.housing_type NOT IN ('coliving', 'chambre', 'residence')
+          AND (
+                l.housing_type != 'coloc'
+                OR (l.roommate_count IS NOT NULL AND l.roommate_count <= 2)
+              )
+        ORDER BY l.score DESC, l.scraped_at DESC
+        LIMIT 20
+    """)
+
+    # Pre-compute "il y a Xh" labels server-side so the page renders complete
+    # without JS — keeps the table readable even before window.onload fires.
+    import datetime as _dt
+    now = _dt.datetime.utcnow()
+    def _ago(iso: str) -> str:
+        if not iso:
+            return ""
+        try:
+            t = _dt.datetime.fromisoformat(iso.replace("Z", ""))
+        except Exception:
+            return iso[:16]
+        delta = now - t
+        mins = int(delta.total_seconds() // 60)
+        if mins < 1:
+            return "à l'instant"
+        if mins < 60:
+            return f"il y a {mins}min"
+        hours = mins // 60
+        if hours < 24:
+            return f"il y a {hours}h"
+        return iso[:10]
+
+    cards_html = ""
+    for i, r in enumerate(rows, 1):
+        src = (r["source"] or "").lower()
+        emoji = SOURCE_EMOJI.get(src, "⚪")
+        score = r["score"]
+        # Color the score badge: 9+ green, 7-8 amber, < 7 muted blue
+        score_color = "#10b981" if score >= 9 else ("#f59e0b" if score >= 7 else "#3b82f6")
+        phone_badge = '<span class="phone">📞</span>' if (r["phone"] and r["phone"] not in ("", "#blocked")) else ""
+        # Show only the human-readable summary tail of score_reason (after the "—" if present)
+        sr = (r["score_reason"] or "")
+        sr_summary = sr.split("—", 1)[1].strip() if "—" in sr else sr
+        sr_summary = sr_summary[:130]
+        surf_str = f"{r['surface']}m²" if r["surface"] else "?m²"
+        avail = f' · libre {r["available_from"]}' if r["available_from"] else ""
+        cards_html += f"""
+        <a class="card" href="{_esc(r['url'])}" target="_blank">
+          <div class="rank">{i}</div>
+          <div class="head">
+            <span class="score" style="background:{score_color}">{score}/10</span>
+            <span class="src">{emoji} {src}</span>
+            <span class="ago">{_ago(r['scraped_at'] or '')}</span>
+            {phone_badge}
+          </div>
+          <div class="title">{_esc((r['title'] or '')[:90])}</div>
+          <div class="meta">
+            <span class="price">{r['price']}€</span>
+            <span>·</span>
+            <span>{surf_str}</span>
+            <span>·</span>
+            <span class="loc">{_esc(r['location'] or '')}</span>
+            <span class="avail">{_esc(avail)}</span>
+          </div>
+          <div class="reason">{_esc(sr_summary)}</div>
+        </a>"""
+    if not rows:
+        cards_html = '<div class="empty">Aucune annonce scorée dans les dernières 24h. Vérifie que ENABLE_SCORING=true et que le bot tourne.</div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>🔥 Top du jour — Dashboard Immo</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         margin: 0; padding: 0; background: #0a0a0f; color: #e5e7eb; min-height:100vh; }}
+  .header {{ position: sticky; top: 0; z-index: 10; background: #1e293b; padding: 16px 20px;
+             border-bottom: 1px solid #334155; display: flex; justify-content: space-between;
+             align-items: center; }}
+  .header h1 {{ margin: 0; font-size: 1.25rem; }}
+  .nav {{ display: flex; gap: 8px; }}
+  .nav a {{ padding: 6px 12px; background: #0f172a; border-radius: 8px; color: #94a3b8;
+            text-decoration: none; font-size: 0.85rem; border: 1px solid #334155; }}
+  .nav a:hover, .nav a.active {{ background: #2563eb; color: white; border-color: #2563eb; }}
+  .content {{ max-width: 900px; margin: 0 auto; padding: 20px; }}
+  .card {{ display: block; background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+           padding: 14px 16px 14px 56px; margin-bottom: 10px; color: inherit; text-decoration: none;
+           position: relative; transition: transform .08s, border-color .15s; }}
+  .card:hover {{ transform: translateY(-1px); border-color: #2563eb; }}
+  .rank {{ position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+           font-size: 1.5rem; font-weight: 700; color: #475569; width: 32px; text-align: center; }}
+  .head {{ display: flex; align-items: center; gap: 8px; font-size: 0.78rem;
+           color: #94a3b8; margin-bottom: 6px; }}
+  .score {{ display: inline-block; padding: 2px 8px; border-radius: 6px; color: #fff;
+            font-weight: 700; font-size: 0.8rem; }}
+  .src {{ text-transform: capitalize; }}
+  .ago {{ margin-left: auto; }}
+  .phone {{ background: #10b981; padding: 1px 6px; border-radius: 6px;
+            color: white; font-size: 0.7rem; }}
+  .title {{ font-size: 1rem; font-weight: 600; margin-bottom: 4px;
+            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+            overflow: hidden; }}
+  .meta {{ font-size: 0.85rem; color: #94a3b8; display: flex; flex-wrap: wrap; gap: 6px;
+           align-items: center; margin-bottom: 6px; }}
+  .price {{ color: #fbbf24; font-weight: 600; }}
+  .loc {{ color: #d1d5db; }}
+  .avail {{ color: #a7f3d0; }}
+  .reason {{ font-size: 0.78rem; color: #64748b; font-style: italic;
+             display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical;
+             overflow: hidden; }}
+  .empty {{ text-align: center; padding: 60px 20px; color: #64748b; }}
+  @media (max-width: 600px) {{
+    .content {{ padding: 12px; }}
+    .card {{ padding: 12px 14px 12px 44px; }}
+    .rank {{ left: 8px; font-size: 1.3rem; }}
+  }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🔥 Top 20 du jour</h1>
+  <div class="nav">
+    <a href="/">📋 Annonces</a>
+    <a href="/today" class="active">🔥 Top du jour</a>
+    <a href="/contacts">✉️ Contacts</a>
+  </div>
+</div>
+<div class="content">
+  {cards_html}
+</div>
 </body></html>
 """
 
@@ -306,6 +457,7 @@ def _render_listings() -> str:
   <h1>🏠 Annonces — {len(row_data)} en base</h1>
   <div class="nav">
     <a href="index.html" class="active">📋 Annonces</a>
+    <a href="/today">🔥 Top du jour</a>
     <a href="contacts.html">✉️ Contacts</a>
   </div>
 </div>
@@ -1012,6 +1164,7 @@ def _render_listings_mobile() -> str:
 <!-- Bottom nav -->
 <nav class="bottom-nav">
   <a href="index.html" class="active"><span class="icon">📋</span><span>Annonces</span></a>
+  <a href="/today"><span class="icon">🔥</span><span>Top du jour</span></a>
   <a href="contacts.html"><span class="icon">✉️</span><span>Contacts</span></a>
   <a href="#" id="nav-stats"><span class="icon">📊</span><span>Stats</span></a>
 </nav>
@@ -1590,6 +1743,7 @@ def _render_contacts() -> str:
   <h1>✉️ Contacts ({len(contacts)})</h1>
   <div class="nav">
     <a href="index.html">📋 Annonces</a>
+    <a href="/today">🔥 Top du jour</a>
     <a href="contacts.html" class="active">✉️ Contacts</a>
   </div>
 </div>
@@ -1620,6 +1774,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/", "/dashboard", "/index.html"):
             self._send_html(_render_listings())
+        elif path in ("/today", "/today.html", "/top"):
+            self._send_html(_render_top20_today())
         elif path in ("/contacts", "/contacts.html"):
             self._send_html(_render_contacts())
         elif path in ("/sys", "/system", "/system-stats"):
