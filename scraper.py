@@ -2020,7 +2020,7 @@ async def _search_bienici_with_playwright(search_url: str, max_results: int) -> 
     """
     import json, urllib.parse
 
-    MAX_BUDGET = 1100  # match dashboard hard cap, no need to fetch above-budget
+    MAX_BUDGET = 1000  # match dashboard hard cap, no need to fetch above-budget
     listings: list[Listing] = []
     client = _get_shared_httpx()
     headers = {"User-Agent": _HTTPX_UA}
@@ -3972,7 +3972,11 @@ async def _search_entreparticuliers(search_url: str, max_results: int) -> list[L
     """EntreParticuliers — Angular SSR site. Every listing's full payload (prix,
     titre, surface, commune, piecesnb, estPro, etc.) lives inside the ng-state
     JSON blob embedded in the page; the rendered HTML around the href has no
-    prices. We loop the 8 IDF dept URLs and parse each ng-state.
+    prices. We loop the 8 IDF dept URLs, parse each ng-state for the data,
+    and parse the HTML anchors for the canonical click-through URLs (the
+    canonical URL is `/appartement/location/{city-slug}/{listing-slug}/ref-{id}`
+    with TWO slug segments — building it from JSON fields produces a URL
+    that EP redirects to a generic listing).
     """
     import json as _json
     base = "https://www.entreparticuliers.com/annonces-immobilieres/location/appartement"
@@ -4007,9 +4011,22 @@ async def _search_entreparticuliers(search_url: str, max_results: int) -> list[L
                 if isinstance(ann, dict) and ann.get("id"):
                     yield ann
 
+    def _href_map(html: str) -> dict[str, str]:
+        """Map rid -> full canonical href from the HTML anchors."""
+        out: dict[str, str] = {}
+        for m in _re.finditer(
+            r'href="(/annonces-immobilieres/appartement/location/[a-z0-9-]+/[a-z0-9-]+/ref-(\d+))"',
+            html,
+        ):
+            rid = m.group(2)
+            if rid not in out:
+                out[rid] = "https://www.entreparticuliers.com" + m.group(1)
+        return out
+
     for html in htmls:
         if not html:
             continue
+        hrefs = _href_map(html)
         for ann in _iter_annonces(html):
             rid = str(ann.get("id"))
             if rid in seen:
@@ -4025,7 +4042,10 @@ async def _search_entreparticuliers(search_url: str, max_results: int) -> list[L
             else:
                 location = str(commune or "")
             est_pro = bool(ann.get("estPro"))
-            url = f"https://www.entreparticuliers.com/annonces-immobilieres/appartement/location/ref-{rid}"
+            # Prefer the canonical href from the HTML; only fall back to the
+            # short /ref-{id} form if the anchor wasn't on this page (rare —
+            # would mean the JSON contained an annonce not rendered as a card).
+            url = hrefs.get(rid) or f"https://www.entreparticuliers.com/annonces-immobilieres/appartement/location/ref-{rid}"
             listings.append(Listing(
                 lbc_id=f"ep_{rid}",
                 title=(ann.get("titre") or "")[:200],
@@ -4400,9 +4420,9 @@ def _inli_card_to_listing(card_html: str) -> Optional[Listing]:
 
 async def _search_inli(search_url: str, max_results: int) -> list[Listing]:
     """Inli (CDC Habitat — logement intermédiaire IDF). Off-radar source.
-    Paginates per-département. ~49 listings IDF ≤1100€ CC."""
+    Paginates per-département. ~49 listings IDF ≤1000€ CC."""
     from curl_cffi.requests import AsyncSession
-    PRICE_CAP = 1100
+    PRICE_CAP = 1000
     PER_PAGE = 24
     MAX_PAGES = 12
     listings: list[Listing] = []
@@ -4636,9 +4656,9 @@ def _fnaim_card_to_listing(card_html: str) -> Optional[Listing]:
 async def _search_fnaim(search_url: str, max_results: int) -> list[Listing]:
     """FNAIM — federated portal of 12k independent agencies. Off-radar.
     Sweeps 8 IDF départements in parallel sessions (server caps at 9 pages/query).
-    ~1100 IDF listings ≤1100€."""
+    ~1100 IDF listings ≤1000€."""
     from curl_cffi.requests import AsyncSession
-    PRICE_CAP = 1100
+    PRICE_CAP = 1000
     BASE = "https://www.fnaim.fr"
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -4807,10 +4827,10 @@ def _cdc_split_articles(html: str) -> list[str]:
 
 
 async def _search_cdc_habitat(search_url: str, max_results: int) -> list[Listing]:
-    """CDC Habitat — public sister of Inli. ~44 IDF listings ≤1100€,
+    """CDC Habitat — public sister of Inli. ~44 IDF listings ≤1000€,
     62% intermediate (sweet spot alternant SNCF). Server-rendered, no anti-bot."""
     from curl_cffi.requests import AsyncSession
-    PRICE_CAP = 1100
+    PRICE_CAP = 1000
     MAX_PAGES = 30
     base = search_url.rstrip("/")
     listings = []
@@ -4967,11 +4987,11 @@ async def _search_laforet_with_playwright(search_url: str, max_results: int) -> 
 
     Important Laforêt quirk: passing `filter[max]=N` makes the backend
     ignore the city slug and return France-wide results. So we apply the
-    1100 € budget cap client-side and use the unfiltered city URL.
+    1000 € budget cap client-side and use the unfiltered city URL.
     """
     from bs4 import BeautifulSoup  # noqa: F401 — kept for parity w/ siblings
 
-    MAX_PRICE = 1100  # spec target
+    MAX_PRICE = 1000  # spec target
 
     # Default to Paris if a non-Laforêt URL is passed
     if not search_url or "laforet.com" not in search_url:
@@ -5189,7 +5209,7 @@ def _gh_parse_html(html_fragment: str, max_results: int) -> list[Listing]:
 
 
 def _gh_build_api_url(page: int, *, location_slug: str = _GH_IDF_SLUG,
-                     transaction: int = 2, price_max: int = 1100) -> str:
+                     transaction: int = 2, price_max: int = 1000) -> str:
     """Build the JSON XHR URL the front-end calls when filters are applied."""
     return (
         "https://www.guy-hoquet.com/biens/result?"
@@ -5231,11 +5251,11 @@ async def _gh_fetch_pages_curl_cffi(urls: list[str], timeout: int = 15) -> list[
 
 
 async def _search_guyhoquet_with_playwright(search_url: str, max_results: int) -> list[Listing]:
-    """Scrape Guy Hoquet rentals (Paris, ≤1100€ by default).
+    """Scrape Guy Hoquet rentals (Paris, ≤1000€ by default).
 
     `search_url` is best-effort: any Guy Hoquet URL is accepted but filters are
     re-applied via the JSON endpoint regardless (the public URLs don't carry
-    filter state — it's session-bound). To target Paris rentals ≤1100€ pass
+    filter state — it's session-bound). To target Paris rentals ≤1000€ pass
     any guy-hoquet.com URL or the canonical /annonces/location/paris/.
 
     Fast path: curl_cffi + chrome120 fingerprint hits /biens/result with the
@@ -5243,7 +5263,7 @@ async def _search_guyhoquet_with_playwright(search_url: str, max_results: int) -
     Fallback: Playwright + stealth replays the same XHR through a real
     browser context if Cloudflare ever blocks the fast path.
     """
-    MAX_PRICE = 1100  # spec target
+    MAX_PRICE = 1000  # spec target
 
     # We always paginate against the JSON endpoint regardless of input URL.
     pages = [_gh_build_api_url(p, price_max=MAX_PRICE) for p in range(1, 6)]
@@ -5498,7 +5518,7 @@ def _lbc_default_filters() -> dict:
     return {
         "category": {"id": "10"},
         "enums": {"real_estate_type": ["1", "2"], "furnished": ["1"]},
-        "ranges": {"price": {"max": 1100}, "square": {"min": 25}},
+        "ranges": {"price": {"max": 1000}, "square": {"min": 25}},
         "location": {
             "locations": [
                 {"locationType": "department", "department_id": "75", "label": "Paris"},

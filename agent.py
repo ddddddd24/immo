@@ -407,10 +407,19 @@ async def score_listings_batch(listings: list[Listing], batch_size: int = 5) -> 
         "\"pas d'APL\", \"non conventionné\"), null SI silencieux.\n"
         "Pour 'unfurnished' : true SI explicitement non-meublé/loué vide, false SI meublé, "
         "null SI silencieux.\n"
+        "Pour 'zone_safety' (note 0-10 de la sécurité/qualité du quartier mentionné dans 'Loc') :\n"
+        "  9-10 : très safe, calme, BCBG (Neuilly, Vincennes, Saint-Mandé, Saint-Germain-en-Laye)\n"
+        "  7-8  : safe, classe moyenne supérieure (Boulogne, Sèvres, Suresnes, Maisons-Alfort)\n"
+        "  5-6  : moyen, mixte (bien dépendre du quartier exact)\n"
+        "  3-4  : réputation difficile pour un couple sans enfants (zones nord-est 93, certains 95)\n"
+        "  0-2  : zone clairement problématique\n"
+        "  null SEULEMENT si tu ne reconnais pas la ville. Sinon réponds avec ton meilleur jugement, "
+        "  même si c'est une banlieue moyennement connue — base-toi sur la réputation générale, "
+        "  classe sociale, taux de criminalité, attractivité.\n"
         "Format réponse :\n"
         '{"items":[{"i":0,"floor":null|N,"elevator":null|true|false,'
         '"available":null|"YYYY-MM","apl_eligible":null|true|false,'
-        '"unfurnished":null|true|false,'
+        '"unfurnished":null|true|false,"zone_safety":null|N,'
         '"commute_min":N,"features":["..."],"summary":"..."}]}'
     )
 
@@ -490,12 +499,39 @@ async def score_listings_batch(listings: list[Listing], batch_size: int = 5) -> 
             results[idx]["available_from"] = avail_str
             continue
 
-        # Étage > 3 sans ascenseur dealbreaker
+        # Étage > 3 sans ascenseur dealbreaker.
+        # Two tiers:
+        #   floor > 3 + elev explicitly False  → drop (was the original rule)
+        #   floor >= 5 + elev unknown          → also drop (conservative for
+        #     top-of-Parisian-building cases where the listing/detail page
+        #     omits ascenseur info — observed on a SeLoger 6/6 listing where
+        #     the LLM had no signal and the listing escaped to score 9.2).
         floor = item.get("floor")
         elev = item.get("elevator")
         if isinstance(floor, int) and floor > 3 and elev is False:
             _zero(idx, f"étage {floor} sans ascenseur")
             continue
+        if isinstance(floor, int) and floor >= 5 and elev is not True:
+            _zero(idx, f"étage {floor}, ascenseur non confirmé")
+            continue
+
+        # Description-text safety net — catches "Nème étage sans ascenseur"
+        # in free text when the LLM failed to structure floor/elevator (e.g.
+        # if the detail-page enrichment timed out and only the basic search
+        # data was passed in).
+        _text_blob = f"{lst.title or ''} {lst.description or ''}"
+        _no_asc_m = re.search(
+            r"(\d+)\s*[èe]?(?:me|ème|er)?\s+étage[^.]{0,80}sans\s+ascenseur",
+            _text_blob, re.IGNORECASE,
+        )
+        if _no_asc_m:
+            try:
+                _fl = int(_no_asc_m.group(1))
+                if _fl > 3:
+                    _zero(idx, f"étage {_fl} sans ascenseur (texte)")
+                    continue
+            except ValueError:
+                pass
 
         # APL/aides eligibility dealbreaker — only if explicitly NOT eligible
         if item.get("apl_eligible") is False:
@@ -510,6 +546,21 @@ async def score_listings_batch(listings: list[Listing], batch_size: int = 5) -> 
         # Sub-scores
         pv = preferences.price_value_score(lst.price, getattr(lst, "surface", None))
         zs, zone_label = preferences.zone_match_score(lst.location or "")
+        # Zone unknown to the curated list → ask the LLM what it thinks of the
+        # specific commune. Falls back to a département-level baseline if the
+        # LLM also has no opinion (75=6.0, 92=6.0, 93=4.0, 94=5.5, other=5.0).
+        # The user-facing rule: "if quartier well-frequented note good, if
+        # dangerous note less. Don't default to 5 just because we lack data."
+        if zone_label == "zone neutre":
+            llm_zs = item.get("zone_safety")
+            if isinstance(llm_zs, (int, float)) and 0 <= llm_zs <= 10:
+                zs = float(llm_zs)
+                zone_label = (lst.location or "").split(",")[0].strip()[:30] or "?"
+            else:
+                _zip_m = re.search(r"\b(\d{5})\b", lst.location or "")
+                _zip = _zip_m.group(1)[:2] if _zip_m else ""
+                zs = {"75": 6.0, "92": 6.0, "93": 4.0, "94": 5.5}.get(_zip, 5.0)
+                zone_label = f"dépt {_zip}" if _zip else "zone inconnue"
         cs, mins_known = preferences.commute_score_from_zip(lst.location or "")
         if mins_known is None:
             llm_min = item.get("commute_min")

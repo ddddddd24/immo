@@ -1033,7 +1033,7 @@ def _render_listings_mobile() -> str:
   <div class="field-row">
     <div class="field">
       <label for="f-maxprice">Prix max (€)</label>
-      <input id="f-maxprice" type="number" inputmode="numeric" pattern="[0-9]*" placeholder="1100" />
+      <input id="f-maxprice" type="number" inputmode="numeric" pattern="[0-9]*" placeholder="1000" />
     </div>
     <div class="field">
       <label for="f-minsurface">m² min</label>

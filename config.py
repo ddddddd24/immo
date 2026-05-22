@@ -67,7 +67,7 @@ DEFAULT_SEARCH_URL: str = (
     "https://www.leboncoin.fr/recherche"
     "?category=10"
     "&real_estate_type=1,2"
-    "&price=min-1100"
+    "&price=min-1000"
     "&locations=r_12"
 )
 
@@ -83,7 +83,7 @@ DEFAULT_SEARCH_SELOGER_URL: str = os.getenv(
     "?distributionTypes=Rent"
     "&estateTypes=House,Apartment"
     "&locations=eyJwbGFjZUlkcyI6WyJTVFJURlI0NDA5MDQ1Il0sImR1cmF0aW9uIjoiNjAiLCJtb2RlIjoiVHJhbnNpdCJ9"
-    "&priceMax=1100"
+    "&priceMax=1000"
     "&projectTypes=Stock"
     "&spaceMin=25",
 )
@@ -94,7 +94,7 @@ DEFAULT_SEARCH_PAP_URL: str = os.getenv(
     # Region code IDF = g471 (g439 était Paris-only malgré le slug "ile-de-france").
     # Couvre 75/77/78/91/92/93/94/95. Pas de surface-min → catch sub-25m² (14-24m²).
     "https://www.pap.fr/annonce/locations-ile-de-france-g471"
-    "?loyer-max=1100&ameublement=meuble",
+    "?loyer-max=1000&ameublement=meuble",
 )
 
 # Default Bien'ici search URL (Paris IDF, meublé, 14m²+, max 1000€)
@@ -102,7 +102,7 @@ DEFAULT_SEARCH_PAP_URL: str = os.getenv(
 DEFAULT_SEARCH_BIENICI_URL: str = os.getenv(
     "BIENICI_SEARCH_URL",
     "https://www.bienici.com/recherche/location/ile-de-france"
-    "?prix-max=1100&surface-min=14",
+    "?prix-max=1000&surface-min=14",
 )
 
 # Default Logic-Immo search URL (IDF entier, max 1100€).
@@ -121,7 +121,7 @@ DEFAULT_SEARCH_LOGICIMMO_URL: str = os.getenv(
     # Same 60min Transit isochrone we restored on SeLoger returns 25 classifieds
     # per page / 5856 totalCount.
     "&locations=eyJwbGFjZUlkcyI6WyJTVFJURlI0NDA5MDQ1Il0sImR1cmF0aW9uIjoiNjAiLCJtb2RlIjoiVHJhbnNpdCJ9"
-    "&priceMax=1100",
+    "&priceMax=1000",
 )
 
 # ── Phase 2: student / young-pro platforms ────────────────────────────────────
@@ -232,7 +232,7 @@ DEFAULT_SEARCH_LAFORET_URL: str = os.getenv(
 # cette URL n'est qu'un référent SPA. Listings vérifiés depuis 92/77/91/93/94.
 DEFAULT_SEARCH_GUYHOQUET_URL: str = os.getenv(
     "GUYHOQUET_SEARCH_URL",
-    "https://www.guy-hoquet.com/annonces/location/ile-de-france/?priceMax=1100",
+    "https://www.guy-hoquet.com/annonces/location/ile-de-france/?priceMax=1000",
 )
 
 # Inli (CDC Habitat — logement intermédiaire IDF). Off-radar — paginates
@@ -305,6 +305,6 @@ ENABLE_CONTACT_PREP: bool = os.getenv("ENABLE_CONTACT_PREP", "true").lower() in 
 # fresh (<24h published or scrape-marker today). Off by default.
 ENABLE_PUSH_ALERTS: bool = os.getenv("ENABLE_PUSH_ALERTS", "false").lower() in ("true", "1", "yes")
 PUSH_MIN_SCORE: int = int(os.getenv("PUSH_MIN_SCORE", "7"))
-PUSH_MAX_PRICE: int = int(os.getenv("PUSH_MAX_PRICE", "1100"))
+PUSH_MAX_PRICE: int = int(os.getenv("PUSH_MAX_PRICE", "1000"))
 PUSH_RATE_PER_MIN: int = int(os.getenv("PUSH_RATE_PER_MIN", "20"))
 PUSH_MAX_PER_CAMPAIGN: int = int(os.getenv("PUSH_MAX_PER_CAMPAIGN", "200"))

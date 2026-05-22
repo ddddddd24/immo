@@ -57,3 +57,58 @@ Fixed inline as part of this task.
 > Before assuming a region URL exists, run `curl_cffi --impersonate=chrome120`
 > against 3-5 candidates and grep for actual listing href patterns. HTTP 200
 > with no listings ≠ working URL — verify the dept distribution.
+
+---
+
+## 2026-05-21 — "verified" claim trap + silent zero-results detection
+
+### What happened
+A previous Claude session (commits `b5bf54b` and `b06a208` on 2026-05-07)
+swapped working SeLoger / Logic-Immo URLs for per-département placeIds
+(`AD08FR75..AD08FR95`, `AD08FR12`) and claimed "verified live" in commit
+messages. The verification was hallucinated — these placeIds return HTTP 200
+with `totalCount=0` from the Aviv backend. Both sources silently produced
+0 listings for **2 weeks** before the user noticed.
+
+Similar pattern on LBC: the SSR `www.leboncoin.fr/recherche` started getting
+DataDome-blocked on 2026-05-14. Bot kept polling for 6 days producing 0
+listings while Camoufox returned a 1.5 KB challenge page (~1576 chars, vs
+~hundreds-of-KB for real content). Fix: bypass via mobile API
+(`api.leboncoin.fr/finder/search` + `curl_cffi safari17_0`).
+
+EntreParticuliers had ALL listing data in an Angular `<script ng-state>`
+JSON blob, with empty `<a>` tags in the rendered HTML. The HTML-regex
+scraper returned 0 prices because the prices simply weren't in the HTML.
+
+### Rules going forward
+1. **Never trust "verified" in prior commit messages.** Re-probe the URL
+   yourself: count actual listings/results, not just HTTP status.
+2. **HTTP 200 ≠ working URL.** Always check listing count or `totalCount`.
+3. **DataDome / Aviv silently swallow bad inputs.** For SeLoger/LogicImmo,
+   parse `__UFRN_FETCHER__` → `pageProps.totalCount` to detect dead URLs.
+4. **For Angular SSR sites** (EP and similar): if rendered HTML has empty
+   anchors, look for `<script ng-state>` or hydration JSON before writing
+   HTML-regex parsers.
+5. **DataDome on home IP**: when SSR scrape fails repeatedly, check if a
+   public mobile API exists (`api.<site>` subdomain) — curl_cffi +
+   `safari17_0` or `chrome120` often bypasses cleanly at low volume.
+6. **Smoke-test step**: after changing a URL or selector, run the scraper
+   end-to-end once and verify >0 listings persist before commit.
+
+### Other catches while fixing
+- `run_bot.bat` single-instance detection was a false-positive abort: the
+  PowerShell command with `^|` escape inside `cmd /c` lost the escape,
+  PowerShell crashed silently, `RUNCOUNT` stayed empty, `"" != "0"`
+  triggered abort on every launch. Fix: `netstat -an | findstr ":47823 .*LISTENING"`.
+- The 116 daily `[leboncoin] __NEXT_DATA__ missing` warnings are MISLEADING.
+  They come from `_pw_get_next_data` with default `site="leboncoin"`,
+  invoked for fnaim/immojeune/locservice/studapart detail pages which
+  don't have `__NEXT_DATA__`. NOT actually LBC failures.
+- LBC API silently ignored `{"locationType": "city", "label": ...}` filter —
+  the LBC sentinel never noticed because it only reads `list_id` for change
+  detection. Use `{"locationType": "department", "department_id": "75"}` etc.
+
+### Rule going forward (LBC + Aviv specifically)
+> Before committing a URL/filter change to SeLoger, Logic-Immo, or LBC,
+> run a probe and assert `totalCount > 0` (Aviv) or `len(ads) > 0` (LBC API).
+> See memories `seloger_logicimmo_aviv_trap` and `lbc_datadome_bypass`.

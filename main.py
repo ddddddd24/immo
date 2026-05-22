@@ -550,6 +550,88 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             pass
         return
 
+    # ── Push-alert "Rédiger" callback ───────────────────────────────────────
+    # User tapped 📝 Rédiger on a push (annonce without phone, LBC or SeLoger).
+    # We generate a draft via the same path /simulate uses and store the
+    # AnalysisResult under `sim:{lbc_id}` so the existing send/edit/ignore
+    # callbacks below pick it up without modification.
+    if action == "rediger":
+        row = database.get_listing_by_lbc_id(lbc_id)
+        if not row:
+            await query.message.reply_text("❌ Annonce introuvable en base.")
+            return
+        source = (row["source"] or "").lower()
+        if source not in ("leboncoin", "seloger"):
+            await query.message.reply_text(
+                f"❌ L'envoi via {source or 'cette source'} n'est pas supporté — seuls LBC et SeLoger ont un form de contact wired."
+            )
+            return
+        # Pre-flight: warn if auth cookies look stale (>25 days). The send
+        # may still succeed via auto-relogin, but the user deserves a heads-up.
+        from messenger import auth_age_days
+        age = auth_age_days(source)
+        preflight_warn = ""
+        if age is None:
+            preflight_warn = (
+                f"\n\n⚠️ <i>Aucune session {source} sauvegardée. "
+                f"Premier envoi → re-login automatique avec tes credentials .env.</i>"
+            )
+        elif age > 25:
+            preflight_warn = (
+                f"\n\n⚠️ <i>Session {source} âgée de {int(age)}j. "
+                f"Possible re-login auto à l'envoi.</i>"
+            )
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("🧠 Génération du draft…")
+
+        lst = Listing(
+            lbc_id=row["lbc_id"],
+            title=row["title"] or "",
+            description=row["description"] or "",
+            price=row["price"] or 0,
+            location=row["location"] or "",
+            seller_name=row["seller_name"] or "",
+            url=row["url"] or "",
+            source=source,
+            surface=row["surface"],
+        )
+        try:
+            result = await analyse_listing(lst)
+        except Exception as exc:
+            logger.warning("[rediger] analyse_listing failed for %s: %s", lbc_id, exc)
+            await query.message.reply_text(f"❌ Échec génération : `{exc}`")
+            return
+
+        # Reuse the /simulate TTL slot so the existing send/edit/ignore
+        # callbacks (further down in this function) can pick up the draft.
+        _set_ttl(ctx.bot_data, f"sim:{lbc_id}", result)
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Envoyer", callback_data=f"send:{lbc_id}"),
+            InlineKeyboardButton("✏️ Modifier", callback_data=f"edit:{lbc_id}"),
+            InlineKeyboardButton("❌ Annuler", callback_data=f"ignore:{lbc_id}"),
+        ]])
+        body = (
+            f"📝 <b>Draft pour {row['title'] or lbc_id}</b>\n"
+            f"<i>Vendeur détecté : {result.seller_type.value if hasattr(result.seller_type, 'value') else result.seller_type}</i>\n\n"
+            f"<pre>{(result.message or '').strip()}</pre>"
+            f"{preflight_warn}"
+        )
+        try:
+            await query.message.reply_text(
+                body, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            # HTML can fail on weird chars in the draft — fall back to plain.
+            await query.message.reply_text(
+                f"📝 Draft :\n\n{result.message}\n\n{preflight_warn.strip()}",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        return
+
     # ── /watch alert callbacks ──────────────────────────────────────────────
     if action == "watch_ignore":
         await query.edit_message_reply_markup(reply_markup=None)
@@ -617,10 +699,28 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     if action == "send":
         if not result:
-            await query.message.reply_text("❌ Session expirée, relancez /simulate.")
+            await query.message.reply_text(
+                "❌ Session expirée (le draft a plus de 30min).\n"
+                "Refais `/simulate <url>` ou retape 📝 Rédiger sur le push."
+            )
             return
 
         listing = result.listing
+        src = (listing.source or "").lower() or "leboncoin"
+
+        # Pre-flight rate-limit check: catch saturation BEFORE creating the
+        # contact row, so we don't pollute the DB with a contact that'll
+        # never get sent. messages_sent_last_hour() is a rolling window.
+        sent_last_h = database.messages_sent_last_hour()
+        cap = config.MAX_MESSAGES_PER_HOUR
+        if sent_last_h >= cap:
+            await query.message.reply_text(
+                f"⏳ Rate limit : {sent_last_h}/{cap} messages envoyés cette heure.\n"
+                f"Retente dans ~{60 - (sent_last_h - cap + 1) * 3} min "
+                f"ou ajuste `MAX_MESSAGES_PER_HOUR` dans .env."
+            )
+            return
+
         listing_id = database.upsert_listing(
             lbc_id=listing.lbc_id,
             title=listing.title,
@@ -640,10 +740,26 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         success = await send_message_safe(listing.url, result.message, contact_id)
         if success:
             await query.message.reply_text(f"✅ Message envoyé à : {listing.url}")
-        else:
-            await query.message.reply_text(
-                "❌ Échec de l'envoi (voir logs). Vérifiez vos identifiants LBC."
-            )
+            return
+
+        # Failure path: re-store the draft so the user can retry without
+        # re-running the LLM, and surface a 🔄 Réessayer button. The fail
+        # cause is usually one of: cookies expired (re-login auto next try),
+        # selector drift after a site redesign, or transient network.
+        _set_ttl(ctx.bot_data, f"sim:{listing.lbc_id}", result)
+        site_label = {"leboncoin": "LBC", "seloger": "SeLoger"}.get(src, src.upper())
+        retry_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Réessayer", callback_data=f"send:{listing.lbc_id}"),
+            InlineKeyboardButton("❌ Annuler", callback_data=f"ignore:{listing.lbc_id}"),
+        ]])
+        await query.message.reply_text(
+            f"❌ Échec d'envoi sur {site_label}. Causes probables :\n"
+            f"• Cookies expirés → re-login auto au prochain essai\n"
+            f"• Sélecteurs cassés (site a changé d'UI) → voir logs\n"
+            f"• Captcha/anti-bot ponctuel → réessayer dans 1-2 min\n\n"
+            f"Le draft est gardé 30min — clique 🔄 pour retenter.",
+            reply_markup=retry_kb,
+        )
 
 
 # ─── Deduplication helper ─────────────────────────────────────────────────────
@@ -1029,10 +1145,22 @@ async def _check_and_push_alerts(
             logger.info("[push] rate limit hit — skipping remaining alerts")
             break
         try:
-            kb = InlineKeyboardMarkup([[
+            buttons = [
                 InlineKeyboardButton("✅ Appelé", callback_data=f"called:{row['lbc_id']}"),
                 InlineKeyboardButton("❌ Loué", callback_data=f"rented:{row['lbc_id']}"),
-            ]])
+            ]
+            # Add "📝 Rédiger" only when there's no phone to call AND the
+            # source is one we can actually send from (LBC/SeLoger). For
+            # every other case, drafting would be a dead-end click — better
+            # to omit the button than show one that errors on tap.
+            phone = row.get("phone") if hasattr(row, "get") else row["phone"]
+            no_phone = not phone or phone in ("", "#blocked")
+            source = (row.get("source") if hasattr(row, "get") else row["source"]) or ""
+            if no_phone and source.lower() in ("leboncoin", "seloger"):
+                buttons.insert(0, InlineKeyboardButton(
+                    "📝 Rédiger", callback_data=f"rediger:{row['lbc_id']}"
+                ))
+            kb = InlineKeyboardMarkup([buttons])
             await ctx.bot.send_message(
                 chat_id=config.TELEGRAM_CHAT_ID,
                 text=_build_push_html(row),

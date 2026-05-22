@@ -24,6 +24,18 @@ logger = logging.getLogger(__name__)
 _AUTH_STATE_PATH         = Path("data/lbc_auth.json")
 _SELOGER_AUTH_STATE_PATH = Path("data/seloger_auth.json")
 
+
+def auth_age_days(source: str) -> float | None:
+    """Days since the auth cookie file for `source` was last refreshed.
+    Returns None if the file doesn't exist (= never logged in). Used by the
+    Telegram "Rédiger" pre-flight to warn the user when cookies are stale
+    before they bother drafting a message that will fail at send time."""
+    p = {"leboncoin": _AUTH_STATE_PATH, "seloger": _SELOGER_AUTH_STATE_PATH}.get(source)
+    if not p or not p.exists():
+        return None
+    import time as _t
+    return (_t.time() - p.stat().st_mtime) / 86400.0
+
 # ─── LeBonCoin selectors ───────────────────────────────────────────────────────
 _SELECTORS = {
     "login_email":      'input[name="st_username"], input[type="email"]',
