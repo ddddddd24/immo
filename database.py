@@ -811,7 +811,7 @@ def _zone_key(location: str) -> str:
     return location.strip()[:8].lower()
 
 
-def is_suspicious_listing(listing) -> tuple[bool, str]:
+def is_suspicious_listing(listing, *, skip_price_anomaly: bool = False) -> tuple[bool, str]:
     """Return (is_fraud, reason) for a listing.
 
     Accepts a dict or sqlite3.Row. Checks, in order:
@@ -822,6 +822,10 @@ def is_suspicious_listing(listing) -> tuple[bool, str]:
       3. Price anomalously low: ≥ 50 % under the median €/m² of comparable
          listings in the same zone (5-digit ZIP) and surface band (±25 %).
          Requires ≥ 5 comparables; otherwise skipped silently.
+
+    `skip_price_anomaly=True` skips step 3 — used by the dashboard bulk
+    render where step 3's per-row SQL CTE was the bottleneck (50s for
+    5k listings). Steps 1-2 are pure regex, ~µs per row.
 
     Returns (False, "") for clean listings. The reason string is always
     short and user-facing — used directly in the dashboard badge tooltip.
@@ -866,6 +870,8 @@ def is_suspicious_listing(listing) -> tuple[bool, str]:
         return (True, "Paiement exigé avant visite")
 
     # 3. Price anomaly vs. zone+surface median
+    if skip_price_anomaly:
+        return (False, "")
     price = _g("price", None)
     surface = _g("surface", None)
     location = _g("location", "")

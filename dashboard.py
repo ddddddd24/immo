@@ -38,6 +38,26 @@ _lower_priority()
 _DB = config.DB_PATH
 
 
+# ─── Page cache ──────────────────────────────────────────────────────────────
+# `/annonces` re-renders ~50s on a 5k-listing DB (per-row is_suspicious_listing
+# SQL queries + 887KB HTML). Caching the rendered HTML for a short TTL makes
+# going-back-to-/annonces feel instant. New listings only update the page
+# after _PAGE_CACHE_TTL_S seconds — acceptable trade-off for the UX gain.
+import time as _time
+_PAGE_CACHE: dict[str, tuple[float, str]] = {}
+_PAGE_CACHE_TTL_S = 60
+
+
+def _cached_html(key: str, render_fn) -> str:
+    now = _time.time()
+    hit = _PAGE_CACHE.get(key)
+    if hit and (now - hit[0]) < _PAGE_CACHE_TTL_S:
+        return hit[1]
+    html = render_fn()
+    _PAGE_CACHE[key] = (now, html)
+    return html
+
+
 SOURCE_EMOJI = {
     "leboncoin":         "🟠",
     "seloger":           "🔵",
@@ -334,12 +354,17 @@ def _render_listings() -> str:
     #  - prix ≤ 1100€
     #  - exclure coloc/coliving avec >2 occupants
     #  - exclure résidence étudiante / chambre / coliving (type)
+    # 14-day window: ~67% of listings older than that are stale (rented or
+    # withdrawn). Keeps the page lean (~1700 rows vs ~5000) without losing
+    # anything practically useful. If we ever need to browse the archive
+    # we can add an "?all=1" param.
     raw_listings = _query("""
         SELECT l.lbc_id, l.source, l.title, l.price, l.surface, l.location,
                l.url, l.scraped_at, l.published_at, l.phone, l.score, l.score_reason,
                l.housing_type, l.roommate_count, l.available_from, l.dedup_of
         FROM listings l
-        WHERE l.price IS NOT NULL AND l.price <= 1050
+        WHERE l.scraped_at > datetime('now', '-14 days')
+          AND l.price IS NOT NULL AND l.price <= 1050
           AND l.housing_type NOT IN ('coliving', 'chambre', 'residence')
           AND (
             l.housing_type != 'coloc'
@@ -350,7 +375,7 @@ def _render_listings() -> str:
           -- Cross-source dedup: only show primaries
           AND (l.dedup_of IS NULL OR l.dedup_of = '')
         ORDER BY l.id DESC
-        LIMIT 10000
+        LIMIT 5000
     """)
 
     # SQL dedup_of already handles cross-source dedup.
@@ -376,7 +401,10 @@ def _render_listings() -> str:
         is_fraud, fraud_reason = (False, "")
         if _has_fraud:
             try:
-                is_fraud, fraud_reason = _db_fraud.is_suspicious_listing(l)
+                # skip_price_anomaly=True avoids ~5k per-row SQL CTE queries
+                # (was the dashboard's 50s bottleneck). Steps 1+2 (regex
+                # scam-marker + payment-before-visit) still run inline.
+                is_fraud, fraud_reason = _db_fraud.is_suspicious_listing(l, skip_price_anomaly=True)
             except Exception:
                 pass
         row_data.append({
@@ -1773,11 +1801,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path in ("/", "/dashboard", "/index.html"):
-            self._send_html(_render_listings())
+            self._send_html(_cached_html("listings", _render_listings))
         elif path in ("/today", "/today.html", "/top"):
-            self._send_html(_render_top20_today())
+            self._send_html(_cached_html("today", _render_top20_today))
         elif path in ("/contacts", "/contacts.html"):
-            self._send_html(_render_contacts())
+            self._send_html(_cached_html("contacts", _render_contacts))
         elif path in ("/sys", "/system", "/system-stats"):
             self._send_html(_render_system_stats())
         elif path == "/api/stats":
