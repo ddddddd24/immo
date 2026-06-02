@@ -1805,8 +1805,16 @@ async def _run_campaign_body(
             database.clear_price_prev(d.get("lbc_id", ""))
         await _reply(update, "\n".join(lines))
 
-    # Smart re-contact: listings never messaged that just dropped into budget
-    uncontacted_drops = database.get_uncontacted_price_drops(PROFILE["search"]["max_rent"])
+    # Smart re-contact (annonce jamais contactée passée sous budget → prépare un
+    # message). DÉSACTIVÉ le 2026-06-02 : feature non utilisée + `fetch_single_listing`
+    # plante sur les URLs non-LBC (contexte Playwright fermé, pas de __NEXT_DATA__)
+    # et spammait le log toutes les quelques secondes. Réactiver = repasser
+    # _SMART_RECONTACT à True (après avoir corrigé le fetch single multi-sources).
+    _SMART_RECONTACT = False
+    uncontacted_drops = (
+        database.get_uncontacted_price_drops(PROFILE["search"]["max_rent"])
+        if _SMART_RECONTACT else []
+    )
     if uncontacted_drops:
         await _reply(
             update,
