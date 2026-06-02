@@ -250,6 +250,16 @@ DEFAULT_SEARCH_GENSDECONFIANCE_URL: str = os.getenv(
     "https://www.gensdeconfiance.com/fr/s/immobilier/locations-immobilieres",
 )
 
+# Sources désactivées (clés normalisées, ex. "gensdeconfiance"). Effet : PAS
+# scrapées + masquées du dashboard + exclues du détecteur de source muette.
+# L'URL ci-dessus est conservée → pour réactiver, retirer la clé d'ici (ou vider
+# l'env DISABLED_SOURCES). gensdeconfiance désactivée le 2026-06-02 (pas de
+# compte/contact pour cette source).
+DISABLED_SOURCES: set = {
+    s.strip() for s in os.getenv("DISABLED_SOURCES", "gensdeconfiance").split(",")
+    if s.strip()
+}
+
 # CDC Habitat (public sister of Inli) — 573k national units, ~44 IDF listings
 # ≤1100€ CC, 62% intermediate (sweet spot for SNCF alternant). Server-rendered.
 DEFAULT_SEARCH_CDC_URL: str = os.getenv(

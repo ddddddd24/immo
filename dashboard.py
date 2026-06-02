@@ -89,6 +89,52 @@ STATUS_COLOR = {
     "negative":  "#ef4444",
 }
 
+_SOURCE_LABEL = {
+    "leboncoin": "LeBonCoin", "seloger": "SeLoger", "logicimmo": "Logic-Immo",
+    "pap": "PAP", "bienici": "Bien'ici", "lodgis": "Lodgis",
+    "parisattitude": "Paris Attitude", "studapart": "Studapart",
+    "immojeune": "ImmoJeune", "locservice": "LocService",
+    "entreparticuliers": "EntreParticuliers", "ladresse": "L'Adresse",
+    "century21": "Century 21", "wizi": "Wizi", "laforet": "Laforêt",
+    "guyhoquet": "Guy Hoquet", "inli": "Inli", "gensdeconfiance": "Gens de Confiance",
+    "cdc_habitat": "CDC Habitat", "fnaim": "FNAIM",
+}
+
+
+def _src_label(src: str) -> str:
+    return _SOURCE_LABEL.get(src, (src or "").title())
+
+
+def _render_alert_banner() -> str:
+    """Bandeau de statut en haut du dashboard (vide si rien à signaler).
+    🚨 rouge = blocage DataDome (lu depuis bot_state, écrit par le bot) ;
+    🔇 ambre = source muette (calculé en direct depuis la DB)."""
+    alerts: list[tuple[str, str]] = []
+    try:
+        import database as _db
+        raw = _db.get_state("monitor_datadome")
+        if raw:
+            blocked = (json.loads(raw) or {}).get("blocked") or []
+            if blocked:
+                items = ", ".join(f"{_src_label(s)} ({b}/{t})" for s, b, t in blocked)
+                alerts.append(("#ef4444",
+                    f"🚨 DataDome bloque : {items} sur la dernière heure — "
+                    f"l'IP se fait flagger. Refresh l'IP (box éteinte une nuit) "
+                    f"avant de perdre la source."))
+        muted = _db.muted_sources(exclude=config.DISABLED_SOURCES)
+        if muted:
+            def _age(h: float) -> str:
+                return f"{h/24:.0f}j" if h >= 48 else f"{h:.0f}h"
+            items = ", ".join(f"{_src_label(s)} ({_age(h)})" for s, h in muted)
+            alerts.append(("#f59e0b", f"🔇 Sources muettes (aucun scrape réussi) : {items}"))
+    except Exception:
+        return ""
+    return "".join(
+        f'<div style="background:{c};color:#fff;padding:11px 16px;font-size:0.9rem;'
+        f'font-weight:600;text-align:center;line-height:1.35">{_esc(t)}</div>'
+        for c, t in alerts
+    )
+
 
 def _query(sql: str, params=()) -> list[dict]:
     conn = sqlite3.connect(_DB)
@@ -358,7 +404,12 @@ def _render_listings() -> str:
     # withdrawn). Keeps the page lean (~1700 rows vs ~5000) without losing
     # anything practically useful. If we ever need to browse the archive
     # we can add an "?all=1" param.
-    raw_listings = _query("""
+    # Sources désactivées (config.DISABLED_SOURCES) → masquées du dashboard.
+    _disabled = sorted(config.DISABLED_SOURCES)
+    _disabled_clause = ""
+    if _disabled:
+        _disabled_clause = f"AND l.source NOT IN ({','.join('?' * len(_disabled))})"
+    raw_listings = _query(f"""
         SELECT l.lbc_id, l.source, l.title, l.price, l.surface, l.location,
                l.url, l.scraped_at, l.published_at, l.phone, l.score, l.score_reason,
                l.housing_type, l.roommate_count, l.available_from, l.dedup_of
@@ -374,9 +425,10 @@ def _render_listings() -> str:
           AND (l.score IS NULL OR l.score > 0)
           -- Cross-source dedup: only show primaries
           AND (l.dedup_of IS NULL OR l.dedup_of = '')
+          {_disabled_clause}
         ORDER BY l.id DESC
         LIMIT 5000
-    """)
+    """, tuple(_disabled))
 
     # SQL dedup_of already handles cross-source dedup.
     listings = list(raw_listings)
@@ -481,6 +533,7 @@ def _render_listings() -> str:
 </style>
 </head>
 <body>
+{_render_alert_banner()}
 <div class="header">
   <h1>🏠 Annonces — {len(row_data)} en base</h1>
   <div class="nav">

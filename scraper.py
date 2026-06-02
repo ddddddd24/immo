@@ -968,6 +968,7 @@ async def _search_lbc_with_api(search_url: str, max_results: int = 35) -> list[L
 
     if r.status_code in (403, 429):
         is_dd = "captcha-delivery" in (r.text or "")[:200]
+        _record_dd("leboncoin", True)
         logger.warning("[LBC-API] HTTP %d (DataDome=%s) — falling back to Playwright",
                        r.status_code, is_dd)
         return await _search_with_playwright(search_url, max_results)
@@ -975,6 +976,7 @@ async def _search_lbc_with_api(search_url: str, max_results: int = 35) -> list[L
         logger.warning("[LBC-API] HTTP %d — falling back to Playwright", r.status_code)
         return await _search_with_playwright(search_url, max_results)
 
+    _record_dd("leboncoin", False)
     try:
         payload = r.json() or {}
     except Exception:
@@ -1063,8 +1065,11 @@ async def _pw_get_seloger_data(url: str) -> Optional[dict]:
         async with AsyncSession(impersonate="chrome120", timeout=30) as session:
             r = await session.get(url, allow_redirects=True)
             if r.status_code == 200:
+                _record_dd("seloger", False)
                 ssr_html = r.text
             else:
+                if r.status_code in (403, 429):
+                    _record_dd("seloger", True)
                 logger.warning("[SELOGER] HTTP %s on %s — trying Camoufox", r.status_code, url[:80])
     except Exception as exc:
         logger.warning("[SELOGER] curl_cffi fetch failed: %s — trying Camoufox", exc)
@@ -3522,22 +3527,56 @@ async def _search_lodgis_with_playwright(search_url: str, max_results: int) -> l
     from bs4 import BeautifulSoup
 
     sep = "&" if "?" in search_url else "?"
-    pages = [search_url] + [f"{search_url}{sep}p={n}" for n in range(2, 71)]
-    logger.info("[LODGIS] Fetching %d pages via httpx (parallel)", len(pages))
-    htmls = await _fetch_pages_httpx(pages)
-
+    # Fetch par vagues bornées + arrêt anticipé. Avant : 70 pages (~830 Ko
+    # chacune) lancées en parallèle d'un coup → lodgis coupait les connexions
+    # (httpx fetch failed p60-70) et le scrape dépassait le timeout 180s → 0
+    # persisté, source muette depuis le 2026-05-03. Avec max_results=500 et
+    # 51 cartes/page, on atteint la cible vers la page 10 ; inutile d'aller à 70.
+    MAX_PAGES = 70
+    WAVE = 6
     listings: list[Listing] = []
-    for html in htmls:
-        if not html:
-            continue
-        soup = BeautifulSoup(html, "html.parser")
-        for card in soup.find_all("div", class_="card__appart"):
-            if (l := _lodgis_card_to_listing(card)):
-                listings.append(l)
-                if len(listings) >= max_results:
-                    break
-        if len(listings) >= max_results:
+    seen_ids: set[str] = set()
+    page = 1
+    while page <= MAX_PAGES and len(listings) < max_results:
+        wave_urls = [
+            search_url if n == 1 else f"{search_url}{sep}p={n}"
+            for n in range(page, min(page + WAVE, MAX_PAGES + 1))
+        ]
+        htmls = await _fetch_pages_httpx(wave_urls)
+        added = 0
+        for html in htmls:
+            if not html:
+                continue
+            soup = BeautifulSoup(html, "html.parser")
+            for card in soup.find_all("div", class_="card__appart"):
+                l = _lodgis_card_to_listing(card)
+                if l and l.lbc_id not in seen_ids:
+                    seen_ids.add(l.lbc_id)
+                    listings.append(l)
+                    added += 1
+                    if len(listings) >= max_results:
+                        break
+            if len(listings) >= max_results:
+                break
+        logger.info("[LODGIS] pages %d-%d: +%d (total %d)",
+                    page, page + len(wave_urls) - 1, added, len(listings))
+        if added == 0:  # fin d'inventaire (ou vague entièrement échouée) → stop
             break
+        page += WAVE
+
+    # Pré-filtre prix AVANT l'enrichissement détail : l'URL lodgis n'a pas de
+    # filtre prix → la liste contient surtout des annonces >1000€ qui seront de
+    # toute façon droppées par le cap dur. Les enrichir (1 fetch détail chacune)
+    # faisait exploser le timeout. On garde price=None (inconnu) par prudence.
+    try:
+        from preferences import HARD_PRICE_CAP as _CAP
+        _before = len(listings)
+        listings = [l for l in listings if l.price is None or l.price <= _CAP]
+        if len(listings) != _before:
+            logger.info("[LODGIS] pré-filtre prix ≤%d€ : %d/%d gardées pour enrichissement",
+                        _CAP, len(listings), _before)
+    except Exception as exc:
+        logger.warning("[LODGIS] pré-filtre prix ignoré: %s", exc)
 
     # Phase 2: detail enrichment for floor+elevator+available_date
     if listings:
@@ -5530,6 +5569,35 @@ def _lbc_default_filters() -> dict:
     }
 
 
+# ─── Télémétrie DataDome (alerte précoce) ────────────────────────────────────
+# Fenêtre glissante d'événements (timestamp, blocked) par source, alimentée par
+# le sentinel LBC, le scrape API LBC et le fetch SeLoger. Lue par
+# main._datadome_block_job qui alerte dès que le taux de 403 DataDome grimpe —
+# signal PRÉCOCE (minutes), bien avant que la source devienne muette (12h).
+from collections import deque as _deque, defaultdict as _defaultdict
+
+_dd_events: "dict[str, _deque]" = _defaultdict(lambda: _deque(maxlen=300))
+
+
+def _record_dd(source: str, blocked: bool) -> None:
+    """Enregistre l'issue d'une requête vers une source DataDome (True=403/bloqué)."""
+    try:
+        _dd_events[source].append((time.time(), blocked))
+    except Exception:
+        pass
+
+
+def datadome_block_rates(window_s: float = 3600.0) -> dict:
+    """Par source : (nb requêtes bloquées DataDome, nb total) sur la fenêtre."""
+    cutoff = time.time() - window_s
+    out: dict = {}
+    for src, dq in list(_dd_events.items()):
+        recent = [b for (t, b) in dq if t >= cutoff]
+        if recent:
+            out[src] = (sum(1 for b in recent if b), len(recent))
+    return out
+
+
 async def _lbc_sentinel_poll() -> Optional[str]:
     """Returns latest list_id (str) or None on failure / cooldown."""
     global _lbc_sentinel_consec_fails, _lbc_sentinel_banned_until
@@ -5562,6 +5630,7 @@ async def _lbc_sentinel_poll() -> Optional[str]:
     if r.status_code in (403, 429):
         _lbc_sentinel_consec_fails += 1
         is_dd = "captcha-delivery" in (r.text or "")[:200]
+        _record_dd("leboncoin", True)
         logger.warning("[SENTINEL] %d (DataDome=%s) consec=%d", r.status_code, is_dd, _lbc_sentinel_consec_fails)
         if _lbc_sentinel_consec_fails >= 3:
             _lbc_sentinel_banned_until = time.time() + 60 * 60
@@ -5569,6 +5638,7 @@ async def _lbc_sentinel_poll() -> Optional[str]:
         return None
     if r.status_code != 200:
         return None
+    _record_dd("leboncoin", False)
     _lbc_sentinel_consec_fails = 0
     try:
         ads = (r.json() or {}).get("ads") or []
@@ -5582,8 +5652,8 @@ async def _lbc_sentinel_poll() -> Optional[str]:
 
 async def _lbc_sentinel_loop(
     on_change: Callable[[str], Awaitable[None]],
-    base_interval_sec: int = 60,
-    jitter_sec: int = 15,
+    base_interval_sec: int = 180,  # throttlé de 60→180 le 2026-06-02 (réput. IP DataDome)
+    jitter_sec: int = 30,
 ) -> None:
     """Background loop: poll every base_interval ± jitter, fire on_change(new_id)."""
     global _lbc_sentinel_last_id

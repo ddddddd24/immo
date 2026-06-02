@@ -919,9 +919,10 @@ _SOURCE_LABELS = {
     "fnaim":             "FNAIM",
 }
 
-
 def _source_url(source: str) -> str:
     """Map a normalised source name to its configured search URL ('' if disabled)."""
+    if source in config.DISABLED_SOURCES:
+        return ""
     return {
         "leboncoin":         config.DEFAULT_SEARCH_URL,
         "seloger":           config.DEFAULT_SEARCH_SELOGER_URL,
@@ -991,6 +992,10 @@ def _campaign_sources(only: str | None = None,
         (config.DEFAULT_SEARCH_CDC_URL, "CDC Habitat"),
         (config.DEFAULT_SEARCH_FNAIM_URL, "FNAIM"),
     ]
+    # Sources désactivées (config.DISABLED_SOURCES, clés normalisées) → on retire
+    # par label via _SOURCE_LABELS.
+    _disabled_labels = {_SOURCE_LABELS.get(k, k) for k in config.DISABLED_SOURCES}
+    sources = [s for s in sources if s[1] not in _disabled_labels]
     # Tier classification — slow = Camoufox-based (cold-start expensive).
     _SLOW_LABELS = {"LBC", "SeLoger", "Logic-Immo"}
     if tier == "fast":
@@ -3077,10 +3082,23 @@ def main() -> None:
         _sentinel_bot_ref[0] = _app.bot
         nonlocal _sentinel_task
         try:
+            # Throttle pour protéger la réputation IP DataDome. Le sentinel à
+            # 60s = ~1440 POST/jour vers api.leboncoin.fr depuis une seule IP →
+            # signal "bot" flagrant, cause confirmée du flag IP du 2026-06-02
+            # (voir tasks/lessons.md). 180s±30s = ~480/jour, garde une détection
+            # < 3 min tout en divisant le signal par 3. Pour ré-accélérer (au
+            # risque de re-griller l'IP), baisser ces 2 valeurs ici.
+            _LBC_SENTINEL_INTERVAL_S = 180
+            _LBC_SENTINEL_JITTER_S = 30
             _sentinel_task = asyncio.create_task(
-                _scraper_mod._lbc_sentinel_loop(_on_lbc_change)
+                _scraper_mod._lbc_sentinel_loop(
+                    _on_lbc_change,
+                    base_interval_sec=_LBC_SENTINEL_INTERVAL_S,
+                    jitter_sec=_LBC_SENTINEL_JITTER_S,
+                )
             )
-            logger.info("[SENTINEL] LBC sentinel loop started (60s±15s polling)")
+            logger.info("[SENTINEL] LBC sentinel loop started (%ds±%ds polling)",
+                        _LBC_SENTINEL_INTERVAL_S, _LBC_SENTINEL_JITTER_S)
         except Exception as exc:
             logger.warning("[SENTINEL] LBC failed to start: %s", exc)
         try:
@@ -3270,6 +3288,37 @@ def main() -> None:
     if app.job_queue is not None:
         app.job_queue.run_daily(
             _healthcheck_job, time=_dtime(hour=9, minute=0), name="healthcheck",
+        )
+
+    # Monitoring → affiché en HAUT DU DASHBOARD, PAS en Telegram (pour limiter
+    # les notifs). Deux signaux :
+    #  • Source muette : calculée EN DIRECT par le dashboard depuis la DB
+    #    (database.muted_sources, basé sur seen_at) — rien à faire côté bot.
+    #  • Blocage DataDome : la télémétrie 403 vit dans la mémoire du bot
+    #    (scraper._dd_events) et le dashboard est un process séparé ; ce job la
+    #    persiste dans bot_state pour que le dashboard puisse l'afficher.
+    _DD_BLOCK_RATE = 0.5    # ≥50% de requêtes bloquées sur 1h
+    _DD_MIN_SAMPLES = 3     # …sur au moins 3 tentatives (évite le coup de chance)
+
+    async def _datadome_block_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            import scraper as _sc, json as _json
+            rates = _sc.datadome_block_rates(window_s=3600)
+            blocked = [
+                [s, b, t] for s, (b, t) in rates.items()
+                if t >= _DD_MIN_SAMPLES and b / t >= _DD_BLOCK_RATE
+            ]
+            database.set_state("monitor_datadome", _json.dumps({
+                "blocked": blocked, "ts": time.time(),
+            }))
+        except Exception as exc:
+            logger.warning("[datadome-monitor] failed: %s", exc)
+
+    if app.job_queue is not None:
+        # 5 min après le démarrage (accumule des échantillons), puis /15 min :
+        # persiste l'état DataDome en DB pour le bandeau du dashboard.
+        app.job_queue.run_repeating(
+            _datadome_block_job, interval=900, first=300, name="datadome_monitor",
         )
 
     logger.info("Bot starting…")

@@ -626,6 +626,53 @@ def today_stats() -> dict:
     }
 
 
+def hours_since_source_active() -> dict[str, float]:
+    """Pour chaque `source`, nombre d'heures depuis le dernier scrape RÉUSSI.
+
+    Signal = MAX(seen_at) : `seen_at` est re-stampé pour CHAQUE listing revu
+    dans un scrape (mark_seen, voir _persist_batch), donc il reflète le dernier
+    scrape ayant ramené des résultats — contrairement à `scraped_at` qui n'est
+    posé qu'à la première insertion d'un ID (ON CONFLICT ne le met pas à jour) et
+    donne donc de faux positifs pour les sources à catalogue stable (Paris
+    Attitude scrape 1834 annonces/min mais peu de NOUVEAUX IDs).
+
+    Repli sur `scraped_at` par ligne quand `seen_at` est NULL (lignes héritées,
+    ou source jamais persistée depuis la migration — ex. lodgis en timeout).
+    """
+    out: dict[str, float] = {}
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT source,
+                      (julianday('now')
+                       - julianday(MAX(COALESCE(seen_at, scraped_at)))) * 24.0 AS hours
+               FROM listings
+               GROUP BY source"""
+        ).fetchall()
+    for r in rows:
+        if r["source"] and r["hours"] is not None:
+            out[r["source"]] = float(r["hours"])
+    return out
+
+
+def muted_sources(stale_h: float = 12.0, active_h: float = 2.0,
+                  exclude: Optional[set] = None) -> list:
+    """Sources muettes : pas de scrape réussi depuis > `stale_h` heures, ALORS
+    QUE le bot est par ailleurs actif (au moins une source < `active_h`).
+
+    La condition relative évite les faux positifs quand TOUTES les sources
+    vieillissent ensemble (PC en veille la nuit, scrapers en pause pendant une
+    session de jeu). `exclude` = sources désactivées volontairement (sinon elles
+    s'affichent "muettes" une fois le scraping arrêté). Retourne [(source,
+    heures)] trié du plus ancien au plus récent, ou [] si downtime / tout va bien.
+    """
+    exclude = exclude or set()
+    ages = {s: h for s, h in hours_since_source_active().items() if s not in exclude}
+    if not ages or min(ages.values()) > active_h:
+        return []
+    stale = [(s, h) for s, h in ages.items() if h > stale_h]
+    return sorted(stale, key=lambda x: -x[1])
+
+
 # ─── Price drops ──────────────────────────────────────────────────────────────
 
 def get_price_drops() -> list[dict]:
