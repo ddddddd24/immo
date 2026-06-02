@@ -559,6 +559,17 @@ def _render_listings() -> str:
     <label>m² min <input id="f-minsurface" type="number" placeholder="20" /></label>
     <label>Recherche <input id="f-search" type="text" placeholder="titre / ville…" style="width:180px" /></label>
     <label><input id="f-phone-only" type="checkbox" /> 📞 Avec tél seulement</label>
+    <label title="Limiter aux annonces récentes (date de publication). Combine avec le tri Score pour voir les meilleurs scores récents. Défaut : toutes dates.">📅 Récence
+      <select id="f-days">
+        <option value="">Toutes dates</option>
+        <option value="1">1 dernier jour</option>
+        <option value="2">2 derniers jours</option>
+        <option value="3">3 derniers jours</option>
+        <option value="4">4 derniers jours</option>
+        <option value="5">5 derniers jours</option>
+        <option value="6">6 derniers jours</option>
+        <option value="7">7 derniers jours</option>
+      </select></label>
     <span class="filter-count" id="count">{len(row_data)} annonces</span>
   </div>
 
@@ -596,6 +607,8 @@ def _render_listings() -> str:
     const minSurface = parseInt(document.getElementById('f-minsurface').value) || null;
     const search = (document.getElementById('f-search').value || '').toLowerCase();
     const phoneOnly = document.getElementById('f-phone-only').checked;
+    const days = parseInt(document.getElementById('f-days').value) || null;
+    const daysCutoff = days ? Date.now() - days * 86400000 : null;
 
     let rows = ROWS.filter(r => {{
       if (src && r.source !== src) return false;
@@ -604,6 +617,11 @@ def _render_listings() -> str:
       if (minSurface && (r.surface === null || r.surface < minSurface)) return false;
       if (phoneOnly) {{
         if (!r.phone || r.phone === '#blocked') return false;
+      }}
+      if (daysCutoff !== null) {{
+        // Récence par date de publication (même parsing que le badge 🔥 NEW).
+        const pm = r.published ? new Date(r.published.length > 7 ? r.published : r.published + '-01').getTime() : 0;
+        if (!pm || pm < daysCutoff) return false;
       }}
       if (search) {{
         const blob = (r.title + ' ' + r.location).toLowerCase();
@@ -742,6 +760,7 @@ def _render_listings() -> str:
     document.getElementById(id).addEventListener('input', render);
   }});
   document.getElementById('f-phone-only').addEventListener('change', render);
+  document.getElementById('f-days').addEventListener('change', render);
 
   render();
 </script>
