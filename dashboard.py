@@ -167,7 +167,7 @@ nav a{{color:#60a5fa;margin-right:1rem;text-decoration:none}}
 canvas{{max-height:280px}}
 </style>
 </head><body>
-<nav><a href="/">← Listings</a><a href="/today">🔥 Top du jour</a><a href="/contacts">Contacts</a><a href="/sys">System</a></nav>
+<nav><a href="/">← Listings</a><a href="today.html">🔥 Top du jour</a><a href="/contacts">Contacts</a><a href="/sys">System</a></nav>
 <h1>System stats — 24h</h1>
 {summary_html}
 
@@ -336,7 +336,7 @@ def _render_top20_today() -> str:
   <h1>🔥 Top 20 du jour</h1>
   <div class="nav">
     <a href="/">📋 Annonces</a>
-    <a href="/today" class="active">🔥 Top du jour</a>
+    <a href="today.html" class="active">🔥 Top du jour</a>
     <a href="/contacts">✉️ Contacts</a>
   </div>
 </div>
@@ -485,7 +485,7 @@ def _render_listings() -> str:
   <h1>🏠 Annonces — {len(row_data)} en base</h1>
   <div class="nav">
     <a href="index.html" class="active">📋 Annonces</a>
-    <a href="/today">🔥 Top du jour</a>
+    <a href="today.html">🔥 Top du jour</a>
     <a href="contacts.html">✉️ Contacts</a>
   </div>
 </div>
@@ -1192,7 +1192,7 @@ def _render_listings_mobile() -> str:
 <!-- Bottom nav -->
 <nav class="bottom-nav">
   <a href="index.html" class="active"><span class="icon">📋</span><span>Annonces</span></a>
-  <a href="/today"><span class="icon">🔥</span><span>Top du jour</span></a>
+  <a href="today.html"><span class="icon">🔥</span><span>Top du jour</span></a>
   <a href="contacts.html"><span class="icon">✉️</span><span>Contacts</span></a>
   <a href="#" id="nav-stats"><span class="icon">📊</span><span>Stats</span></a>
 </nav>
@@ -1771,7 +1771,7 @@ def _render_contacts() -> str:
   <h1>✉️ Contacts ({len(contacts)})</h1>
   <div class="nav">
     <a href="index.html">📋 Annonces</a>
-    <a href="/today">🔥 Top du jour</a>
+    <a href="today.html">🔥 Top du jour</a>
     <a href="contacts.html" class="active">✉️ Contacts</a>
   </div>
 </div>

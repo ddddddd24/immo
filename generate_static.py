@@ -24,6 +24,13 @@ def main() -> None:
     html = dashboard._render_listings()
     (out_dir / "index.html").write_text(html, encoding="utf-8")
 
+    # Top du jour (last 24h)
+    try:
+        today_html = dashboard._render_top20_today()
+        (out_dir / "today.html").write_text(today_html, encoding="utf-8")
+    except Exception as e:
+        print(f"WARN: today.html failed: {e}")
+
     # Also drop a contacts page (less critical, but useful)
     try:
         contacts_html = dashboard._render_contacts()
