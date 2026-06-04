@@ -34,10 +34,28 @@ _MAX_WAIT = 300
 _shared_httpx: Optional[httpx.AsyncClient] = None
 
 
+# ─── Points d'injection PROXY (inactifs tant que config.USE_PROXY=False) ──────
+def _proxy_httpx() -> Optional[str]:
+    """URL proxy pour httpx, ou None si désactivé. Point d'injection httpx."""
+    if getattr(config, "USE_PROXY", False) and getattr(config, "PROXY_URL", ""):
+        return config.PROXY_URL
+    return None
+
+
+def _proxy_curl() -> Optional[dict]:
+    """Dict `proxies` pour curl_cffi (post/AsyncSession), ou None si désactivé.
+    Point d'injection curl_cffi — à passer en `proxies=_proxy_curl()`."""
+    url = _proxy_httpx()
+    return {"http": url, "https": url} if url else None
+
+
 def _get_shared_httpx() -> httpx.AsyncClient:
     """Return the process-wide AsyncClient, creating it lazily."""
     global _shared_httpx
     if _shared_httpx is None or _shared_httpx.is_closed:
+        _proxy_kwargs = {}
+        if (_p := _proxy_httpx()):
+            _proxy_kwargs["proxy"] = _p  # httpx ≥0.26 ; inactif par défaut
         _shared_httpx = httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=True,
@@ -46,6 +64,7 @@ def _get_shared_httpx() -> httpx.AsyncClient:
                 max_keepalive_connections=10,
                 keepalive_expiry=30.0,
             ),
+            **_proxy_kwargs,
         )
     return _shared_httpx
 
@@ -936,6 +955,8 @@ async def _search_lbc_with_api(search_url: str, max_results: int = 35) -> list[L
     are NOT respected; the caller's intent is reflected in DEFAULT_SEARCH_URL
     which matches the hardcoded filter shape.
     """
+    if _dd_should_skip("leboncoin"):
+        return []
     if not _CCFFI_AVAILABLE:
         logger.warning("[LBC-API] curl_cffi unavailable — falling back to Playwright")
         return await _search_with_playwright(search_url, max_results)
@@ -960,7 +981,8 @@ async def _search_lbc_with_api(search_url: str, max_results: int = 35) -> list[L
     try:
         def _do():
             return _ccffi.post(_LBC_API_URL, headers=headers, json=body,
-                               impersonate="safari17_0", timeout=15)
+                               impersonate="safari17_0", timeout=15,
+                               proxies=_proxy_curl())
         r = await asyncio.to_thread(_do)
     except Exception as exc:
         logger.warning("[LBC-API] request raised: %s — falling back to Playwright", exc)
@@ -1058,11 +1080,14 @@ async def _pw_get_seloger_data(url: str) -> Optional[dict]:
     Fallback chain when curl_cffi is blocked (HTTP 403/captcha):
         curl_cffi → warm Camoufox "seloger" context (DataDome cookie reused)
     """
+    if _dd_should_skip("seloger"):
+        return None
     from curl_cffi.requests import AsyncSession
 
     ssr_html: Optional[str] = None
     try:
-        async with AsyncSession(impersonate="chrome120", timeout=30) as session:
+        async with AsyncSession(impersonate="chrome120", timeout=30,
+                                proxies=_proxy_curl()) as session:
             r = await session.get(url, allow_redirects=True)
             if r.status_code == 200:
                 _record_dd("seloger", False)
@@ -1162,16 +1187,20 @@ async def _search_seloger_with_playwright(search_url: str, max_results: int) -> 
     listings: list[Listing] = []
     seen_ids: set[str] = set()
     MAX_PAGES = 50
+    # Concurrence bornée à 2 (au lieu de 5 d'un coup) — réduit la pression
+    # DataDome sur SeLoger.
+    _sel_sem = asyncio.Semaphore(2)
 
     async def _fetch_page(page_num: int):
         page_url = f"{search_url}{sep}page={page_num}" if page_num > 1 else search_url
-        try:
-            return await _pw_get_seloger_data(page_url)
-        except Exception as exc:
-            logger.warning("[SELOGER] page %d failed: %s", page_num, exc)
-            return None
+        async with _sel_sem:
+            try:
+                return await _pw_get_seloger_data(page_url)
+            except Exception as exc:
+                logger.warning("[SELOGER] page %d failed: %s", page_num, exc)
+                return None
 
-    # Fetch in waves of 5 to balance speed vs. SeLoger rate-limiting tolerance
+    # Fetch in waves of 5 (concurrence réelle plafonnée à 2 par le sémaphore)
     page = 1
     while page <= MAX_PAGES and len(listings) < max_results:
         wave = list(range(page, min(page + 5, MAX_PAGES + 1)))
@@ -2658,17 +2687,22 @@ _HTTPX_HEADERS = {
 }
 
 
-async def _fetch_pages_httpx(urls: list[str], timeout: int = 15) -> list[Optional[str]]:
-    """Fetch a list of URLs in parallel via httpx. Returns HTML strings (or None
-    on failure) in the same order as input. Used by SSR sites with no bot block."""
+async def _fetch_pages_httpx(urls: list[str], timeout: int = 15,
+                             concurrency: int = 2) -> list[Optional[str]]:
+    """Fetch a list of URLs via httpx, concurrence BORNÉE à `concurrency` (def. 2).
+    Returns HTML strings (or None on failure) in the same order as input. Le cap
+    évite les rafales (N pages d'un coup) qui pesaient sur l'anti-bot / saturaient
+    les connexions. Used by SSR sites with no bot block."""
     client = _get_shared_httpx()
+    sem = asyncio.Semaphore(max(1, concurrency))
     async def _one(url: str) -> Optional[str]:
-        try:
-            r = await client.get(url, headers=_HTTPX_HEADERS, timeout=timeout)
-            return r.text if r.status_code == 200 else None
-        except Exception as exc:
-            logger.warning("httpx fetch failed for %s: %s", url, exc)
-            return None
+        async with sem:
+            try:
+                r = await client.get(url, headers=_HTTPX_HEADERS, timeout=timeout)
+                return r.text if r.status_code == 200 else None
+            except Exception as exc:
+                logger.warning("httpx fetch failed for %s: %s", url, exc)
+                return None
     return await asyncio.gather(*(_one(u) for u in urls))
 
 
@@ -5578,13 +5612,48 @@ from collections import deque as _deque, defaultdict as _defaultdict
 
 _dd_events: "dict[str, _deque]" = _defaultdict(lambda: _deque(maxlen=300))
 
+# ─── Backoff exponentiel sur 403 ─────────────────────────────────────────────
+# Dès qu'une source DataDome renvoie 403, on la met en pause croissante (1, 2,
+# 4, 8, 16 min… plafonné) au lieu de marteler — ce martèlement de 403 est ce qui
+# renforce le flag IP. `_dd_should_skip(source)` est vérifié en tête des chemins
+# de scrape (LBC API, SeLoger) qui retournent vide sans taper le réseau pendant
+# la pause. Un succès (200) réarme à zéro.
+_DD_BACKOFF_BASE_S = 60.0
+_DD_BACKOFF_CAP_S = 30 * 60.0   # plafond 30 min
+_dd_backoff: "dict[str, dict]" = {}
+
 
 def _record_dd(source: str, blocked: bool) -> None:
-    """Enregistre l'issue d'une requête vers une source DataDome (True=403/bloqué)."""
+    """Enregistre l'issue d'une requête vers une source DataDome (True=403/bloqué)
+    et met à jour le backoff exponentiel."""
     try:
         _dd_events[source].append((time.time(), blocked))
+        st = _dd_backoff.setdefault(source, {"until": 0.0, "consec": 0})
+        if blocked:
+            st["consec"] += 1
+            delay = min(_DD_BACKOFF_BASE_S * (2 ** (st["consec"] - 1)), _DD_BACKOFF_CAP_S)
+            st["until"] = time.time() + delay
+            logger.warning("[BACKOFF] %s bloqué (×%d) → pause %.0f min",
+                           source, st["consec"], delay / 60)
+        else:
+            if st["consec"]:
+                logger.info("[BACKOFF] %s rétabli — backoff réarmé", source)
+            st["consec"] = 0
+            st["until"] = 0.0
     except Exception:
         pass
+
+
+def _dd_should_skip(source: str) -> bool:
+    """True si `source` est en backoff 403 (ne pas taper le réseau maintenant)."""
+    st = _dd_backoff.get(source)
+    if not st:
+        return False
+    remaining = st["until"] - time.time()
+    if remaining > 0:
+        logger.info("[BACKOFF] %s en pause encore %.0fs — scrape sauté", source, remaining)
+        return True
+    return False
 
 
 def datadome_block_rates(window_s: float = 3600.0) -> dict:
@@ -5619,7 +5688,8 @@ async def _lbc_sentinel_poll() -> Optional[str]:
     try:
         def _do():
             return _ccffi.post(_LBC_API_URL, headers=headers, json=body,
-                              impersonate="safari17_0", timeout=10)
+                              impersonate="safari17_0", timeout=10,
+                              proxies=_proxy_curl())
         r = await asyncio.to_thread(_do)
     except Exception as exc:
         _lbc_sentinel_consec_fails += 1

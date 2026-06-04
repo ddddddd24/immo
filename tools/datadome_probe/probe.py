@@ -67,12 +67,14 @@ def show_dd(r):
 
 def test_ip():
     line("── [1] Identité IP / ASN ─────────────────────────────")
+    ip_addr = "?"
     try:
         ip = ccffi.get("https://api.ipify.org?format=json", timeout=10).json()
-        line(f"    IP publique : {ip.get('ip')}")
+        ip_addr = ip.get("ip") or "?"
+        line(f"    IP publique : {ip_addr}")
     except Exception as e:
         line(f"    ipify échec : {e}")
-        return
+        return ip_addr
     try:
         # ip-api gratuit, pas de clé, renvoie ASN/ISP
         info = ccffi.get(f"http://ip-api.com/json/{ip['ip']}?fields=isp,org,as,country,city",
@@ -81,8 +83,11 @@ def test_ip():
         line(f"    ASN : {info.get('as')}")
         line(f"    Org : {info.get('org')}")
         line(f"    Loc : {info.get('city')}, {info.get('country')}")
+        if "Orange" in (info.get("isp") or "") and "86.247.64.52" == ip_addr:
+            line("    ⚠️ IP identique à l'IP flaggée (86.247.64.52) — pas changé.")
     except Exception as e:
         line(f"    ip-api échec : {e}")
+    return ip_addr
 
 
 def lbc_request(impersonate, ua, limit=1):
@@ -166,27 +171,34 @@ def test_seloger_variants():
 def main():
     line("=" * 60)
     line(" SONDE DATADOME — LBC + SeLoger")
+    line(" (lance ce script branché en 4G pour comparer à l'IP Box)")
     line("=" * 60)
-    test_ip()
-    lbc_ok = test_lbc()
-    sel_ok = test_seloger()
+    ip_addr = test_ip()
+    test_lbc()
+    test_seloger()
     lbc_b, lbc_t = test_lbc_variants()
     sel_b, sel_t = test_seloger_variants()
 
+    lbc_200, sel_200 = lbc_t - lbc_b, sel_t - sel_b
+    total_200 = lbc_200 + sel_200
+
     line("\n" + "=" * 60)
-    line(" VERDICT")
+    line(" VERDICT  (200 = passe ✓   |   403 = bloqué DataDome ✗)")
     line("=" * 60)
-    line(f"  LBC requête actuelle    : {'PASSE' if lbc_ok else 'BLOQUÉE'}")
-    line(f"  SeLoger requête actuelle: {'PASSE' if sel_ok else 'BLOQUÉE'}")
-    line(f"  LBC variantes bloquées  : {lbc_b}/{lbc_t}")
-    line(f"  SeLoger variantes bloq. : {sel_b}/{sel_t}")
-    if lbc_b == lbc_t and sel_b == sel_t and not lbc_ok and not sel_ok:
-        line("\n  → TOUTES les signatures bloquées sur cette IP.")
-        line("    Hypothèse IP-flaggée CONFIRMÉE (pas un problème de fingerprint).")
-    elif lbc_ok or sel_ok:
-        line("\n  → Au moins une requête passe : ce n'est pas (uniquement) l'IP.")
+    line(f"  IP testée : {ip_addr}")
+    line(f"  LBC      : {lbc_200} × 200   /   {lbc_b} × 403     (sur {lbc_t} tests)")
+    line(f"  SeLoger  : {sel_200} × 200   /   {sel_b} × 403     (sur {sel_t} tests)")
+    line("")
+    if total_200 == 0:
+        line("  ❌ ENCORE BLOQUÉ — 0 requête passe sur cette IP.")
+        line("     → Si tu es en 4G : même la 4G est bloquée → passer au proxy.")
+        line("     → Si tu es sur la Box : IP toujours flaggée.")
+    elif lbc_200 > 0 and sel_200 > 0:
+        line("  ✅ DÉBLOQUÉ — LBC ET SeLoger passent sur cette IP !")
+        line("     → En 4G : CONFIRMÉ, l'IP était bien le seul problème.")
+        line("     → Reste à pérenniser (proxy mobile/résidentiel ou 4G dédiée).")
     else:
-        line("\n  → Résultat mixte — voir détails ci-dessus.")
+        line("  ⚠️ PARTIEL — une source passe, pas l'autre (voir détails ci-dessus).")
 
 
 if __name__ == "__main__":

@@ -260,6 +260,15 @@ DISABLED_SOURCES: set = {
     if s.strip()
 }
 
+# ─── Proxy (PRÉPARÉ, INACTIF par défaut) ─────────────────────────────────────
+# Fix durable contre le flag IP DataDome. Quand USE_PROXY=True ET PROXY_URL non
+# vide, les requêtes curl_cffi (LBC API, sentinel, SeLoger) et httpx passent par
+# le proxy (voir _proxy_curl/_proxy_httpx dans scraper.py). Format attendu :
+#   http://user:pass@host:port   (ou socks5://user:pass@host:port)
+# NE PAS activer avant d'avoir un proxy résidentiel/mobile FR configuré.
+USE_PROXY: bool = os.getenv("USE_PROXY", "false").strip().lower() in ("1", "true", "yes")
+PROXY_URL: str = os.getenv("PROXY_URL", "").strip()
+
 # CDC Habitat (public sister of Inli) — 573k national units, ~44 IDF listings
 # ≤1100€ CC, 62% intermediate (sweet spot for SNCF alternant). Server-rendered.
 DEFAULT_SEARCH_CDC_URL: str = os.getenv(
