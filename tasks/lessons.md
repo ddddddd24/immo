@@ -158,6 +158,53 @@ DataDome (Scrapfly/Roundproxies 2026) et domine quand l'IP est grillée.
 3. **PAYANT (accord requis)** : proxy résidentiel/mobile FR (mobile > résidentiel
    pour DataDome), ~3-15 €/mois.
 
+### MAJ 2026-06-03 : le refresh IP Orange a ÉCHOUÉ (IP sticky)
+Box Livebox débranchée (prise) **6h** → IP **identique** (`86.247.64.52`), LBC/SeLoger
+toujours 403. Orange réattribue la même IP sur la ligne après 6h de coupure.
+→ Le levier "refresh IP gratuit" n'est PAS fiable sur cette ligne Orange.
+Pistes restantes : coupure beaucoup plus longue (12-24h+, incertain), **tethering
+4G/5G** (IP mobile, bien notée par DataDome — à tester via probe.py), ou **proxy
+résidentiel/mobile payant** (~3-15€/mo, seul fix durable fiable). Décision user en cours.
+
+### MAJ 2026-06-04 : test 4G = DÉBLOQUÉ → diagnostic IP confirmé à 100%
+PC routé via partage de connexion 4G du tel → IP `92.184.97.174` (Orange mobile,
+différente de la Box). Résultat : **LBC API safari17_0 → 200 ✅, SeLoger → 200 ✅**
+(vs 8/8 + 3/3 en 403 sur l'IP Box). Preuve finale : c'était 100% la réputation IP.
+→ Fix durable = IP non-flaggée : **proxy mobile/résidentiel FR** (mobile = idéal,
+confirmé ici) ou 4G dédiée. Le proxy est déjà préparé (config.USE_PROXY/PROXY_URL).
+Piège routage Windows : Ethernet Box (metric 0) gagne sur le hotspot USB ; il faut
+désactiver l'Ethernet Box pour forcer le passage 4G.
+**Note fingerprint** : sur l'IP mobile, SeLoger `chrome120` → 403 mais `chrome124`
+et `safari17_0` → 200. Envisager de bumper SeLoger chrome120→chrome124 (gain even
+on a clean IP). LBC safari17_0 (chemin prod) → 200, OK.
+
+### MAJ 2026-06-05 : l'IP Orange CYCLE sur un petit pool (pas une IP fixe)
+Reconnexions successives → IP varie dans un pool restreint :
+- `86.247.64.52` (Vitry) = FLAGGÉE (LBC+SeLoger 403)
+- `90.16.28.212` (Paris) = LBC ✅ (200), SeLoger ❌ (CAPTCHA `t=bv`)
+- `92.184.97.174` (4G mobile) = LBC ✅ + SeLoger ✅
+→ Reconnecter = loterie (on peut retomber sur la flaggée). Le Box IP est donc
+**non fiable pour du 24/7**. Pour de la stabilité : IP dédiée (proxy mobile / 4G).
+
+### Enquête SeLoger (pourquoi KO même sur IP fixe fraîche) — `tools/datadome_probe/seloger_invest.py`
+curl_cffi : 403 sur TOUT (cookie handshake, home-warm, headers complets, 5 finger-
+prints). Camoufox : sert une **iframe CAPTCHA `geo.captcha-delivery.com/captcha/?...t=bv`**
+(`t=bv` = vrai captcha à résoudre, pas un challenge silencieux). → Pas un bug code/
+header/cookie/fingerprint : DataDome juge le score IP trop bas et exige un captcha.
+**LBC (API mobile lax) passe sur IP fraîche ; SeLoger (web DataDome strict) exige une
+IP haut-score = MOBILE.** Un proxy résidentiel fixe/datacenter ne suffira probablement
+pas pour SeLoger — viser MOBILE.
+
+### MAJ 2026-06-05 : SeLoger = réputation PAR IP, même sur mobile (pas un durcissement)
+À ~2h d'intervalle : IP 4G `92.184.97.174` → SeLoger **200** (curl_cffi direct, aucun
+challenge) ; IP 4G `92.184.97.67` (même opérateur) → SeLoger **captcha `t=bv`**.
+Ce n'est PAS un durcissement DataDome (2h, jeudi minuit = invraisemblable). C'est la
+**réputation par IP** : les IP mobiles sont partagées (CGNAT), certaines propres,
+d'autres cramées par d'autres bots. DataDome choisit le niveau de challenge par IP.
+→ SeLoger PEUT marcher sur mobile (prouvé), mais il faut une **IP mobile PROPRE**.
+Implication proxy : viser un **proxy mobile avec ROTATION d'IP** (pool propre) — pas
+une IP mobile unique. Toujours RE-tester (probe.py) sur l'IP candidate avant d'acheter.
+
 ### Règle going forward
 > Source DataDome silencieuse (0 listing) : lancer `tools/datadome_probe/probe.py`
 > AVANT de toucher au code. Si toutes les signatures 403 sur l'IP courante →

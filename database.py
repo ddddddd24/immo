@@ -970,6 +970,25 @@ def is_suspicious_listing(listing, *, skip_price_anomaly: bool = False) -> tuple
 
 # ─── Activity check (cross-source) ────────────────────────────────────────────
 
+def existing_lbc_ids(ids: list) -> set:
+    """Sous-ensemble de `ids` déjà présents dans la table listings.
+    Sert au trim SeLoger : n'enrichir (pages détail) que les NOUVELLES annonces,
+    les connues gardent leur détail existant (pas de re-téléchargement)."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return set()
+    out: set = set()
+    with _conn() as conn:
+        for i in range(0, len(ids), 900):  # chunk (limite placeholders SQLite)
+            chunk = ids[i:i + 900]
+            ph = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT lbc_id FROM listings WHERE lbc_id IN ({ph})", chunk
+            ).fetchall()
+            out.update(r["lbc_id"] for r in rows)
+    return out
+
+
 def mark_seen(source: str, lbc_ids: list) -> int:
     """Stamp `seen_at = now` for every listing in (source, lbc_ids).
 

@@ -34,28 +34,31 @@ _MAX_WAIT = 300
 _shared_httpx: Optional[httpx.AsyncClient] = None
 
 
-# ─── Points d'injection PROXY (inactifs tant que config.USE_PROXY=False) ──────
-def _proxy_httpx() -> Optional[str]:
-    """URL proxy pour httpx, ou None si désactivé. Point d'injection httpx."""
-    if getattr(config, "USE_PROXY", False) and getattr(config, "PROXY_URL", ""):
+# ─── Points d'injection PROXY (routage SÉLECTIF par source) ───────────────────
+# Inactif tant que config.USE_PROXY=False. Quand actif, SEULES les sources de
+# config.PROXY_SOURCES (par défaut {"seloger"}) passent par le proxy ; LBC + les
+# 19 autres restent en DIRECT (le client httpx partagé n'est jamais proxifié car
+# il ne sert que des sources directes — SeLoger utilise ses propres AsyncSession).
+def _proxy_url_for(source: str) -> Optional[str]:
+    if (getattr(config, "USE_PROXY", False) and getattr(config, "PROXY_URL", "")
+            and source in getattr(config, "PROXY_SOURCES", set())):
         return config.PROXY_URL
     return None
 
 
-def _proxy_curl() -> Optional[dict]:
-    """Dict `proxies` pour curl_cffi (post/AsyncSession), ou None si désactivé.
-    Point d'injection curl_cffi — à passer en `proxies=_proxy_curl()`."""
-    url = _proxy_httpx()
-    return {"http": url, "https": url} if url else None
+def _proxy_curl(source: str) -> Optional[dict]:
+    """Dict `proxies` curl_cffi pour `source` (None = direct). À passer en
+    `proxies=_proxy_curl("seloger")` / `_proxy_curl("leboncoin")`."""
+    u = _proxy_url_for(source)
+    return {"http": u, "https": u} if u else None
 
 
 def _get_shared_httpx() -> httpx.AsyncClient:
-    """Return the process-wide AsyncClient, creating it lazily."""
+    """Return the process-wide AsyncClient, creating it lazily.
+    DIRECT (jamais proxifié) — sert PAP/FNAIM/Bien'ici/etc. qui marchent sur l'IP
+    Box. SeLoger (proxifiable) passe par ses propres AsyncSession curl_cffi."""
     global _shared_httpx
     if _shared_httpx is None or _shared_httpx.is_closed:
-        _proxy_kwargs = {}
-        if (_p := _proxy_httpx()):
-            _proxy_kwargs["proxy"] = _p  # httpx ≥0.26 ; inactif par défaut
         _shared_httpx = httpx.AsyncClient(
             timeout=30.0,
             follow_redirects=True,
@@ -64,7 +67,6 @@ def _get_shared_httpx() -> httpx.AsyncClient:
                 max_keepalive_connections=10,
                 keepalive_expiry=30.0,
             ),
-            **_proxy_kwargs,
         )
     return _shared_httpx
 
@@ -982,7 +984,7 @@ async def _search_lbc_with_api(search_url: str, max_results: int = 35) -> list[L
         def _do():
             return _ccffi.post(_LBC_API_URL, headers=headers, json=body,
                                impersonate="safari17_0", timeout=15,
-                               proxies=_proxy_curl())
+                               proxies=_proxy_curl("leboncoin"))
         r = await asyncio.to_thread(_do)
     except Exception as exc:
         logger.warning("[LBC-API] request raised: %s — falling back to Playwright", exc)
@@ -1086,8 +1088,11 @@ async def _pw_get_seloger_data(url: str) -> Optional[dict]:
 
     ssr_html: Optional[str] = None
     try:
-        async with AsyncSession(impersonate="chrome120", timeout=30,
-                                proxies=_proxy_curl()) as session:
+        # chrome124 (pas chrome120) : sur IP mobile, chrome120→403 mais
+        # chrome124→200 (test 4G du 2026-06-04). Neutre sur l'IP Box (SeLoger
+        # bloqué de toute façon, c'est une source proxy-only).
+        async with AsyncSession(impersonate="chrome124", timeout=30,
+                                proxies=_proxy_curl("seloger")) as session:
             r = await session.get(url, allow_redirects=True)
             if r.status_code == 200:
                 _record_dd("seloger", False)
@@ -1230,11 +1235,28 @@ async def _search_seloger_with_playwright(search_url: str, max_results: int) -> 
             break
         page += 5
 
-    # Phase 2: detail-page enrichment for non-meublé / no-ascenseur
+    # Phase 2: enrichissement détail — UNIQUEMENT les NOUVELLES annonces (absentes
+    # de la base). Les annonces déjà connues gardent leur détail existant : pas de
+    # re-téléchargement. Le search renvoie quand même TOUT le stock courant → seen_at
+    # se met à jour → la détection des annonces disparues (louées/retirées) via
+    # mark_stale_listings reste OK sans détail. L'enrichissement = ~90% de la conso
+    # data SeLoger ; ne le faire que sur le nouveau divise drastiquement le volume
+    # (clé pour un proxy mobile facturé au Go). Voir database.existing_lbc_ids.
     if listings:
+        try:
+            import database as _db_sel
+            _known = _db_sel.existing_lbc_ids([l.lbc_id for l in listings])
+        except Exception as _e:
+            logger.warning("[SELOGER] existing_lbc_ids échec (%s) — enrichit tout", _e)
+            _known = set()
+        to_enrich = [l for l in listings if l.lbc_id not in _known]
+        logger.info("[SELOGER] enrichissement détail : %d nouvelles / %d (skip %d connues)",
+                    len(to_enrich), len(listings), len(listings) - len(to_enrich))
+    if listings and to_enrich:
         from curl_cffi.requests import AsyncSession
         sem_d = asyncio.Semaphore(10)
-        async with AsyncSession(impersonate="chrome120", timeout=20) as session:
+        async with AsyncSession(impersonate="chrome124", timeout=20,
+                                proxies=_proxy_curl("seloger")) as session:
             async def _enrich(lst):
                 async with sem_d:
                     try:
@@ -1260,7 +1282,7 @@ async def _search_seloger_with_playwright(search_url: str, max_results: int) -> 
                     if tags:
                         lst.description = (lst.description + "\n" + " ".join(tags)).strip()
                     return None
-            drops = await asyncio.gather(*(_enrich(l) for l in listings))
+            drops = await asyncio.gather(*(_enrich(l) for l in to_enrich))
             drop_set = {d for d in drops if d}
             if drop_set:
                 logger.info("[SELOGER] Dropped %d (non-meublé / étage>3 sans asc)", len(drop_set))
@@ -5689,7 +5711,7 @@ async def _lbc_sentinel_poll() -> Optional[str]:
         def _do():
             return _ccffi.post(_LBC_API_URL, headers=headers, json=body,
                               impersonate="safari17_0", timeout=10,
-                              proxies=_proxy_curl())
+                              proxies=_proxy_curl("leboncoin"))
         r = await asyncio.to_thread(_do)
     except Exception as exc:
         _lbc_sentinel_consec_fails += 1

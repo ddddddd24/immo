@@ -268,6 +268,13 @@ DISABLED_SOURCES: set = {
 # NE PAS activer avant d'avoir un proxy résidentiel/mobile FR configuré.
 USE_PROXY: bool = os.getenv("USE_PROXY", "false").strip().lower() in ("1", "true", "yes")
 PROXY_URL: str = os.getenv("PROXY_URL", "").strip()
+# Routage SÉLECTIF : seules ces sources passent par le proxy (les autres restent
+# en DIRECT sur l'IP Box, gratuit). Par défaut : SeLoger uniquement (seul à
+# exiger une IP mobile — LBC passe en direct sur une IP Box propre). Clés
+# normalisées (cf. _SOURCE_LABELS). Étendre via env PROXY_SOURCES="seloger,logicimmo".
+PROXY_SOURCES: set = {
+    s.strip() for s in os.getenv("PROXY_SOURCES", "seloger").split(",") if s.strip()
+}
 
 # CDC Habitat (public sister of Inli) — 573k national units, ~44 IDF listings
 # ≤1100€ CC, 62% intermediate (sweet spot for SNCF alternant). Server-rendered.
