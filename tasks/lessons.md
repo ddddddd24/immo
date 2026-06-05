@@ -205,6 +205,21 @@ d'autres cramées par d'autres bots. DataDome choisit le niveau de challenge par
 Implication proxy : viser un **proxy mobile avec ROTATION d'IP** (pool propre) — pas
 une IP mobile unique. Toujours RE-tester (probe.py) sur l'IP candidate avant d'acheter.
 
+### MAJ 2026-06-05 : conso data SeLoger + leviers (mesure réelle sur IP mobile)
+Scrape SeLoger complet mesuré (octets sur le fil) : **108 Mo/scrape** → ~465 Go/mois
+à 144 scrapes/j. Ventilation : search (pagination ~16 pages) = **32 Mo**, détail =
+**81 Ko/page × ~844 pages = 68 Mo**. Leviers (par impact) :
+1. **Enrich detail new-only** (database.existing_lbc_ids) : 465 → ~137 Go/mois.
+2. **Shallow/deep** (scraper, gate bot_state `seloger_last_deep` 20h) : 3 pages/cycle
+   + full pagination 1×/j → ~137 → **~27 Go/mois** (estimé : shallow=3/16 du search).
+3. **gzip** : INUTILE — curl_cffi demande déjà gzip via l'impersonation et SeLoger
+   renvoie NON-compressé (ratio mesuré ~1.0). Forcer le header = no-op + dégrade le
+   fingerprint. (Confirmation Content-Encoding à faire au prochain 200.)
+Disparition (mark_stale_listings seuil 24h) : OK car deep ≤20h < 24h rafraîchit seen_at.
+Une annonce apparue au-delà de la page 3 est rattrapée par le deep quotidien (perte
+max ~1 jour sur une annonce rare en fond de liste — acceptable).
+**→ Cible proxy SeLoger ≈ 27 Go/mois** (≈18 si shallow=2 pages ; gzip n'aide pas).
+
 ### Règle going forward
 > Source DataDome silencieuse (0 listing) : lancer `tools/datadome_probe/probe.py`
 > AVANT de toucher au code. Si toutes les signatures 403 sur l'IP courante →

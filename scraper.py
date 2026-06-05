@@ -1191,7 +1191,30 @@ async def _search_seloger_with_playwright(search_url: str, max_results: int) -> 
 
     listings: list[Listing] = []
     seen_ids: set[str] = set()
-    MAX_PAGES = 50
+
+    # Shallow/deep : à chaque cycle (toutes les 10 min) on ne scrape que les
+    # SELOGER_SHALLOW_PAGES premières pages (les annonces les plus récentes →
+    # détection du nouveau). La pagination COMPLÈTE ne tourne qu'~1×/jour pour
+    # rafraîchir seen_at sur tout le stock et détecter les disparues
+    # (mark_stale_listings, seuil 24h). Le deep (toutes les 20h) passe AVANT le
+    # seuil de 24h → pas de faux "disparu". Une annonce nouvelle apparue au-delà
+    # de la page shallow est rattrapée au + tard par le deep quotidien (perte
+    # max ~1 cycle deep sur une annonce rare en fond de liste — acceptable, et
+    # via le proxy ça divise la conse search par ~5). Gros gain data.
+    SELOGER_SHALLOW_PAGES = 3
+    _SEL_DEEP_EVERY_S = 20 * 3600
+    try:
+        import database as _db_depth
+        _last_deep = float(_db_depth.get_state("seloger_last_deep", "0") or "0")
+        _deep = (time.time() - _last_deep) > _SEL_DEEP_EVERY_S
+        if _deep:
+            _db_depth.set_state("seloger_last_deep", str(time.time()))
+    except Exception:
+        _deep = False
+    MAX_PAGES = 50 if _deep else SELOGER_SHALLOW_PAGES
+    logger.info("[SELOGER] mode=%s (MAX_PAGES=%d)",
+                "DEEP (stock complet, ~1×/j)" if _deep else f"shallow ({SELOGER_SHALLOW_PAGES} pages)",
+                MAX_PAGES)
     # Concurrence bornée à 2 (au lieu de 5 d'un coup) — réduit la pression
     # DataDome sur SeLoger.
     _sel_sem = asyncio.Semaphore(2)
