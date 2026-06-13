@@ -1909,12 +1909,17 @@ def _parse_pasted_ad(text: str):
     )
 
 
-def _render_generate() -> str:
-    """Static page (served locally AND pushed to GitHub Pages) that posts a
-    pasted ad to {backend}/generate. Contains NO secret: the backend URL and
-    token are entered once by the user and kept in the browser's localStorage.
+def _render_generate(token_default: str = "") -> str:
+    """Page that posts a pasted ad to {backend}/generate.
+
+    Served two ways:
+    - by the LOCAL dashboard (do_GET) with token_default=config.GENERATE_TOKEN
+      → on localhost the token is pre-filled and the backend auto-fills to the
+      page origin, so there is NOTHING to type.
+    - by generate_static.py for GitHub Pages with token_default="" → the public
+      page carries NO secret; the user enters the tunnel URL + token once.
     """
-    return """<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="fr"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1965,7 +1970,7 @@ def _render_generate() -> str:
     <label>Backend URL (URL du tunnel Cloudflare, ex: https://xxxx.trycloudflare.com)</label>
     <input id="backend" placeholder="https://....trycloudflare.com">
     <label>Token</label>
-    <input id="token" type="password" placeholder="ton GENERATE_TOKEN">
+    <input id="token" type="password" placeholder="ton GENERATE_TOKEN" value="__GENERATE_TOKEN__">
   </details>
 
   <label>Colle l'annonce ici (titre + description)</label>
@@ -1996,6 +2001,11 @@ def _render_generate() -> str:
   // Restore saved settings
   for (const k of ["backend","token"]) {
     const v = localStorage.getItem("gen_"+k); if (v) $(k).value = v;
+  }
+  // On localhost the page is served by the backend itself → auto-fill the URL
+  // so nothing has to be typed on PC. (On GitHub Pages the user enters the tunnel URL.)
+  if (!$("backend").value && ["localhost","127.0.0.1"].includes(location.hostname)) {
+    $("backend").value = location.origin;
   }
   $("backend").addEventListener("change", e => localStorage.setItem("gen_backend", e.target.value.trim()));
   $("token").addEventListener("change", e => localStorage.setItem("gen_token", e.target.value));
@@ -2035,6 +2045,7 @@ def _render_generate() -> str:
   });
 </script>
 </body></html>"""
+    return html.replace("__GENERATE_TOKEN__", token_default)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -2100,7 +2111,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif path in ("/sys", "/system", "/system-stats"):
             self._send_html(_render_system_stats())
         elif path in ("/generate.html", "/generate-ui"):
-            self._send_html(_render_generate())
+            # Locally-served page is NOT public → safe to pre-fill the token.
+            self._send_html(_render_generate(config.GENERATE_TOKEN))
         elif path == "/api/stats":
             self._send_json(_stats())
         elif path == "/api/sys":
