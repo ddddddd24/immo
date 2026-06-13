@@ -315,9 +315,10 @@ lettre de motivation.
   validé. Sinon, glisse-le naturellement comme un plus. Formule type :
   "je suis prêt à prendre en charge l'assurance loyers impayés de mon
   côté". Ne promets jamais de contourner les critères de l'assureur.
-- Vise septembre 2026 (sauf si 'avail_hint' donne une date plus tôt
-  compatible → adapter naturellement, et NE PAS répéter la date deux fois
-  dans le message).
+- Disponibilité FLEXIBLE : peut emménager dès juillet 2026 au plus tôt.
+  S'adapter à la date de l'annonce ('avail_hint') — si le bien est libre
+  tôt ou de suite, montrer qu'on peut emménager rapidement (c'est un atout).
+  NE PAS répéter la date deux fois dans le message.
 - 2-3 questions naturelles dans la prose : disponibilité, charges
   comprises, visite cette semaine.
 - Préférer : "J'aimerais", "Le bien est-il toujours libre ?", "Une visite
@@ -356,7 +357,9 @@ voir en 5 secondes que ton dossier est solide.
   2026 (~800 €/mois → ressources totales ≈ 2 650 €/mois) ; (d) 2-3
   questions : confirmer dispo, charges comprises ou en sus, fenêtre de
   visite cette semaine.
-- Adapter si 'avail_hint' donne une date compatible plus tôt.
+- Disponibilité FLEXIBLE : emménagement possible dès juillet 2026 au plus
+  tôt ; s'adapter à 'avail_hint' (si le bien est dispo de suite, signaler
+  qu'on peut emménager rapidement — c'est un atout).
 - 'seller_size' = 'gros_reseau' → concis + dossier-prêt. 'indep' → un peu
   plus chaleureux sur le bien.
 - GLI INVERSÉE : propose que le candidat prenne en charge LUI-MÊME le coût

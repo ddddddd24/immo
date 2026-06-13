@@ -18,7 +18,7 @@ PROFILE = {
         ],
         "furnished": True,
         "balcony_preferred": True,
-        "move_in": "Septembre 2026",
+        "move_in": "Dès juillet 2026 au plus tôt (flexible)",
         "excluded_zones": ["Sarcelles", "quartiers défavorisés"],
     },
 }
