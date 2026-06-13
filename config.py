@@ -40,6 +40,11 @@ USE_DEEPSEEK: bool = os.getenv("USE_DEEPSEEK", "false").lower() in ("true", "1",
 DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
+# Shared secret protecting the dashboard /generate endpoint (exposed via a
+# Cloudflare tunnel for the GitHub-Pages message generator). Set in .env;
+# NEVER hardcode it here (config.py is committed). Empty = endpoint disabled.
+GENERATE_TOKEN: str = os.getenv("GENERATE_TOKEN", "")
+
 # Optional / defaults
 DB_PATH: str = os.getenv("DB_PATH", "data/bot.db")
 LOG_FILE: str = os.getenv("LOG_FILE", "leboncoin_bot.log")

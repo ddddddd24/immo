@@ -9,6 +9,7 @@ Two tabs:
 """
 import json
 import os
+import re
 import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -384,6 +385,7 @@ def _render_top20_today() -> str:
     <a href="/">📋 Annonces</a>
     <a href="today.html" class="active">🔥 Top du jour</a>
     <a href="/contacts">✉️ Contacts</a>
+    <a href="generate.html">✍️ Générer</a>
   </div>
 </div>
 <div class="content">
@@ -540,6 +542,7 @@ def _render_listings() -> str:
     <a href="index.html" class="active">📋 Annonces</a>
     <a href="today.html">🔥 Top du jour</a>
     <a href="contacts.html">✉️ Contacts</a>
+    <a href="generate.html">✍️ Générer</a>
   </div>
 </div>
 <div class="content">
@@ -1266,6 +1269,7 @@ def _render_listings_mobile() -> str:
   <a href="index.html" class="active"><span class="icon">📋</span><span>Annonces</span></a>
   <a href="today.html"><span class="icon">🔥</span><span>Top du jour</span></a>
   <a href="contacts.html"><span class="icon">✉️</span><span>Contacts</span></a>
+  <a href="generate.html"><span class="icon">✍️</span><span>Générer</span></a>
   <a href="#" id="nav-stats"><span class="icon">📊</span><span>Stats</span></a>
 </nav>
 
@@ -1845,6 +1849,7 @@ def _render_contacts() -> str:
     <a href="index.html">📋 Annonces</a>
     <a href="today.html">🔥 Top du jour</a>
     <a href="contacts.html" class="active">✉️ Contacts</a>
+    <a href="generate.html">✍️ Générer</a>
   </div>
 </div>
 <div class="content">
@@ -1866,9 +1871,223 @@ def _render_contacts() -> str:
 
 # ─── HTTP handler ────────────────────────────────────────────────────────────
 
+def _parse_pasted_ad(text: str):
+    """Build an agent.Listing from a raw pasted ad (title + full description).
+
+    Light regex extraction for price/surface; the LLM reads the whole
+    description anyway, so this only needs to fill the structured slots the
+    prompt builders use. Imported lazily so generate_static.py (which only
+    renders HTML) never triggers agent.py's LLM-client construction.
+    """
+    from agent import Listing  # lazy
+    text = (text or "").strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    title = lines[0][:120] if lines else "Annonce"
+    low = text.lower()
+
+    m = re.search(r"(\d{1,3})\s*m[²2]\b", low)
+    surface = int(m.group(1)) if m else None
+
+    price = 0
+    mp = re.search(r"loyer[^\d]{0,20}(\d[\d\s.]{1,7})", low)
+    if not mp:
+        mp = re.search(r"(\d[\d\s.]{2,7})\s*(?:€|eur)", low)
+    if mp:
+        digits = re.sub(r"[^\d]", "", mp.group(1))
+        if digits:
+            price = int(digits[:5])
+
+    return Listing(
+        lbc_id="paste",
+        title=title,
+        description=text,
+        price=price,
+        location="",
+        seller_name="",
+        url="",
+        surface=surface,
+    )
+
+
+def _render_generate() -> str:
+    """Static page (served locally AND pushed to GitHub Pages) that posts a
+    pasted ad to {backend}/generate. Contains NO secret: the backend URL and
+    token are entered once by the user and kept in the browser's localStorage.
+    """
+    return """<!DOCTYPE html>
+<html lang="fr"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>✍️ Générer un message</title>
+<style>
+  :root { --bg:#0a0a0f; --card:#15151f; --border:#26263a; --accent:#97C459;
+          --text:#e8e8f0; --muted:#8a8aa0; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .nav { display:flex; gap:14px; padding:14px 18px; border-bottom:1px solid var(--border);
+         font-size:15px; flex-wrap:wrap; }
+  .nav a { color:var(--muted); text-decoration:none; }
+  .nav a.active { color:var(--accent); }
+  .wrap { max-width:720px; margin:0 auto; padding:18px; }
+  h1 { font-size:20px; margin:8px 0 16px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:14px 0 5px; }
+  input, select, textarea {
+    width:100%; background:var(--card); color:var(--text);
+    border:1px solid var(--border); border-radius:10px; padding:11px 12px;
+    font-size:15px; font-family:inherit; }
+  textarea { min-height:200px; resize:vertical; line-height:1.45; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; }
+  details { margin:6px 0 4px; }
+  summary { cursor:pointer; color:var(--muted); font-size:13px; }
+  button { margin-top:16px; width:100%; background:var(--accent); color:#0a0a0f;
+    border:none; border-radius:10px; padding:13px; font-size:16px; font-weight:600;
+    cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #out { margin-top:18px; white-space:pre-wrap; background:var(--card);
+    border:1px solid var(--border); border-radius:10px; padding:14px; display:none;
+    line-height:1.5; }
+  #meta { font-size:12px; color:var(--muted); margin-top:8px; min-height:16px; }
+  .copy { background:var(--border); color:var(--text); }
+</style></head><body>
+<nav class="nav">
+  <a href="index.html">📋 Annonces</a>
+  <a href="today.html">🔥 Top du jour</a>
+  <a href="contacts.html">✉️ Contacts</a>
+  <a href="generate.html" class="active">✍️ Générer</a>
+</nav>
+<div class="wrap">
+  <h1>✍️ Générer un message de candidature</h1>
+
+  <details>
+    <summary>⚙️ Réglages backend (à remplir une fois)</summary>
+    <label>Backend URL (URL du tunnel Cloudflare, ex: https://xxxx.trycloudflare.com)</label>
+    <input id="backend" placeholder="https://....trycloudflare.com">
+    <label>Token</label>
+    <input id="token" type="password" placeholder="ton GENERATE_TOKEN">
+  </details>
+
+  <label>Colle l'annonce ici (titre + description)</label>
+  <textarea id="ad" placeholder="Colle ici le texte complet de l'annonce..."></textarea>
+
+  <div class="row">
+    <div>
+      <label>Type de vendeur</label>
+      <select id="seller">
+        <option value="auto">Auto (détecté)</option>
+        <option value="particulier">Particulier</option>
+        <option value="agence">Agence</option>
+      </select>
+    </div>
+    <div>
+      <label>Lien perso (optionnel)</label>
+      <input id="perso" placeholder="ex: j'ai grandi dans ce quartier">
+    </div>
+  </div>
+
+  <button id="go">Générer</button>
+  <div id="meta"></div>
+  <div id="out"></div>
+  <button id="copy" class="copy" style="display:none">📋 Copier</button>
+</div>
+<script>
+  const $ = id => document.getElementById(id);
+  // Restore saved settings
+  for (const k of ["backend","token"]) {
+    const v = localStorage.getItem("gen_"+k); if (v) $(k).value = v;
+  }
+  $("backend").addEventListener("change", e => localStorage.setItem("gen_backend", e.target.value.trim()));
+  $("token").addEventListener("change", e => localStorage.setItem("gen_token", e.target.value));
+
+  $("go").addEventListener("click", async () => {
+    const backend = $("backend").value.trim().replace(/\\/$/, "");
+    const token = $("token").value;
+    const text = $("ad").value.trim();
+    if (!backend || !token) { $("meta").textContent = "⚠️ Renseigne le backend + token dans ⚙️ Réglages."; return; }
+    if (!text) { $("meta").textContent = "⚠️ Colle d'abord une annonce."; return; }
+    localStorage.setItem("gen_backend", backend);
+    localStorage.setItem("gen_token", token);
+    $("go").disabled = true; $("go").textContent = "Génération…";
+    $("meta").textContent = ""; $("out").style.display = "none"; $("copy").style.display = "none";
+    try {
+      const r = await fetch(backend + "/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Generate-Token": token },
+        body: JSON.stringify({ text, perso: $("perso").value.trim(), seller_type: $("seller").value })
+      });
+      const data = await r.json();
+      if (!r.ok) { $("meta").textContent = "❌ " + (data.error || r.status); }
+      else {
+        $("out").textContent = data.message; $("out").style.display = "block";
+        $("copy").style.display = "block";
+        $("meta").textContent = "Type: " + data.seller_type
+          + (data.surface ? " · " + data.surface + " m²" : "")
+          + (data.price ? " · " + data.price + " €" : "");
+      }
+    } catch (e) { $("meta").textContent = "❌ Connexion impossible au backend (tunnel éteint ?)"; }
+    $("go").disabled = false; $("go").textContent = "Générer";
+  });
+
+  $("copy").addEventListener("click", () => {
+    navigator.clipboard.writeText($("out").textContent);
+    $("copy").textContent = "✅ Copié"; setTimeout(() => $("copy").textContent = "📋 Copier", 1500);
+  });
+</script>
+</body></html>"""
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Generate-Token")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != "/generate":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if not config.GENERATE_TOKEN or self.headers.get("X-Generate-Token") != config.GENERATE_TOKEN:
+            self._send_json({"error": "unauthorized"}, status=401)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self._send_json({"error": "bad request"}, status=400)
+            return
+        text = (payload.get("text") or "").strip()
+        if not text:
+            self._send_json({"error": "annonce vide"}, status=400)
+            return
+        perso = (payload.get("perso") or "").strip()
+        override = (payload.get("seller_type") or "auto").strip()
+        try:
+            import agent
+            listing = _parse_pasted_ad(text)
+            if override in ("particulier", "agence"):
+                seller_type = override
+            else:
+                seller_type = agent._detect_seller_type(listing)
+            message = agent._generate_message(listing, seller_type, perso)
+            self._send_json({
+                "message": message,
+                "seller_type": seller_type,
+                "surface": listing.surface,
+                "price": listing.price,
+            })
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -1880,6 +2099,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_html(_cached_html("contacts", _render_contacts))
         elif path in ("/sys", "/system", "/system-stats"):
             self._send_html(_render_system_stats())
+        elif path in ("/generate.html", "/generate-ui"):
+            self._send_html(_render_generate())
         elif path == "/api/stats":
             self._send_json(_stats())
         elif path == "/api/sys":
@@ -1903,10 +2124,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def _send_json(self, data):
+    def _send_json(self, data, status: int = 200):
         b = json.dumps(data, default=str).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self._cors()
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)

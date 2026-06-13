@@ -165,3 +165,49 @@ Illan's profile (alternant SNCF, ≤1000€, 25m²+, Paris+10km, sept 2026) is a
 - Run the bot, exercise `/campagne` against each new source, fix parser selectors based on actual scraped HTML.
 - Decide scoring policy: keep contact-then-notify? Or notify-only for high scores and skip contact?
 - Consider cost: with 11 sources × ~25 listings × $0.005 score = ~$1.40 per `/campagne` cycle if scoring enabled.
+
+---
+
+## Générateur de messages de candidature — web nomade (2026-06-13)
+
+### Objectif
+Coller le texte d'une annonce depuis le téléphone (site GitHub Pages) → message
+de candidature généré, en réutilisant `agent.py` (prompts Visale + garant + GLI
+inversée). Backend = serveur local `dashboard.py` exposé via Cloudflare Tunnel.
+Clé DeepSeek jamais exposée ; endpoint protégé par token.
+
+### Architecture
+- `public/generate.html` (statique, GitHub Pages) : textarea + lien perso +
+  sélecteur particulier/agence + champs "Backend URL"/"Token" (localStorage).
+- `POST {backend}/generate` (serveur local) : token → parse → Listing →
+  `_detect_seller_type` (ou override) → `_generate_message` → JSON.
+- Cloudflare quick tunnel (trycloudflare.com) ; URL collée 1x dans la page.
+
+### Tâches
+- [x] `config.py` : `GENERATE_TOKEN` depuis env (.env, jamais commit). + `.env.example`.
+- [x] `agent.py` : param `extra` dans `_generate_message` + builders (lien perso).
+- [x] `dashboard.py` : `_parse_pasted_ad`, `_render_generate`, GET `/generate.html`,
+      `do_POST`/`do_OPTIONS` + CORS, import `agent` lazy.
+- [x] `generate_static.py` : écrire `public/generate.html`.
+- [x] Liens nav "✍️ Générer" (today, listings, contacts, mobile).
+- [ ] Marche à suivre Cloudflare Tunnel (l'utilisateur lance `cloudflared`) — fournie.
+
+### Vérification
+- [x] `ast.parse` OK sur agent.py / dashboard.py / generate_static.py / config.py.
+- [x] `_render_generate()` (5430 chars) ne contient ni token ni URL en dur ; localStorage utilisé.
+- [x] POST /generate en local (MOCK_MODE) : mauvais token → 401 ; bon token → 200,
+      parse OK (particulier, 20 m², 800 €), message renvoyé.
+
+### Review
+- Backend = route sur le serveur local existant (zéro nouvelle dépendance, http.server).
+- Sécurité : endpoint protégé par `GENERATE_TOKEN` (header `X-Generate-Token`),
+  vide ⇒ 401 ; CORS `*` (le token est le vrai gate). Token jamais dans le repo.
+- Réutilise `agent._generate_message` (Visale + garant + GLI inversée) — zéro
+  duplication de prompt. Import `agent` lazy ⇒ generate_static n'a pas besoin des clés LLM.
+- Reste à faire (utilisateur) : `GENERATE_TOKEN` dans `.env`, redémarrer le dashboard,
+  lancer `cloudflared tunnel --url http://localhost:5000`, `python generate_static.py`
+  + push `public/`, puis coller URL+token dans ⚙️ de la page sur le téléphone.
+- NB : mixed-content — la page Pages est en HTTPS, donc utiliser l'URL **https**
+  trycloudflare (pas localhost) depuis le téléphone. Quick tunnel = URL change à
+  chaque redémarrage (recoller dans ⚙️) ; tunnel nommé = URL fixe si tu mets un domaine.
+- Pas de commit (laissé à ta main).

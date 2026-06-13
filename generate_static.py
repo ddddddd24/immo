@@ -38,6 +38,13 @@ def main() -> None:
     except Exception:
         pass
 
+    # Message generator (static page; posts to the local backend via tunnel).
+    # No secret embedded — backend URL + token live in the browser localStorage.
+    try:
+        (out_dir / "generate.html").write_text(dashboard._render_generate(), encoding="utf-8")
+    except Exception as e:
+        print(f"WARN: generate.html failed: {e}")
+
     print(f"OK → public/index.html ({(out_dir / 'index.html').stat().st_size // 1024} KB)")
 
 

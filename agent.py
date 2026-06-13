@@ -307,6 +307,14 @@ lettre de motivation.
   'Features vérifiées' du contexte. Si vide → parle de la localisation ou
   de la surface (réelle, fournie en contexte).
 - Mentionne SNCF (poste stable) + dossier solide avec garant Visale.
+- GLI INVERSÉE : propose de prendre en charge TOI-MÊME le coût de
+  l'assurance loyers impayés (GLI), pour que la garantie ne coûte rien au
+  propriétaire. C'est un argument fort et différenciant. Si la description
+  mentionne une GLI ou un organisme (Cautioneo, Garantme, assurance loyers
+  impayés), mets-le EN AVANT et indique que tu présenteras un dossier déjà
+  validé. Sinon, glisse-le naturellement comme un plus. Formule type :
+  "je suis prêt à prendre en charge l'assurance loyers impayés de mon
+  côté". Ne promets jamais de contourner les critères de l'assureur.
 - Vise septembre 2026 (sauf si 'avail_hint' donne une date plus tôt
   compatible → adapter naturellement, et NE PAS répéter la date deux fois
   dans le message).
@@ -351,13 +359,20 @@ voir en 5 secondes que ton dossier est solide.
 - Adapter si 'avail_hint' donne une date compatible plus tôt.
 - 'seller_size' = 'gros_reseau' → concis + dossier-prêt. 'indep' → un peu
   plus chaleureux sur le bien.
+- GLI INVERSÉE : propose que le candidat prenne en charge LUI-MÊME le coût
+  de l'assurance loyers impayés (GLI), pour qu'elle ne coûte rien au
+  bailleur — argument fort et différenciant. Si l'annonce mentionne une GLI
+  ou un organisme (Cautioneo, Garantme, assurance loyers impayés), mets-le
+  EN AVANT et précise que le dossier sera présenté déjà validé auprès de
+  l'organisme demandé. Sinon, glisse-le comme un atout. Ne promets jamais
+  de contourner les critères d'éligibilité de l'assureur.
 - Préférer : "Merci par avance", "Bonne journée", "Cordialement".
 - Signature : "Illan Krief".
 - Langue : français.
 """.strip()
 
 
-def _build_particulier_prompt(listing: Listing) -> str:
+def _build_particulier_prompt(listing: Listing, extra: str = "") -> str:
     features = _extract_listing_features(listing)
     kind = _listing_kind(listing)
     avail = _avail_hint(listing)
@@ -374,11 +389,12 @@ def _build_particulier_prompt(listing: Listing) -> str:
         f"- Description (extrait) : {(listing.description or '')[:500]}\n\n"
         f"Features vérifiées (utiliser UNE de la liste, ne pas inventer) :\n{feat_str}\n\n"
         + (f"avail_hint : {avail}\n\n" if avail else "")
+        + (f"Élément personnel à intégrer naturellement SI c'est pertinent (sinon l'ignorer complètement, ne force rien) : {extra}\n\n" if extra else "")
         + "Rédige le message de contact en respectant TOUTES les règles du system."
     )
 
 
-def _build_agence_prompt(listing: Listing) -> str:
+def _build_agence_prompt(listing: Listing, extra: str = "") -> str:
     features = _extract_listing_features(listing)
     kind = _listing_kind(listing)
     size = _seller_size_hint(listing.seller_name)
@@ -397,11 +413,12 @@ def _build_agence_prompt(listing: Listing) -> str:
         f"Features vérifiées (utiliser UNE de la liste, ne pas inventer) :\n{feat_str}\n\n"
         f"seller_size : {size}\n"
         + (f"avail_hint : {avail}\n\n" if avail else "\n")
+        + (f"Élément personnel à intégrer naturellement SI c'est pertinent (sinon l'ignorer complètement, ne force rien) : {extra}\n\n" if extra else "")
         + "Rédige le message de contact en respectant TOUTES les règles du system."
     )
 
 
-def _generate_message(listing: Listing, seller_type: SellerType) -> str:
+def _generate_message(listing: Listing, seller_type: SellerType, extra: str = "") -> str:
     if config.MOCK_MODE:
         from mock_data import generate_mock_message
         logger.info("[MOCK] Returning personalized template message for seller_type=%s", seller_type)
@@ -409,10 +426,10 @@ def _generate_message(listing: Listing, seller_type: SellerType) -> str:
 
     if seller_type == "particulier":
         system = _PARTICULIER_SYSTEM
-        user_prompt = _build_particulier_prompt(listing)
+        user_prompt = _build_particulier_prompt(listing, extra)
     else:
         system = _AGENCE_SYSTEM
-        user_prompt = _build_agence_prompt(listing)
+        user_prompt = _build_agence_prompt(listing, extra)
 
     resp = _call_claude(
         model=config.CLAUDE_MODEL,
