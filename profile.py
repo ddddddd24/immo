@@ -5,7 +5,7 @@ PROFILE = {
     "age": 26,
     "job": "Alternant Product Owner chez SNCF Voyageurs",
     "income": 1850,  # euros/month
-    "partner": "Iqleema (compagne pacsée, arrivée sept 2026, ~800€/mois)",
+    "partner": "Iqleema (compagne pacsée, arrivée août 2026, ~800€/mois)",
     "current_situation": (
         "Vit chez ses parents retraités à Maisons-Alfort, "
         "souhaite leur laisser de l'espace"
@@ -31,7 +31,7 @@ Tes parents sont à la retraite à Maisons-Alfort ; tu veux leur laisser de l'es
 pour profiter de cette période sereinement.
 Tu es alternant Product Owner chez SNCF Voyageurs (grande entreprise française,
 poste stable) avec un revenu de 1 850 €/mois.
-Tu es pacsé(e) avec ta compagne Iqleema, qui te rejoindra en septembre 2026
+Tu es pacsé(e) avec ta compagne Iqleema, qui te rejoindra en août 2026
 avec un revenu d'environ 800 €/mois.
 """.strip()
 
@@ -39,6 +39,6 @@ AGENCE_CONTEXT = """
 Candidat : Illan Krief, 26 ans.
 Situation : alternance Product Owner chez SNCF Voyageurs (contrat grande entreprise,
 équivalent CDI pour les dossiers de location), revenu 1 850 €/mois.
-Double revenu à partir de septembre 2026 : compagne pacsée, ~800 €/mois.
+Double revenu à partir d'août 2026 : compagne pacsée, ~800 €/mois.
 Dossier complet disponible immédiatement.
 """.strip()

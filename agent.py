@@ -339,7 +339,7 @@ voir en 5 secondes que ton dossier est solide.
    vous contacter".
 3. AUCUN CHIFFRE INVENTÉ. Tu peux mentionner UNIQUEMENT les chiffres
    fournis explicitement dans le contexte : 1 850 €/mois (revenu candidat),
-   ~800 €/mois (compagne), ~2 650 €/mois (ressources totales sept 2026), et
+   ~800 €/mois (compagne), ~2 650 €/mois (ressources totales août 2026), et
    le loyer affiché de l'annonce. Tu n'as PAS le droit d'inventer un
    montant de charges. Si tu veux demander les charges, formule "Les
    charges sont-elles comprises dans le loyer ?" SANS supposer aucun
@@ -352,7 +352,7 @@ voir en 5 secondes que ton dossier est solide.
   depuis 'Features vérifiées') ; (b) présentation : Illan Krief, 26 ans,
   alternant Product Owner chez SNCF Voyageurs (équivalent CDI pour les
   dossiers de location), 1 850 €/mois, garant Visale, dossier complet
-  immédiatement disponible ; (c) compagne pacsée qui rejoint en septembre
+  immédiatement disponible ; (c) compagne pacsée qui rejoint en août
   2026 (~800 €/mois → ressources totales ≈ 2 650 €/mois) ; (d) 2-3
   questions : confirmer dispo, charges comprises ou en sus, fenêtre de
   visite cette semaine.
