@@ -215,14 +215,63 @@ _BIG_CHAIN_HINTS = (
 )
 
 
+# Negation markers that, when they appear just BEFORE a feature keyword in the
+# same clause, mean the feature is ABSENT ("n'a pas de balcon", "sans balcon",
+# "ni jardin"…). Without this guard, "pas de balcon" was matched as a verified
+# "balcon" feature and the LLM hallucinated a balcony that the ad explicitly
+# denies — the worst possible signal to a landlord.
+_NEG_RE = re.compile(r"\b(pas|sans|aucune?|ni|d[ée]pourvus?|d[ée]pourvues?|non|n['’](?:a|ait|est|ont))\b")
+
+
+def _is_negated(blob: str, idx: int) -> bool:
+    """True if a negation marker governs the feature keyword at position `idx`.
+
+    Looks back within the same clause (60-char window, cut at the previous
+    sentence boundary). A negation crosses a comma only if the chunk leading to
+    the keyword is a list continuation ("pas de balcon, de terrasse, de jardin"
+    → all negated) — so an unrelated adjacent word ("sans balcon, lumineux" →
+    "lumineux" kept) is not wrongly suppressed."""
+    seg = blob[max(0, idx - 60):idx]
+    cut = max(seg.rfind(c) for c in ".!?;:")
+    if cut != -1:
+        seg = seg[cut + 1:]
+    m = _NEG_RE.search(seg)
+    if not m:
+        return False
+    after = seg[m.end():]  # text between the negation and the keyword
+    # An adversative conjunction ends the negation scope ("pas d'ascenseur MAIS
+    # métro" → métro is positive).
+    if re.search(r"\b(mais|toutefois|cependant|n[ée]anmoins|par contre|en revanche)\b", after):
+        return False
+    if "," in after:
+        tail = after[after.rfind(",") + 1:].lstrip()
+        if not tail.startswith(("de ", "d'", "d’", "ni ", "et ", "ou ")):
+            return False
+    return True
+
+
 def _extract_listing_features(listing: Listing) -> list[str]:
     """Return concrete features actually present in the listing text. Caps
-    at 6 to keep the prompt tight. Anti-hallucination guard."""
+    at 6 to keep the prompt tight. Anti-hallucination guard: skips any feature
+    whose keyword only appears in a negated context ("pas de balcon")."""
     blob = f" {(listing.title or '').lower()} {(listing.description or '').lower()} "
     found: list[str] = []
     seen: set[str] = set()
     for needle, label in _FEATURE_KEYWORDS:
-        if needle in blob and label not in seen:
+        if label in seen:
+            continue
+        # Keep the feature only if it appears at least once NOT negated.
+        present = False
+        start = 0
+        while True:
+            i = blob.find(needle, start)
+            if i == -1:
+                break
+            if not _is_negated(blob, i):
+                present = True
+                break
+            start = i + len(needle)
+        if present:
             seen.add(label)
             found.append(label)
             if len(found) >= 6:
