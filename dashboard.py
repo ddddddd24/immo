@@ -413,7 +413,7 @@ def _render_listings() -> str:
         _disabled_clause = f"AND l.source NOT IN ({','.join('?' * len(_disabled))})"
     raw_listings = _query(f"""
         SELECT l.lbc_id, l.source, l.title, l.price, l.surface, l.location,
-               l.url, l.scraped_at, l.published_at, l.phone, l.score, l.score_reason,
+               l.url, l.scraped_at, l.published_at, l.seen_at, l.phone, l.score, l.score_reason,
                l.housing_type, l.roommate_count, l.available_from, l.dedup_of
         FROM listings l
         WHERE l.scraped_at > datetime('now', '-14 days')
@@ -473,6 +473,11 @@ def _render_listings() -> str:
             "score_reason": l["score_reason"] or "",
             "published": ((l["published_at"] or "")[7:17] if (l["published_at"] or "").startswith("scrape:") else (l["published_at"] or "")[:10]),
             "published_is_scrape": (l["published_at"] or "").startswith("scrape:"),
+            # "Vue récemment" filter: when the bot last saw the listing (re-stamped
+            # each scrape). Always a real timestamp (unlike published_at, which can
+            # be a "scrape:" placeholder → Invalid Date). Normalized to explicit UTC
+            # ('Z') so the browser parses it unambiguously. Falls back to scraped_at.
+            "seen": ((l["seen_at"] or l["scraped_at"] or "")[:23] + "Z") if (l["seen_at"] or l["scraped_at"]) else "",
             "phone": l["phone"],
             "available_from": l["available_from"] or "",
             "housing_type": ht,
@@ -562,7 +567,7 @@ def _render_listings() -> str:
     <label>m² min <input id="f-minsurface" type="number" placeholder="20" /></label>
     <label>Recherche <input id="f-search" type="text" placeholder="titre / ville…" style="width:180px" /></label>
     <label><input id="f-phone-only" type="checkbox" /> 📞 Avec tél seulement</label>
-    <label title="Limiter aux annonces récentes (date de publication). Combine avec le tri Score pour voir les meilleurs scores récents. Défaut : toutes dates.">📅 Récence
+    <label title="Limiter aux annonces vues récemment par le bot (date de dernier scrape, re-stampée à chaque passage). Plus fiable que la date de publication, qui peut manquer sur certaines sources. Défaut : toutes dates.">👁 Vue récemment
       <select id="f-days">
         <option value="">Toutes dates</option>
         <option value="1">1 dernier jour</option>
@@ -622,9 +627,10 @@ def _render_listings() -> str:
         if (!r.phone || r.phone === '#blocked') return false;
       }}
       if (daysCutoff !== null) {{
-        // Récence par date de publication (même parsing que le badge 🔥 NEW).
-        const pm = r.published ? new Date(r.published.length > 7 ? r.published : r.published + '-01').getTime() : 0;
-        if (!pm || pm < daysCutoff) return false;
+        // Récence = date où le bot a vu l'annonce (seen_at, re-stampé à chaque
+        // scrape) — pas la date de publication (qui peut être absente/placeholder).
+        const sm = r.seen ? new Date(r.seen).getTime() : 0;
+        if (!sm || sm < daysCutoff) return false;
       }}
       if (search) {{
         const blob = (r.title + ' ' + r.location).toLowerCase();
