@@ -260,8 +260,26 @@ DEFAULT_SEARCH_GENSDECONFIANCE_URL: str = os.getenv(
 # L'URL ci-dessus est conservée → pour réactiver, retirer la clé d'ici (ou vider
 # l'env DISABLED_SOURCES). gensdeconfiance désactivée le 2026-06-02 (pas de
 # compte/contact pour cette source).
+# leboncoin/seloger/logicimmo désactivés le 2026-06-06 : abandon des sources
+# DataDome — l'IP Box Orange cycle sur un pool dont les IP se flaggent toutes à
+# force de scraping 24/7 (probe 2026-06-06 : 90.16.28.212 → 8/8 LBC + 3/3 SeLoger
+# en 403). Le backoff plafonné à 30 min re-tapait l'IP en boucle = entretien du
+# flag. On coupe net. logicimmo partage le backend Aviv de SeLoger (même mur
+# DataDome). Réactiver = retirer les clés (URLs conservées) une fois sur une IP
+# propre (proxy mobile). Voir tasks/lessons.md.
+# fnaim/entreparticuliers/cdc_habitat/inli/guyhoquet/wizi désactivés le 2026-06-15
+# (décision Illan) : inadaptés au besoin (meublé étudiant/couple). fnaim = annuaire
+# d'agences ; entreparticuliers = payant côté locataire, peu d'offres étudiantes ;
+# cdc_habitat = logement social/institutionnel ; inli = résidences gérées (souvent
+# seniors/services) ; guyhoquet = agence généraliste, peu de meublés ; wizi = volume
+# négligeable. NB : fnaim + entreparticuliers étaient les 2 plus gros pourvoyeurs
+# d'annonces retenues (≈59 score≥6/j chacun) — réactiver = retirer la clé.
 DISABLED_SOURCES: set = {
-    s.strip() for s in os.getenv("DISABLED_SOURCES", "gensdeconfiance").split(",")
+    s.strip() for s in os.getenv(
+        "DISABLED_SOURCES",
+        "gensdeconfiance,leboncoin,seloger,logicimmo,"
+        "fnaim,entreparticuliers,cdc_habitat,inli,guyhoquet,wizi"
+    ).split(",")
     if s.strip()
 }
 
